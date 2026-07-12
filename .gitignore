@@ -1,0 +1,7 @@
+target/
+bin/
+native/
+*.so
+*.env
+.env
+*.log

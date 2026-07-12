@@ -1,0 +1,46 @@
+use anyhow::Result;
+use clap::Parser;
+use om_api::api::{serve, AppState};
+use om_api::official::OfficialDecoder;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Shanghai Open-Meteo point API over .omranges bundles"
+)]
+struct Args {
+    #[arg(long, env = "OM_DATA_ROOT", default_value = "/data/om_raw")]
+    data_root: PathBuf,
+
+    #[arg(long, env = "OM_API_BIND", default_value = "0.0.0.0:8088")]
+    bind: SocketAddr,
+
+    #[arg(long, env = "OM_OMFILE_LIB")]
+    omfile_lib: Option<PathBuf>,
+
+    #[arg(long, env = "OM_SNAPSHOT_REFRESH_SECONDS", default_value_t = 30)]
+    snapshot_refresh_seconds: u64,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .json()
+        .init();
+
+    let args = Args::parse();
+    let decoder = match args.omfile_lib.as_ref() {
+        Some(path) => Some(OfficialDecoder::load(path)?),
+        None => None,
+    };
+    let state = AppState::new(
+        args.data_root,
+        decoder,
+        Duration::from_secs(args.snapshot_refresh_seconds),
+    )?;
+    serve(state, args.bind).await
+}
