@@ -22,3 +22,9 @@ docs/
 *.omranges
 *.omranges.tmp
 
+
+# Server-local operational backups.
+.backup*/
+.codex-backups/
+*.bak.*
+*.backup*
