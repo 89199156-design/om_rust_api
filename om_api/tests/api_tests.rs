@@ -254,7 +254,10 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
         body["hourly"]["time"],
         serde_json::json!(["2026-07-08T02:00", "2026-07-08T03:00"])
     );
-    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([12.0, 13.0]));
+    assert_eq!(
+        body["hourly"]["temperature_2m"],
+        serde_json::json!([12.0, 13.0])
+    );
 }
 
 #[tokio::test]
@@ -400,7 +403,10 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["hourly"]["carbon_monoxide"], serde_json::json!([150.0]));
+    assert_eq!(
+        body["hourly"]["carbon_monoxide"],
+        serde_json::json!([150.0])
+    );
 }
 
 #[tokio::test]
@@ -427,7 +433,11 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
 
     let mut current_entries = Vec::new();
     for hour in 0..24 {
-        let timestamp = format!("2026-07-{:02}T{:02}:00:00Z", if hour < 8 { 7 } else { 8 }, (hour + 16) % 24);
+        let timestamp = format!(
+            "2026-07-{:02}T{:02}:00:00Z",
+            if hour < 8 { 7 } else { 8 },
+            (hour + 16) % 24
+        );
         for (variable, value) in [
             ("pm2_5", 30.0),
             ("pm10", 50.0),
@@ -490,7 +500,7 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-07T16:00&end_hour=2026-07-07T16:00&daily=chinese_aqi,chinese_aqi_o3&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-07T16:00&end_hour=2026-07-07T16:00&daily=chinese_aqi,chinese_aqi_o3,chinese_aqi_pm2_5&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
 
@@ -499,6 +509,10 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     assert_eq!(body["daily"]["time"], serde_json::json!(["2026-07-08"]));
     assert_eq!(body["daily"]["chinese_aqi"], serde_json::json!([110.0]));
     assert_eq!(body["daily"]["chinese_aqi_o3"], serde_json::json!([50.0]));
+    assert_eq!(
+        body["daily"]["chinese_aqi_pm2_5"],
+        serde_json::json!([50.0])
+    );
 
     let (daily_only_status, daily_only_body) = request_json(
         app,
@@ -507,7 +521,10 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     .await;
     assert_eq!(daily_only_status, StatusCode::OK, "{daily_only_body}");
     assert_eq!(daily_only_body["hourly"], serde_json::json!({}));
-    assert_eq!(daily_only_body["daily"]["chinese_aqi"], serde_json::json!([110.0]));
+    assert_eq!(
+        daily_only_body["daily"]["chinese_aqi"],
+        serde_json::json!([110.0])
+    );
 }
 
 #[tokio::test]
@@ -539,6 +556,35 @@ async fn missing_historical_release_coverage_does_not_block_current_cams_api() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["hourly"]["pm2_5"], serde_json::json!([42.0]));
+}
+
+#[tokio::test]
+async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
+    let root = tempfile::tempdir().unwrap();
+    let current = write_product(
+        root.path(),
+        "cams_global",
+        vec![TestEntry {
+            variable: "pm2_5",
+            values: [60.0, 60.0, 60.0, 60.0],
+        }],
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", &current)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5&forecast_hours=1",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // HJ 633-2026 defines PM2.5 24h breakpoints 30/60 at IAQI 50/100.
+    assert_eq!(
+        body["hourly"]["chinese_aqi_pm2_5"],
+        serde_json::json!([100.0])
+    );
 }
 
 fn fixture_root() -> TempDir {

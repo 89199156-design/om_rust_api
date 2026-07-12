@@ -151,10 +151,28 @@ impl OfficialDecoder {
         reader: &dyn BundleRangeReader,
         read_offset: &[u64],
     ) -> Result<f32> {
+        let read_count = vec![1_u64; read_offset.len()];
+        Ok(self.decode_grid(variable_metadata, reader, read_offset, &read_count)?[0])
+    }
+
+    pub fn decode_grid(
+        &self,
+        variable_metadata: &[u64],
+        reader: &dyn BundleRangeReader,
+        read_offset: &[u64],
+        read_count: &[u64],
+    ) -> Result<Vec<f32>> {
+        if read_offset.len() != read_count.len() || read_offset.is_empty() {
+            bail!("read_offset and read_count dimensions must match");
+        }
         let n_dimensions = read_offset.len();
-        let read_count = vec![1_u64; n_dimensions];
         let cube_offset = vec![0_u64; n_dimensions];
-        let cube_dimensions = vec![1_u64; n_dimensions];
+        let cube_dimensions = read_count.to_vec();
+        let io_size_merge = if read_count.iter().all(|value| *value == 1) {
+            512
+        } else {
+            0
+        };
         let variable_ptr =
             unsafe { (self.inner.om_variable_init)(variable_metadata.as_ptr() as *const c_void) };
         let mut decoder = OmDecoder {
@@ -186,7 +204,7 @@ impl OfficialDecoder {
                 read_count.as_ptr(),
                 cube_offset.as_ptr(),
                 cube_dimensions.as_ptr(),
-                512,
+                io_size_merge,
                 1024 * 1024 * 64,
             )
         };
@@ -208,7 +226,12 @@ impl OfficialDecoder {
                 upper_bound: 0,
             },
         };
-        let mut output = vec![f32::NAN; 1];
+        let output_count = read_count.iter().try_fold(1_usize, |total, value| {
+            total
+                .checked_mul(*value as usize)
+                .ok_or_else(|| anyhow::anyhow!("decoder output size overflow"))
+        })?;
+        let mut output = vec![f32::NAN; output_count];
         let mut chunk_buffer =
             vec![0_u8; unsafe { (self.inner.om_decoder_read_buffer_size)(&decoder) } as usize];
 
@@ -261,7 +284,7 @@ impl OfficialDecoder {
             }
             self.ensure_ok(error)?;
         }
-        Ok(output[0])
+        Ok(output)
     }
 
     fn ensure_ok(&self, error: u32) -> Result<()> {

@@ -155,13 +155,11 @@ fn load_group_release_history(
             if current.manifest.coverage_id == product_ready.coverage_id {
                 continue;
             }
-            let already_loaded = historical_products
-                .get(*product)
-                .is_some_and(|snapshots| {
-                    snapshots
-                        .iter()
-                        .any(|snapshot| snapshot.manifest.coverage_id == product_ready.coverage_id)
-                });
+            let already_loaded = historical_products.get(*product).is_some_and(|snapshots| {
+                snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.manifest.coverage_id == product_ready.coverage_id)
+            });
             if already_loaded {
                 continue;
             }
@@ -175,17 +173,14 @@ fn load_group_release_history(
                 // values whose history window is no longer complete.
                 continue;
             }
-            let snapshot = load_product_snapshot_for_coverage(
-                data_root,
-                product,
-                &product_ready.coverage_id,
-            )
-            .with_context(|| {
-                format!(
-                    "failed to load historical {} coverage {} selected by group {}",
-                    product, product_ready.coverage_id, group
-                )
-            })?;
+            let snapshot =
+                load_product_snapshot_for_coverage(data_root, product, &product_ready.coverage_id)
+                    .with_context(|| {
+                        format!(
+                            "failed to load historical {} coverage {} selected by group {}",
+                            product, product_ready.coverage_id, group
+                        )
+                    })?;
             historical_products
                 .entry((*product).to_string())
                 .or_default()
