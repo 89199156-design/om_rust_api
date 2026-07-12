@@ -256,9 +256,15 @@ pub fn point_forecast(
         for variable in variables {
             let mut values = Vec::with_capacity(times.len());
             for time in &times {
-                values.push(read_variable_value(
+                match read_variable_value(
                     snapshot, decoder, variable, *time, latitude, longitude,
-                )?);
+                ) {
+                    Ok(value) => values.push(value),
+                    Err(error) if error.to_string().contains("variable/time is not available") => {
+                        values.push(f32::NAN)
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             hourly_units.insert(variable.clone(), unit_for_variable(variable).to_string());
             hourly.insert(variable.clone(), json_array_for_variable(variable, values));
@@ -461,6 +467,19 @@ fn read_variable_value(
     match variable {
         "weather_code" | "weathercode" => {
             return read_weather_code(snapshot, decoder, time, latitude, longitude);
+        }
+        "surface_pressure" => {
+            let temperature = read_direct(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let pressure_msl =
+                read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
+            return Ok(surface_pressure(temperature, pressure_msl, 0.0));
         }
         "dew_point_2m" | "dewpoint_2m" => {
             let temperature = read_direct(
@@ -1347,6 +1366,13 @@ fn finite_max(values: &[f32]) -> f32 {
         .unwrap_or(f32::NAN)
 }
 
+fn surface_pressure(temperature: f32, pressure_msl: f32, elevation: f32) -> f32 {
+    let elevation = if elevation.is_nan() { 0.0 } else { elevation };
+    let t0 = temperature + 273.15 + 0.0065 * elevation;
+    let factor = (1.0 - (0.0065 * elevation) / t0).powf(-5.255_781_3);
+    pressure_msl / factor
+}
+
 fn read_direct(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -2090,6 +2116,7 @@ fn product_for_variable(
 fn seed_variable_for_times(variable: &str) -> &str {
     match variable {
         "dew_point_2m" | "dewpoint_2m" => "temperature_2m",
+        "surface_pressure" => "temperature_2m",
         "weather_code" | "weathercode" => "cloud_cover",
         "rain" => "precipitation",
         "snowfall" => "snowfall_water_equivalent",
@@ -2793,7 +2820,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "windspeed_10m"
         | "wind_gusts_10m" => "m/s",
         "wind_direction_10m" | "winddirection_10m" => "°",
-        "pressure_msl" => "hPa",
+        "pressure_msl" | "surface_pressure" => "hPa",
         "visibility" => "m",
         "freezing_level_height" | "boundary_layer_height" | "snow_depth" => "m",
         "weather_code" | "weathercode" => "wmo code",
