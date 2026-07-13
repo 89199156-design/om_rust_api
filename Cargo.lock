@@ -558,6 +558,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "libloading",
+ "ryu",
  "serde",
  "serde_json",
  "tempfile",

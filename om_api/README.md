@@ -1,8 +1,8 @@
-# Shanghai OM Point API
+# OM Point API
 
 License: `AGPL-3.0-or-later`.
 
-This Rust server is the Shanghai client-facing point API. It reads mirrored
+This Rust server is the client-facing point API. It reads published
 Open-Meteo `.omranges` bundles from `/data/om_raw` and returns point JSON
 directly. Clients do not fetch `latest.json` or any manifest before requesting
 point data.
@@ -38,6 +38,12 @@ bash scripts/build_omfileformat_decoder.sh /opt/1panel/apps/weather_om_api/nativ
 If an exact approved `om-file-format` source checkout is available, pass it with
 `OM_FILE_FORMAT_SRC=/path/to/om-file-format`. This keeps the decoder aligned with
 the Singapore/Open-Meteo baseline instead of silently mixing source versions.
+
+GFS model coordinates, model elevation, and `surface_pressure` require the
+official static file `ncep_gfs013/static/HSURF.om`. The installer downloads the
+baseline-pinned object to
+`/data/om_raw/static/ncep_gfs013/HSURF.om`, verifies its SHA-256 checksum, and
+the API rejects GFS requests if the file is missing or has an unexpected size.
 
 Example:
 

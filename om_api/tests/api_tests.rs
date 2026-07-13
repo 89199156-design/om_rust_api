@@ -800,6 +800,70 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
 }
 
 #[tokio::test]
+async fn forecast_endpoint_uses_official_soil_and_radiation_units_and_precision() {
+    let root = tempfile::tempdir().unwrap();
+    let gfs013 = write_product(
+        root.path(),
+        "gfs013_surface",
+        vec![
+            TestEntry {
+                variable: "soil_moisture_0_to_10cm",
+                values: [0.3284, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "soil_moisture_10_to_40cm",
+                values: [0.3334, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "soil_moisture_40_to_100cm",
+                values: [0.3354, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "soil_moisture_100_to_200cm",
+                values: [0.3674, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "shortwave_radiation",
+                values: [123.4, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "diffuse_radiation",
+                values: [45.6, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "total_column_integrated_water_vapour",
+                values: [22.3, 0.0, 0.0, 0.0],
+            },
+        ],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_moisture_40_to_100cm,soil_moisture_100_to_200cm,shortwave_radiation,diffuse_radiation,total_column_integrated_water_vapour&forecast_hours=1",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hourly"]["soil_moisture_0_to_10cm"][0], 0.328);
+    assert_eq!(body["hourly"]["soil_moisture_10_to_40cm"][0], 0.333);
+    assert_eq!(body["hourly"]["soil_moisture_40_to_100cm"][0], 0.335);
+    assert_eq!(body["hourly"]["soil_moisture_100_to_200cm"][0], 0.367);
+    assert_eq!(
+        body["hourly_units"]["soil_moisture_0_to_10cm"],
+        "m\u{00B3}/m\u{00B3}"
+    );
+    assert_eq!(body["hourly_units"]["shortwave_radiation"], "W/m\u{00B2}");
+    assert_eq!(body["hourly_units"]["diffuse_radiation"], "W/m\u{00B2}");
+    assert_eq!(
+        body["hourly_units"]["total_column_integrated_water_vapour"],
+        "kg/m\u{00B2}"
+    );
+}
+
+#[tokio::test]
 async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipitation() {
     let root = tempfile::tempdir().unwrap();
     let gfs013 = write_product(

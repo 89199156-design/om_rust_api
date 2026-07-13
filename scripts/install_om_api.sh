@@ -6,6 +6,9 @@ DATA_ROOT="${OM_DATA_ROOT:-/data/om_raw}"
 BIND_ADDR="${OM_API_BIND:-127.0.0.1:8088}"
 SERVICE_NAME="${OM_API_SERVICE_NAME:-weather-om-api}"
 INSTALL_OWNER="${OM_API_USER:-ubuntu}"
+GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
+GFS013_STATIC_SHA256="${OM_GFS013_STATIC_SHA256:-203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0}"
+GFS013_STATIC_PATH="$DATA_ROOT/static/ncep_gfs013/HSURF.om"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -24,6 +27,16 @@ if ! command -v cc >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required to install official static model data." >&2
+  exit 1
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+  echo "sha256sum is required to verify official static model data." >&2
+  exit 1
+fi
+
 if [ ! -d "$DATA_ROOT" ]; then
   echo "OM data root does not exist: $DATA_ROOT" >&2
   exit 1
@@ -35,6 +48,23 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 mkdir -p "$BIN_DIR" "$NATIVE_DIR"
+
+if [ ! -f "$GFS013_STATIC_PATH" ] || [ "$(sha256sum "$GFS013_STATIC_PATH" | awk '{print $1}')" != "$GFS013_STATIC_SHA256" ]; then
+  static_tmp="$(mktemp)"
+  trap 'rm -f "$static_tmp"' EXIT
+  curl --fail --location --silent --show-error --retry 4 \
+    --connect-timeout 15 --max-time 180 \
+    --output "$static_tmp" "$GFS013_STATIC_URL"
+  actual_static_sha256="$(sha256sum "$static_tmp" | awk '{print $1}')"
+  if [ "$actual_static_sha256" != "$GFS013_STATIC_SHA256" ]; then
+    echo "official GFS013 static elevation checksum mismatch: $actual_static_sha256" >&2
+    exit 1
+  fi
+  $SUDO install -d -m 0755 "$(dirname "$GFS013_STATIC_PATH")"
+  $SUDO install -m 0644 "$static_tmp" "$GFS013_STATIC_PATH"
+  rm -f "$static_tmp"
+  trap - EXIT
+fi
 
 if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] || [ ! -f "$NATIVE_DIR/libomfileformat.so" ]; then
   bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" "$NATIVE_DIR"
@@ -55,7 +85,7 @@ EOF
 
 $SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
-Description=Shanghai Open-Meteo point API
+Description=Open-Meteo point API
 After=network-online.target
 Wants=network-online.target
 

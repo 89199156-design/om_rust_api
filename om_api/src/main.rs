@@ -7,10 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "Shanghai Open-Meteo point API over .omranges bundles"
-)]
+#[command(version, about = "Open-Meteo point API over .omranges bundles")]
 struct Args {
     #[arg(long, env = "OM_DATA_ROOT", default_value = "/data/om_raw")]
     data_root: PathBuf,

@@ -9,7 +9,17 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+const GFS013_STATIC_ELEVATION_PATH: &str = "static/ncep_gfs013/HSURF.om";
+const GFS013_STATIC_DIMENSIONS: &[u64] = &[1536, 3072];
+const GFS013_STATIC_CHUNKS: &[u64] = &[20, 20];
+const GFS013_STATIC_LUT_OFFSET: u64 = 1_439_999;
+const GFS013_STATIC_LUT_SIZE: u64 = 15_438;
+const GFS013_STATIC_FILE_SIZE: u64 = 1_455_544;
+type GfsElevationCache = HashMap<(PathBuf, u64, u64), f32>;
+static GFS_ELEVATION_CACHE: OnceLock<Mutex<GfsElevationCache>> = OnceLock::new();
 
 pub const OPENMETEO_UPSTREAM_BASELINE: &str = "4efb9c49fb4a3718ed385fb22580d2e0fc56bdb2";
 pub const OPENMETEO_IMAGE_BASELINE: &str = "weather-forecast-openmeteo:9849315";
@@ -263,6 +273,11 @@ pub fn forecast_for_query(
         && daily_variables
             .iter()
             .all(|variable| is_chinese_aqi_variable(variable));
+    let has_gfs_weather = variables
+        .iter()
+        .any(|variable| !is_air_quality_variable(variable))
+        || (!daily_variables.is_empty() && !daily_is_aqi);
+
     if daily_has_aqi && !daily_is_aqi {
         bail!("daily weather and Chinese AQI variables cannot be mixed in one request");
     }
@@ -311,6 +326,15 @@ pub fn forecast_for_query(
                 query.forecast_days,
                 &timezone,
             )?;
+        }
+        if has_gfs_weather {
+            if let Some((model_latitude, model_longitude, model_elevation)) =
+                gfs013_model_location(snapshot, decoder, latitude, longitude)?
+            {
+                response.latitude = model_latitude;
+                response.longitude = model_longitude;
+                response.elevation = Some(model_elevation as f64);
+            }
         }
         responses.push(response);
     }
@@ -578,7 +602,7 @@ fn attach_daily_weather(
         );
         daily.insert(
             variable.clone(),
-            json_array_for_variable(aggregation.output_variable(), values),
+            json_array_for_daily_variable(variable, aggregation, values),
         );
     }
     response.daily_units = Some(daily_units);
@@ -1036,10 +1060,10 @@ pub fn read_variable_value(
             )?;
             let pressure_msl =
                 read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
-            // The Shanghai API does not yet ship the Singapore DEM. Open-Meteo
-            // treats a missing target elevation as zero, which is the exact
-            // fallback used here until the static DEM is published locally.
-            return Ok(surface_pressure(temperature, pressure_msl, 0.0));
+            let elevation = gfs013_model_location(snapshot, decoder, latitude, longitude)?
+                .map(|(_, _, elevation)| elevation)
+                .unwrap_or(0.0);
+            return Ok(surface_pressure(temperature, pressure_msl, elevation));
         }
         "dew_point_2m" | "dewpoint_2m" => {
             let temperature = read_direct(
@@ -3125,6 +3149,13 @@ fn is_cams_variable(variable: &str) -> bool {
     )
 }
 
+fn is_air_quality_variable(variable: &str) -> bool {
+    is_cams_variable(seed_variable_for_times(variable))
+        || variable.starts_with("european_aqi")
+        || variable.starts_with("us_aqi")
+        || variable.starts_with("chinese_aqi")
+}
+
 fn is_gfs025_variable(variable: &str) -> bool {
     matches!(
         variable,
@@ -3377,6 +3408,103 @@ fn grid_latitude_for_index(array: &ArrayMetadata, y: u64) -> Result<f32> {
     Ok(lat_min + y as f32 * dy)
 }
 
+fn grid_longitude_for_index(array: &ArrayMetadata, x: u64) -> Result<f32> {
+    if array.dimensions.len() != 2 || x >= array.dimensions[1] {
+        bail!("invalid longitude grid index");
+    }
+    Ok(-180.0_f32 + x as f32 * (360.0_f32 / array.dimensions[1] as f32))
+}
+
+fn gfs013_model_location(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Option<(f64, f64, f32)>> {
+    let Some(product) = snapshot.product("gfs013_surface") else {
+        return Ok(None);
+    };
+    let entry = product
+        .entries
+        .values()
+        .find(|entry| entry.variable == "temperature_2m")
+        .or_else(|| product.entries.values().next())
+        .context("gfs013_surface has no grid entries")?;
+    let (y, x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
+    let model_latitude = official_f32_json_number(grid_latitude_for_index(&entry.array, y)?)?;
+    let model_longitude = official_f32_json_number(grid_longitude_for_index(&entry.array, x)?)?;
+
+    let Some(decoder) = decoder else {
+        return Ok(None);
+    };
+    let static_path = snapshot.data_root.join(GFS013_STATIC_ELEVATION_PATH);
+    if !static_path.exists() {
+        bail!(
+            "required official GFS013 static elevation file is missing: {}",
+            static_path.display()
+        );
+    }
+    let cache_key = (static_path.clone(), y, x);
+    let cache = GFS_ELEVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(elevation) = cache
+        .lock()
+        .map_err(|_| anyhow!("GFS elevation cache poisoned"))?
+        .get(&cache_key)
+        .copied()
+    {
+        return Ok(Some((model_latitude, model_longitude, elevation)));
+    }
+    let file = Arc::new(
+        File::open(&static_path)
+            .with_context(|| format!("failed to open {}", static_path.display()))?,
+    );
+    if file.metadata()?.len() != GFS013_STATIC_FILE_SIZE {
+        bail!("official GFS013 static elevation file size is invalid");
+    }
+    let metadata = build_v3_array_metadata_blob(
+        "",
+        20,
+        0,
+        GFS013_STATIC_DIMENSIONS,
+        GFS013_STATIC_CHUNKS,
+        GFS013_STATIC_LUT_SIZE,
+        GFS013_STATIC_LUT_OFFSET,
+        1.0,
+        0.0,
+    );
+    let reader = FullFileRangeReader { file };
+    let elevation = match decoder.decode_point(&metadata, &reader, &[y, x])? {
+        value if value <= -900.0 => 0.0,
+        value => value,
+    };
+    cache
+        .lock()
+        .map_err(|_| anyhow!("GFS elevation cache poisoned"))?
+        .insert(cache_key, elevation);
+    Ok(Some((model_latitude, model_longitude, elevation)))
+}
+
+fn official_f32_json_number(value: f32) -> Result<f64> {
+    let mut buffer = ryu::Buffer::new();
+    buffer
+        .format_finite(value)
+        .parse::<f64>()
+        .context("failed to format model coordinate")
+}
+
+#[derive(Debug)]
+struct FullFileRangeReader {
+    file: Arc<File>,
+}
+
+impl BundleRangeReader for FullFileRangeReader {
+    fn read_original_range(&self, start: u64, count: u64) -> Result<Vec<u8>> {
+        let mut out = vec![0_u8; count as usize];
+        self.file.read_exact_at(&mut out, start)?;
+        Ok(out)
+    }
+}
+
 fn model_latitude_for_variable(
     snapshot: &OmDataSnapshot,
     variable: &str,
@@ -3455,6 +3583,17 @@ mod tests {
         let model_latitude = grid_latitude_for_index(&array, y).unwrap();
 
         assert!((model_latitude - 22.78555).abs() < 0.00001);
+    }
+
+    #[test]
+    fn model_coordinates_use_official_shortest_float_representation() {
+        assert_eq!(official_f32_json_number(131.953125).unwrap(), 131.95312);
+        assert_eq!(official_f32_json_number(75.5859375).unwrap(), 75.58594);
+        assert_eq!(official_f32_json_number(82.734375).unwrap(), 82.734375);
+        assert_eq!(
+            official_f32_json_number(39.06932067871094).unwrap(),
+            39.06932
+        );
     }
 
     #[test]
@@ -4141,15 +4280,43 @@ fn unit_for_variable(variable: &str) -> &'static str {
         "uv_index" | "uv_index_clear_sky" | "lifted_index" | "categorical_freezing_rain" => "",
         "cape" | "convective_inhibition" => "J/kg",
         "shortwave_radiation" | "diffuse_radiation" | "latent_heat_flux" | "sensible_heat_flux" => {
-            "W/m2"
+            "W/m\u{00B2}"
         }
         "soil_moisture_0_to_10cm"
         | "soil_moisture_10_to_40cm"
         | "soil_moisture_40_to_100cm"
-        | "soil_moisture_100_to_200cm" => "m3/m3",
-        "total_column_integrated_water_vapour" => "kg/m2",
+        | "soil_moisture_100_to_200cm" => "m\u{00B3}/m\u{00B3}",
+        "total_column_integrated_water_vapour" => "kg/m\u{00B2}",
         _ => "unknown",
     }
+}
+
+fn json_array_for_daily_variable(
+    variable: &str,
+    aggregation: DailyWeatherAggregation,
+    values: Vec<f32>,
+) -> serde_json::Value {
+    let decimals = match variable {
+        "wind_gusts_10m_mean" | "windgusts_10m_mean" | "visibility_mean" => Some(2),
+        _ => None,
+    };
+    match decimals {
+        Some(decimals) => serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|value| json_value_with_decimals(value, decimals))
+                .collect(),
+        ),
+        None => json_array_for_variable(aggregation.output_variable(), values),
+    }
+}
+
+fn json_value_with_decimals(value: f32, decimals: u8) -> serde_json::Value {
+    if !value.is_finite() {
+        return serde_json::Value::Null;
+    }
+    let factor = 10_f32.powi(decimals as i32);
+    serde_json::json!(((value * factor).round() as i64) as f64 / factor as f64)
 }
 
 fn json_array_for_variable(variable: &str, values: Vec<f32>) -> serde_json::Value {
@@ -4200,6 +4367,29 @@ pub fn round_variable_output_value(variable: &str, value: f32) -> f32 {
 enum OutputDecimals {
     Integer,
     Fixed(u8),
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn daily_mean_precision_matches_official_output() {
+        let value = json_array_for_daily_variable(
+            "wind_gusts_10m_mean",
+            DailyWeatherAggregation::Mean("wind_gusts_10m"),
+            vec![5.158],
+        );
+        assert_eq!(value, serde_json::json!([5.16]));
+    }
+
+    #[test]
+    fn snow_depth_uses_official_two_decimal_precision() {
+        assert_eq!(
+            json_array_for_variable("snow_depth", vec![0.006]),
+            serde_json::json!([0.01])
+        );
+    }
 }
 
 fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
@@ -4277,7 +4467,11 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "wind_v_component_100m"
         | "vertical_velocity"
         | "aerosol_optical_depth" => OutputDecimals::Fixed(2),
-        "snowfall" | "uv_index" | "uv_index_clear_sky" => OutputDecimals::Fixed(2),
+        "soil_moisture_0_to_10cm"
+        | "soil_moisture_10_to_40cm"
+        | "soil_moisture_40_to_100cm"
+        | "soil_moisture_100_to_200cm" => OutputDecimals::Fixed(3),
+        "snowfall" | "snow_depth" | "uv_index" | "uv_index_clear_sky" => OutputDecimals::Fixed(2),
         "temperature_2m"
         | "apparent_temperature"
         | "temperature_80m"
@@ -4298,7 +4492,6 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "visibility"
         | "freezing_level_height"
         | "boundary_layer_height"
-        | "snow_depth"
         | "cape"
         | "convective_inhibition"
         | "lifted_index"
