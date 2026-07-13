@@ -1472,7 +1472,7 @@ fn us_aqi_pm2_5(
 ) -> Result<f32> {
     let mean = rolling_mean_before(snapshot, decoder, "pm2_5", time, latitude, longitude, 24)?;
     Ok(us_aqi_scale(position_extrapolated(
-        &[0.0, 12.0, 35.5, 55.5, 150.5, 250.5, 350.1, 500.5],
+        &[0.0, 9.0, 35.5, 55.5, 125.5, 225.5, 325.5, 500.5],
         mean,
     )))
 }
@@ -2024,7 +2024,9 @@ fn rolling_mean_before(
     hours: i64,
 ) -> Result<f32> {
     let mut sum = 0.0;
-    for hour in 1..=hours {
+    // Swift's slidingAverageDroppingFirstDt reduces the window from the
+    // oldest sample to the newest; preserve that order for identical f32 ties.
+    for hour in (1..=hours).rev() {
         let sample_time = time - Duration::hours(hour);
         let Some(value) = read_optional_direct(
             snapshot,
@@ -4113,7 +4115,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "european_aqi_so2"
         | "european_aqi_nitrogen_dioxide"
         | "european_aqi_ozone"
-        | "european_aqi_sulphur_dioxide" => "European AQI",
+        | "european_aqi_sulphur_dioxide" => "EAQI",
         "us_aqi"
         | "us_aqi_pm2_5"
         | "us_aqi_pm10"
@@ -4124,7 +4126,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "us_aqi_nitrogen_dioxide"
         | "us_aqi_ozone"
         | "us_aqi_sulphur_dioxide"
-        | "us_aqi_carbon_monoxide" => "US AQI",
+        | "us_aqi_carbon_monoxide" => "USAQI",
         "chinese_aqi"
         | "chinese_aqi_pm2_5"
         | "chinese_aqi_pm10"
@@ -4238,8 +4240,8 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "us_aqi_nitrogen_dioxide"
         | "us_aqi_ozone"
         | "us_aqi_sulphur_dioxide"
-        | "us_aqi_carbon_monoxide"
-        | "chinese_aqi"
+        | "us_aqi_carbon_monoxide" => OutputDecimals::Integer,
+        "chinese_aqi"
         | "chinese_aqi_pm2_5"
         | "chinese_aqi_pm10"
         | "chinese_aqi_no2"

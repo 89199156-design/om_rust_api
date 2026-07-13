@@ -1274,20 +1274,20 @@ async fn air_quality_endpoint_returns_official_and_chinese_aqi_derivatives() {
     assert_eq!(status, StatusCode::OK);
     assert_approx(
         body["hourly"]["european_aqi_no2"][0].as_f64().unwrap(),
-        42.6667,
+        43.0,
     );
     assert_approx(
         body["hourly"]["european_aqi_nitrogen_dioxide"][0]
             .as_f64()
             .unwrap(),
-        42.6667,
+        43.0,
     );
-    assert_approx(body["hourly"]["us_aqi_no2"][0].as_f64().unwrap(), 46.2963);
+    assert_approx(body["hourly"]["us_aqi_no2"][0].as_f64().unwrap(), 46.0);
     assert_approx(
         body["hourly"]["us_aqi_nitrogen_dioxide"][0]
             .as_f64()
             .unwrap(),
-        46.2963,
+        46.0,
     );
     assert_approx(body["hourly"]["chinese_aqi_no2"][0].as_f64().unwrap(), 47.0);
     assert_approx(
@@ -1296,8 +1296,8 @@ async fn air_quality_endpoint_returns_official_and_chinese_aqi_derivatives() {
             .unwrap(),
         47.0,
     );
-    assert_eq!(body["hourly_units"]["european_aqi_no2"], "European AQI");
-    assert_eq!(body["hourly_units"]["us_aqi_no2"], "US AQI");
+    assert_eq!(body["hourly_units"]["european_aqi_no2"], "EAQI");
+    assert_eq!(body["hourly_units"]["us_aqi_no2"], "USAQI");
     assert_eq!(body["hourly_units"]["chinese_aqi_no2"], "Chinese AQI");
 }
 
