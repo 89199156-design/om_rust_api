@@ -2,7 +2,8 @@ use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -31,6 +32,12 @@ pub struct PointQuery {
     pub end_date: Option<String>,
     #[serde(default)]
     pub forecast_hours: Option<usize>,
+    #[serde(default)]
+    pub past_days: Option<usize>,
+    #[serde(default)]
+    pub forecast_days: Option<usize>,
+    #[serde(default)]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub cell_selection: Option<String>,
 }
@@ -121,6 +128,103 @@ pub fn parse_hour(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
         .transpose()
 }
 
+#[derive(Debug, Clone)]
+struct QueryTimezone {
+    offset: FixedOffset,
+    identifier: String,
+    abbreviation: String,
+}
+
+fn parse_query_timezones(
+    value: Option<&str>,
+    coordinate_count: usize,
+) -> Result<Vec<QueryTimezone>> {
+    let requested = value
+        .unwrap_or("GMT")
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(parse_query_timezone)
+        .collect::<Result<Vec<_>>>()?;
+    if requested.len() == 1 {
+        return Ok(vec![requested[0].clone(); coordinate_count]);
+    }
+    if requested.len() != coordinate_count {
+        bail!("timezone and coordinates must have the same number of elements");
+    }
+    Ok(requested)
+}
+
+fn parse_query_timezone(value: &str) -> Result<QueryTimezone> {
+    if value.eq_ignore_ascii_case("auto") {
+        bail!("timezone=auto requires the official coordinate timezone database and is not enabled; provide an explicit IANA timezone");
+    }
+    if value.eq_ignore_ascii_case("GMT") || value.eq_ignore_ascii_case("UTC") {
+        return Ok(QueryTimezone {
+            offset: FixedOffset::east_opt(0).expect("valid GMT offset"),
+            identifier: "GMT".to_string(),
+            abbreviation: "GMT".to_string(),
+        });
+    }
+    let timezone = value
+        .parse::<Tz>()
+        .with_context(|| format!("invalid timezone: {value}"))?;
+    let local_now = Utc::now().with_timezone(&timezone);
+    Ok(QueryTimezone {
+        offset: local_now.offset().fix(),
+        identifier: timezone.name().to_string(),
+        abbreviation: local_now.format("%Z").to_string(),
+    })
+}
+
+fn parse_hour_with_timezone(
+    value: Option<&str>,
+    timezone: &QueryTimezone,
+) -> Result<Option<DateTime<Utc>>> {
+    value
+        .map(|text| {
+            if text.ends_with('Z') || DateTime::parse_from_rfc3339(text).is_ok() {
+                return parse_hour(Some(text)).map(|value| value.expect("value is present"));
+            }
+            let local = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M")
+                .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S"))
+                .with_context(|| format!("invalid hour: {text}"))?;
+            timezone
+                .offset
+                .from_local_datetime(&local)
+                .single()
+                .map(|value| value.with_timezone(&Utc))
+                .with_context(|| format!("invalid local hour: {text}"))
+        })
+        .transpose()
+}
+
+fn apply_response_timezone(
+    response: &mut ForecastResponse,
+    timezone: &QueryTimezone,
+) -> Result<()> {
+    response.utc_offset_seconds = timezone.offset.local_minus_utc();
+    response.timezone = timezone.identifier.clone();
+    response.timezone_abbreviation = timezone.abbreviation.clone();
+    let Some(serde_json::Value::Array(times)) = response.hourly.get_mut("time") else {
+        return Ok(());
+    };
+    for value in times {
+        let text = value
+            .as_str()
+            .context("hourly time must be an ISO-8601 string")?;
+        let utc = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M")
+            .with_context(|| format!("invalid hourly response time: {text}"))?
+            .and_utc();
+        *value = serde_json::Value::String(
+            utc.with_timezone(&timezone.offset)
+                .format("%Y-%m-%dT%H:%M")
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn forecast_for_query(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -151,11 +255,26 @@ pub fn forecast_for_query(
     } else {
         parse_variables(query.hourly.as_deref())
     };
-    let start = parse_hour(query.start_hour.as_deref())?;
-    let end = parse_hour(query.end_hour.as_deref())?;
+    let timezones = parse_query_timezones(query.timezone.as_deref(), latitudes.len())?;
+    let daily_has_aqi = daily_variables
+        .iter()
+        .any(|variable| is_chinese_aqi_variable(variable));
+    let daily_is_aqi = !daily_variables.is_empty()
+        && daily_variables
+            .iter()
+            .all(|variable| is_chinese_aqi_variable(variable));
+    if daily_has_aqi && !daily_is_aqi {
+        bail!("daily weather and Chinese AQI variables cannot be mixed in one request");
+    }
 
     let mut responses = Vec::new();
-    for (latitude, longitude) in latitudes.into_iter().zip(longitudes.into_iter()) {
+    for ((latitude, longitude), timezone) in latitudes
+        .into_iter()
+        .zip(longitudes.into_iter())
+        .zip(timezones.into_iter())
+    {
+        let start = parse_hour_with_timezone(query.start_hour.as_deref(), &timezone)?;
+        let end = parse_hour_with_timezone(query.end_hour.as_deref(), &timezone)?;
         let mut response = point_forecast(
             snapshot,
             decoder,
@@ -166,7 +285,8 @@ pub fn forecast_for_query(
             end,
             query.forecast_hours,
         )?;
-        if !daily_variables.is_empty() {
+        apply_response_timezone(&mut response, &timezone)?;
+        if daily_is_aqi {
             attach_daily_chinese_aqi(
                 &mut response,
                 snapshot,
@@ -176,6 +296,20 @@ pub fn forecast_for_query(
                 &daily_variables,
                 query.start_date.as_deref(),
                 query.end_date.as_deref(),
+            )?;
+        } else if !daily_variables.is_empty() {
+            attach_daily_weather(
+                &mut response,
+                snapshot,
+                decoder,
+                latitude,
+                longitude,
+                &daily_variables,
+                query.start_date.as_deref(),
+                query.end_date.as_deref(),
+                query.past_days,
+                query.forecast_days,
+                &timezone,
             )?;
         }
         responses.push(response);
@@ -283,6 +417,391 @@ pub fn point_forecast(
         daily_units: None,
         daily: None,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DailyWeatherAggregation {
+    Max(&'static str),
+    Min(&'static str),
+    Mean(&'static str),
+    Sum(&'static str),
+    RadiationSum(&'static str),
+    PrecipitationHours(&'static str),
+    DominantWindDirection,
+}
+
+impl DailyWeatherAggregation {
+    fn seed_variable(self) -> &'static str {
+        match self {
+            Self::Max(variable)
+            | Self::Min(variable)
+            | Self::Mean(variable)
+            | Self::Sum(variable)
+            | Self::RadiationSum(variable)
+            | Self::PrecipitationHours(variable) => variable,
+            Self::DominantWindDirection => "wind_u_component_10m",
+        }
+    }
+
+    fn output_variable(self) -> &'static str {
+        match self {
+            Self::Max(variable)
+            | Self::Min(variable)
+            | Self::Mean(variable)
+            | Self::Sum(variable) => variable,
+            Self::RadiationSum(_) => "uv_index",
+            Self::PrecipitationHours(_) => "precipitation",
+            Self::DominantWindDirection => "wind_direction_10m",
+        }
+    }
+}
+
+fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> {
+    let aggregation = match variable {
+        "temperature_2m_max" => DailyWeatherAggregation::Max("temperature_2m"),
+        "temperature_2m_min" => DailyWeatherAggregation::Min("temperature_2m"),
+        "temperature_2m_mean" => DailyWeatherAggregation::Mean("temperature_2m"),
+        "apparent_temperature_max" => DailyWeatherAggregation::Max("apparent_temperature"),
+        "apparent_temperature_min" => DailyWeatherAggregation::Min("apparent_temperature"),
+        "apparent_temperature_mean" => DailyWeatherAggregation::Mean("apparent_temperature"),
+        "precipitation_sum" => DailyWeatherAggregation::Sum("precipitation"),
+        "rain_sum" => DailyWeatherAggregation::Sum("rain"),
+        "showers_sum" => DailyWeatherAggregation::Sum("showers"),
+        "snowfall_sum" => DailyWeatherAggregation::Sum("snowfall"),
+        "snowfall_water_equivalent_sum" => DailyWeatherAggregation::Sum("snowfall_water_equivalent"),
+        "weather_code" | "weathercode" => DailyWeatherAggregation::Max("weather_code"),
+        "shortwave_radiation_sum" => DailyWeatherAggregation::RadiationSum("shortwave_radiation"),
+        "wind_speed_10m_max" | "windspeed_10m_max" => DailyWeatherAggregation::Max("wind_speed_10m"),
+        "wind_speed_10m_min" | "windspeed_10m_min" => DailyWeatherAggregation::Min("wind_speed_10m"),
+        "wind_speed_10m_mean" | "windspeed_10m_mean" => DailyWeatherAggregation::Mean("wind_speed_10m"),
+        "wind_gusts_10m_max" | "windgusts_10m_max" => DailyWeatherAggregation::Max("wind_gusts_10m"),
+        "wind_gusts_10m_min" | "windgusts_10m_min" => DailyWeatherAggregation::Min("wind_gusts_10m"),
+        "wind_gusts_10m_mean" | "windgusts_10m_mean" => DailyWeatherAggregation::Mean("wind_gusts_10m"),
+        "wind_direction_10m_dominant" | "winddirection_10m_dominant" => DailyWeatherAggregation::DominantWindDirection,
+        "precipitation_hours" => DailyWeatherAggregation::PrecipitationHours("precipitation"),
+        "visibility_max" => DailyWeatherAggregation::Max("visibility"),
+        "visibility_min" => DailyWeatherAggregation::Min("visibility"),
+        "visibility_mean" => DailyWeatherAggregation::Mean("visibility"),
+        "pressure_msl_max" => DailyWeatherAggregation::Max("pressure_msl"),
+        "pressure_msl_min" => DailyWeatherAggregation::Min("pressure_msl"),
+        "pressure_msl_mean" => DailyWeatherAggregation::Mean("pressure_msl"),
+        "surface_pressure_max" => DailyWeatherAggregation::Max("surface_pressure"),
+        "surface_pressure_min" => DailyWeatherAggregation::Min("surface_pressure"),
+        "surface_pressure_mean" => DailyWeatherAggregation::Mean("surface_pressure"),
+        "cape_max" => DailyWeatherAggregation::Max("cape"),
+        "cape_min" => DailyWeatherAggregation::Min("cape"),
+        "cape_mean" => DailyWeatherAggregation::Mean("cape"),
+        "cloud_cover_max" | "cloudcover_max" => DailyWeatherAggregation::Max("cloud_cover"),
+        "cloud_cover_min" | "cloudcover_min" => DailyWeatherAggregation::Min("cloud_cover"),
+        "cloud_cover_mean" | "cloudcover_mean" => DailyWeatherAggregation::Mean("cloud_cover"),
+        "dew_point_2m_max" | "dewpoint_2m_max" => DailyWeatherAggregation::Max("dew_point_2m"),
+        "dew_point_2m_min" | "dewpoint_2m_min" => DailyWeatherAggregation::Min("dew_point_2m"),
+        "dew_point_2m_mean" | "dewpoint_2m_mean" => DailyWeatherAggregation::Mean("dew_point_2m"),
+        "relative_humidity_2m_max" => DailyWeatherAggregation::Max("relative_humidity_2m"),
+        "relative_humidity_2m_min" => DailyWeatherAggregation::Min("relative_humidity_2m"),
+        "relative_humidity_2m_mean" => DailyWeatherAggregation::Mean("relative_humidity_2m"),
+        "snow_depth_max" => DailyWeatherAggregation::Max("snow_depth"),
+        "snow_depth_min" => DailyWeatherAggregation::Min("snow_depth"),
+        "snow_depth_mean" => DailyWeatherAggregation::Mean("snow_depth"),
+        "uv_index_max" => DailyWeatherAggregation::Max("uv_index"),
+        "uv_index_clear_sky_max" => DailyWeatherAggregation::Max("uv_index_clear_sky"),
+        _ => bail!(
+            "unsupported daily weather variable: {variable}; this server only exposes official aggregations backed by locally downloaded fields"
+        ),
+    };
+    Ok(aggregation)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_daily_weather(
+    response: &mut ForecastResponse,
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    latitude: f64,
+    longitude: f64,
+    variables: &[String],
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    past_days: Option<usize>,
+    forecast_days: Option<usize>,
+    timezone: &QueryTimezone,
+) -> Result<()> {
+    let aggregations = variables
+        .iter()
+        .map(|variable| daily_weather_aggregation(variable))
+        .collect::<Result<Vec<_>>>()?;
+    let seed = aggregations
+        .first()
+        .context("daily weather variables must not be empty")?
+        .seed_variable();
+    let dates = select_weather_dates(
+        snapshot,
+        seed,
+        start_date,
+        end_date,
+        past_days,
+        forecast_days,
+        timezone,
+    )?;
+
+    let mut daily_units = BTreeMap::new();
+    daily_units.insert("time".to_string(), "iso8601".to_string());
+    let mut daily = BTreeMap::new();
+    daily.insert(
+        "time".to_string(),
+        serde_json::to_value(
+            dates
+                .iter()
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>(),
+        )?,
+    );
+
+    for (variable, aggregation) in variables.iter().zip(aggregations) {
+        let values = dates
+            .iter()
+            .map(|date| {
+                daily_weather_value(
+                    snapshot,
+                    decoder,
+                    aggregation,
+                    *date,
+                    timezone,
+                    latitude,
+                    longitude,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        daily_units.insert(
+            variable.clone(),
+            daily_weather_unit(variable, aggregation).to_string(),
+        );
+        daily.insert(
+            variable.clone(),
+            json_array_for_variable(aggregation.output_variable(), values),
+        );
+    }
+    response.daily_units = Some(daily_units);
+    response.daily = Some(daily);
+    Ok(())
+}
+
+fn select_weather_dates(
+    snapshot: &OmDataSnapshot,
+    seed_variable: &str,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    past_days: Option<usize>,
+    forecast_days: Option<usize>,
+    timezone: &QueryTimezone,
+) -> Result<Vec<NaiveDate>> {
+    if start_date.is_some() != end_date.is_some() {
+        bail!("both start_date and end_date must be set");
+    }
+    if start_date.is_some() && (past_days.unwrap_or(0) != 0 || forecast_days.unwrap_or(0) != 0) {
+        bail!("past_days and forecast_days cannot be combined with start_date and end_date");
+    }
+
+    let raw_seed = seed_variable_for_times(seed_variable);
+    let (product_name, raw_variable) = product_for_variable(snapshot, raw_seed)?;
+    let mut times = snapshot
+        .product_snapshots(product_name)
+        .into_iter()
+        .flat_map(|product| {
+            product
+                .entries
+                .keys()
+                .filter(|key| key.variable == raw_variable)
+                .map(|key| key.valid_time_utc)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    times.sort();
+    times.dedup();
+    let first = *times
+        .first()
+        .context("no data available for requested daily weather variable")?;
+    let last = *times
+        .last()
+        .context("no data available for requested daily weather variable")?;
+    let first_date = first.with_timezone(&timezone.offset).date_naive();
+    let last_date = last.with_timezone(&timezone.offset).date_naive();
+
+    let (requested_start, requested_end) = match (start_date, end_date) {
+        (Some(start), Some(end)) => (
+            NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                .with_context(|| format!("invalid date: {start}"))?,
+            NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                .with_context(|| format!("invalid date: {end}"))?,
+        ),
+        (None, None) => {
+            let past_days = past_days.unwrap_or(0);
+            let forecast_days = forecast_days.unwrap_or(7);
+            if forecast_days == 0 || forecast_days > 16 {
+                bail!("forecast_days must be between 1 and 16");
+            }
+            let today = Utc::now().with_timezone(&timezone.offset).date_naive();
+            (
+                today
+                    .checked_sub_signed(Duration::days(past_days as i64))
+                    .context("daily start date overflow")?,
+                today
+                    .checked_add_signed(Duration::days(forecast_days as i64 - 1))
+                    .context("daily end date overflow")?,
+            )
+        }
+        _ => unreachable!("validated matching start/end date options"),
+    };
+    if requested_start > requested_end {
+        bail!("start_date must not be after end_date");
+    }
+    if requested_start < first_date || requested_end > last_date {
+        bail!(
+            "daily date range is outside available data: {} to {}",
+            first_date,
+            last_date
+        );
+    }
+
+    let mut dates = Vec::new();
+    let mut date = requested_start;
+    while date <= requested_end {
+        dates.push(date);
+        date = date.succ_opt().context("daily date range overflow")?;
+    }
+    Ok(dates)
+}
+
+fn daily_weather_value(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    aggregation: DailyWeatherAggregation,
+    date: NaiveDate,
+    timezone: &QueryTimezone,
+    latitude: f64,
+    longitude: f64,
+) -> Result<f32> {
+    let local_start = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid daily local start")?;
+    let local_end = date
+        .succ_opt()
+        .context("daily date overflow")?
+        .and_hms_opt(0, 0, 0)
+        .context("invalid daily local end")?;
+    let start = timezone
+        .offset
+        .from_local_datetime(&local_start)
+        .single()
+        .context("invalid daily local start")?
+        .with_timezone(&Utc);
+    let end = timezone
+        .offset
+        .from_local_datetime(&local_end)
+        .single()
+        .context("invalid daily local end")?
+        .with_timezone(&Utc);
+
+    if matches!(aggregation, DailyWeatherAggregation::DominantWindDirection) {
+        let mut u_sum = 0.0_f32;
+        let mut v_sum = 0.0_f32;
+        let mut time = start;
+        while time < end {
+            let u = read_daily_hour(
+                snapshot,
+                decoder,
+                "wind_u_component_10m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let v = read_daily_hour(
+                snapshot,
+                decoder,
+                "wind_v_component_10m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            if !u.is_finite() || !v.is_finite() {
+                return Ok(f32::NAN);
+            }
+            u_sum += u;
+            v_sum += v;
+            time += Duration::hours(1);
+        }
+        return Ok(wind_direction(u_sum, v_sum));
+    }
+
+    let source = aggregation.seed_variable();
+    let mut values = Vec::new();
+    let mut time = start;
+    while time < end {
+        values.push(read_daily_hour(
+            snapshot, decoder, source, time, latitude, longitude,
+        )?);
+        time += Duration::hours(1);
+    }
+
+    let finite_extreme = |take_max: bool| {
+        values
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .reduce(|left, right| {
+                if take_max {
+                    left.max(right)
+                } else {
+                    left.min(right)
+                }
+            })
+            .unwrap_or(f32::NAN)
+    };
+    let complete = values.iter().all(|value| value.is_finite());
+    let value = match aggregation {
+        DailyWeatherAggregation::Max(_) => finite_extreme(true),
+        DailyWeatherAggregation::Min(_) => finite_extreme(false),
+        DailyWeatherAggregation::Mean(_) if complete => {
+            values.iter().sum::<f32>() / values.len() as f32
+        }
+        DailyWeatherAggregation::Sum(_) if complete => values.iter().sum(),
+        DailyWeatherAggregation::RadiationSum(_) if complete => {
+            (values.iter().map(|value| value * 0.0036).sum::<f32>() * 100.0).round() / 100.0
+        }
+        DailyWeatherAggregation::PrecipitationHours(_) if complete => values
+            .iter()
+            .map(|value| if *value > 0.001 { 1.0 } else { 0.0 })
+            .sum(),
+        DailyWeatherAggregation::Mean(_)
+        | DailyWeatherAggregation::Sum(_)
+        | DailyWeatherAggregation::RadiationSum(_)
+        | DailyWeatherAggregation::PrecipitationHours(_) => f32::NAN,
+        DailyWeatherAggregation::DominantWindDirection => unreachable!("handled above"),
+    };
+    Ok(value)
+}
+
+fn read_daily_hour(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    variable: &str,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<f32> {
+    match read_variable_value(snapshot, decoder, variable, time, latitude, longitude) {
+        Ok(value) => Ok(value),
+        Err(error) if error.to_string().contains("variable/time is not available") => Ok(f32::NAN),
+        Err(error) => Err(error),
+    }
+}
+
+fn daily_weather_unit(variable: &str, aggregation: DailyWeatherAggregation) -> &'static str {
+    match variable {
+        "shortwave_radiation_sum" => "MJ/m\u{00B2}",
+        "precipitation_hours" => "h",
+        _ => unit_for_variable(aggregation.output_variable()),
+    }
 }
 
 fn attach_daily_chinese_aqi(
@@ -465,6 +984,46 @@ pub fn read_variable_value(
     match variable {
         "weather_code" | "weathercode" => {
             return read_weather_code(snapshot, decoder, time, latitude, longitude);
+        }
+        "apparent_temperature" => {
+            let temperature = read_direct(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let relative_humidity = read_direct(
+                snapshot,
+                decoder,
+                "relative_humidity_2m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let wind_speed = read_variable_value(
+                snapshot,
+                decoder,
+                "wind_speed_10m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let shortwave_radiation = read_direct(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                time,
+                latitude,
+                longitude,
+            )?;
+            return Ok(apparent_temperature(
+                temperature,
+                relative_humidity,
+                wind_speed,
+                Some(shortwave_radiation),
+            ));
         }
         "surface_pressure" => {
             let temperature = read_direct(
@@ -2517,7 +3076,7 @@ fn product_for_variable(
 
 fn seed_variable_for_times(variable: &str) -> &str {
     match variable {
-        "dew_point_2m" | "dewpoint_2m" => "temperature_2m",
+        "dew_point_2m" | "dewpoint_2m" | "apparent_temperature" => "temperature_2m",
         "surface_pressure" => "temperature_2m",
         "weather_code" | "weathercode" => "cloud_cover",
         "rain" => "precipitation",
@@ -3470,6 +4029,22 @@ fn dew_point(temperature: f32, relative_humidity: f32) -> f32 {
     lambda * x / (beta - x)
 }
 
+fn apparent_temperature(
+    temperature_2m: f32,
+    relative_humidity_2m: f32,
+    wind_speed_10m: f32,
+    shortwave_radiation: Option<f32>,
+) -> f32 {
+    let wind_speed_2m = wind_speed_10m * 0.75;
+    let vapor_pressure = relative_humidity_2m / 100.0
+        * 6.105
+        * (17.27 * temperature_2m / (237.7 + temperature_2m)).exp();
+    let radiation = (0.1 * (shortwave_radiation.unwrap_or(550.0) - 550.0)).max(0.0);
+    temperature_2m + 0.348 * vapor_pressure - 0.70 * wind_speed_2m
+        + 0.70 * (radiation / (wind_speed_2m + 10.0))
+        - 4.25
+}
+
 fn unit_for_variable(variable: &str) -> &'static str {
     if variable.ends_with("hPa") {
         if variable.starts_with("temperature_") {
@@ -3490,6 +4065,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
     }
     match variable {
         "temperature_2m"
+        | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
         | "dew_point_2m"
@@ -3701,6 +4277,7 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "aerosol_optical_depth" => OutputDecimals::Fixed(2),
         "snowfall" | "uv_index" | "uv_index_clear_sky" => OutputDecimals::Fixed(2),
         "temperature_2m"
+        | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
         | "dew_point_2m"

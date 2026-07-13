@@ -56,6 +56,38 @@ GET /v1/air-quality?latitude=31.23&longitude=121.47&hourly=chinese_aqi&daily=chi
 POST /v1/route
 ```
 
+Daily weather:
+
+```text
+GET /v1/forecast?latitude=31.23&longitude=121.47&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_max,precipitation_sum,precipitation_hours,weather_code,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant&start_date=2026-07-13&end_date=2026-07-13&timezone=Asia%2FShanghai
+```
+
+- Daily values use the natural-day UTC offset selected by `timezone`. With no
+  timezone the official GMT default is used. Explicit IANA names such as
+  `Asia/Shanghai` are supported for single and multi-coordinate requests.
+- `start_date` and `end_date` must be supplied together. Otherwise the
+  endpoint uses `past_days=0` and `forecast_days=7`; `forecast_days` is
+  limited to 1 through 16.
+- Supported official aggregations backed by local GFS fields are temperature
+  and apparent-temperature max/min/mean, precipitation/rain/showers/snow sums,
+  precipitation hours, weather code, shortwave-radiation sum, 10 m wind
+  speed/gust max/min/mean, dominant 10 m wind direction, visibility,
+  mean-sea-level/surface pressure, CAPE, cloud cover, dew point, relative
+  humidity, snow depth, and UV-index maxima. Both current and legacy
+  Open-Meteo aliases listed in `VariableDaily.swift` are accepted.
+- The implementation follows Open-Meteo
+  `VariableDaily.swift`, `GenericDailyCalculator.swift`, and
+  `Meteorology.apparentTemperature` at the frozen upstream commit above.
+  Max/min ignore unavailable hours; mean, sum, radiation sum, precipitation
+  hours, and dominant direction require a complete natural day.
+- GFS omits hour 0 for solar radiation. Until the frozen upstream
+  `solar_backwards_averaged` interpolation is ported and validated,
+  `shortwave_radiation_sum` can be `null` for a day containing that gap.
+  The API does not substitute a custom estimate.
+- `timezone=auto`, sunrise/sunset/daylight calculations, and daily variables
+  without an exactly equivalent local input are rejected instead of
+  approximated.
+
 Chinese AQI:
 
 - `hourly=chinese_aqi,...` implements the HJ 633-2026 hourly forecast method:

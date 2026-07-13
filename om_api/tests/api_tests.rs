@@ -1966,3 +1966,180 @@ async fn land_cell_selection_requires_dem_before_serving() {
         .unwrap()
         .contains("cell_selection=land requires DEM"));
 }
+
+fn daily_weather_fixture_root() -> TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let coverage_id = "gfs013_surface_daily_weather";
+    let mut entries = Vec::new();
+    for index in 0..24 {
+        let (date, hour) = if index < 8 {
+            ("2026-07-07", 16 + index)
+        } else {
+            ("2026-07-08", index - 8)
+        };
+        let timestamp: &'static str =
+            Box::leak(format!("{date}T{hour:02}:00:00Z").into_boxed_str());
+        let scalar = |value| [value, value, value, value];
+        entries.extend([
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: scalar(index as f32),
+                valid_time_utc: timestamp,
+            },
+            TimedTestEntry {
+                variable: "relative_humidity_2m",
+                values: scalar(50.0),
+                valid_time_utc: timestamp,
+            },
+            TimedTestEntry {
+                variable: "precipitation",
+                values: scalar(if index < 3 { 0.5 } else { 0.0 }),
+                valid_time_utc: timestamp,
+            },
+            TimedTestEntry {
+                variable: "shortwave_radiation",
+                values: scalar(100.0),
+                valid_time_utc: timestamp,
+            },
+            TimedTestEntry {
+                variable: "wind_u_component_10m",
+                values: scalar(-3.0),
+                valid_time_utc: timestamp,
+            },
+            TimedTestEntry {
+                variable: "wind_v_component_10m",
+                values: scalar(0.0),
+                valid_time_utc: timestamp,
+            },
+        ]);
+    }
+    write_product_coverage_timed(root.path(), "gfs013_surface", coverage_id, entries, false);
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage_id)]);
+    root
+}
+
+#[tokio::test]
+async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
+    let root = daily_weather_fixture_root();
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,shortwave_radiation_sum,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["utc_offset_seconds"], 28_800);
+    assert_eq!(body["timezone"], "Asia/Shanghai");
+    assert_eq!(body["daily"]["time"], serde_json::json!(["2026-07-08"]));
+    assert_eq!(
+        body["daily"]["temperature_2m_max"],
+        serde_json::json!([23.0])
+    );
+    assert_eq!(
+        body["daily"]["temperature_2m_min"],
+        serde_json::json!([0.0])
+    );
+    assert_eq!(
+        body["daily"]["temperature_2m_mean"],
+        serde_json::json!([11.5])
+    );
+    assert!(body["daily"]["apparent_temperature_mean"][0].is_number());
+    assert_eq!(body["daily"]["precipitation_sum"], serde_json::json!([1.5]));
+    assert_eq!(
+        body["daily"]["precipitation_hours"],
+        serde_json::json!([3.0])
+    );
+    assert_eq!(
+        body["daily"]["shortwave_radiation_sum"],
+        serde_json::json!([8.64])
+    );
+    assert_eq!(
+        body["daily"]["wind_speed_10m_max"],
+        serde_json::json!([3.0])
+    );
+    assert_eq!(
+        body["daily"]["wind_direction_10m_dominant"],
+        serde_json::json!([90])
+    );
+    assert_eq!(
+        body["daily_units"]["shortwave_radiation_sum"],
+        "MJ/m\u{00B2}"
+    );
+    assert_eq!(body["hourly"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn daily_weather_supports_multiple_coordinates() {
+    let root = daily_weather_fixture_root();
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90,-89&longitude=-180,-179&daily=temperature_2m_max,precipitation_sum&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let responses = body.as_array().unwrap();
+    assert_eq!(responses.len(), 2);
+    for response in responses {
+        assert_eq!(
+            response["daily"]["temperature_2m_max"],
+            serde_json::json!([23.0])
+        );
+        assert_eq!(
+            response["daily"]["precipitation_sum"],
+            serde_json::json!([1.5])
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_timezone_applies_to_hour_selection_and_output() {
+    let root = daily_weather_fixture_root();
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00&timezone=Asia%2FShanghai",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["hourly"]["time"],
+        serde_json::json!(["2026-07-08T00:00"])
+    );
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([0.0]));
+}
+
+#[tokio::test]
+async fn daily_weather_rejects_non_exact_features() {
+    let root = daily_weather_fixture_root();
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+
+    let (auto_status, auto_body) = request_json(
+        app.clone(),
+        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max&start_date=2026-07-08&end_date=2026-07-08&timezone=auto",
+    )
+    .await;
+    assert_eq!(auto_status, StatusCode::BAD_REQUEST);
+    assert!(auto_body["error"]
+        .as_str()
+        .unwrap()
+        .contains("timezone=auto"));
+
+    let (sunrise_status, sunrise_body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&daily=sunrise&start_date=2026-07-08&end_date=2026-07-08",
+    )
+    .await;
+    assert_eq!(sunrise_status, StatusCode::BAD_REQUEST);
+    assert!(sunrise_body["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported daily weather variable"));
+}
