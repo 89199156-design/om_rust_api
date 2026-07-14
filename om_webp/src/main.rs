@@ -5,7 +5,7 @@ use fs2::FileExt;
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 use om_api::official::OfficialDecoder;
-use om_api::query::{read_variable_grid, round_variable_output_value};
+use om_api::query::{read_variable_grid_series, round_variable_output_value};
 use om_api::snapshot::OmDataSnapshot;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -169,8 +169,10 @@ struct Args {
     bottom_lat: f64,
     #[arg(long, default_value_t = 58.0)]
     top_lat: f64,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 2, env = "OM_WEBP_WORKERS")]
     workers: usize,
+    #[arg(long, default_value_t = 24, env = "OM_WEBP_SERIES_BLOCK_HOURS")]
+    series_block_hours: usize,
     #[arg(long)]
     layers: Option<String>,
     #[arg(long)]
@@ -405,9 +407,7 @@ fn main() -> Result<()> {
     let selected = select_layers(args.scope.layers(), args.layers.as_deref())?;
     let grid = compute_grid(args.left_lon, args.right_lon, args.bottom_lat, args.top_lat)?;
     let start = parse_run(&ready.latest_complete_run)?;
-    let times = (0..args.frames)
-        .map(|offset| start + Duration::hours(offset as i64))
-        .collect::<Vec<_>>();
+    let times = render_times(start, args.frames)?;
     let snapshot = Arc::new(OmDataSnapshot::load(&args.data_root)?);
     let decoder = Arc::new(OfficialDecoder::load(&args.decoder_lib)?);
     let release_root = args.output_root.join("releases").join(format!(
@@ -433,45 +433,46 @@ fn main() -> Result<()> {
     for layer in &selected {
         fs::create_dir_all(product_staging.join(layer.name))?;
     }
+    if args.series_block_hours == 0 {
+        bail!("--series-block-hours must be positive");
+    }
     let total_invalid = std::sync::atomic::AtomicUsize::new(0);
-    pool.install(|| {
-        times
-            .par_iter()
-            .enumerate()
-            .try_for_each(|(frame_index, time)| -> Result<()> {
-                let frame_started = Instant::now();
-                let rendered = render_frame(&snapshot, &decoder, &grid, &selected, *time)?;
-                let stem = format!("{}_{}", time.timestamp(), batch);
-                for layer in rendered {
-                    if layer.invalid_points > 0 {
-                        println!(
-                            "[om-webp-layer] scope={} frame={} layer={} invalid_points={}",
-                            args.scope.group(),
-                            frame_index + 1,
-                            layer.layer_name,
-                            layer.invalid_points
-                        );
-                    }
-                    fs::write(
-                        product_staging
-                            .join(layer.layer_name)
-                            .join(format!("{stem}.webp")),
-                        layer.bytes,
-                    )?;
-                    total_invalid
-                        .fetch_add(layer.invalid_points, std::sync::atomic::Ordering::Relaxed);
+    for (block_index, block_times) in times.chunks(args.series_block_hours).enumerate() {
+        let block_started = Instant::now();
+        let rendered = pool
+            .install(|| render_series_block(&snapshot, &decoder, &grid, &selected, block_times))?;
+        for (offset, layers) in rendered.into_iter().enumerate() {
+            let frame_index = block_index * args.series_block_hours + offset;
+            let time = block_times[offset];
+            let stem = format!("{}_{}", time.timestamp(), batch);
+            for layer in layers {
+                if layer.invalid_points > 0 {
+                    println!(
+                        "[om-webp-layer] scope={} frame={} layer={} invalid_points={}",
+                        args.scope.group(),
+                        frame_index + 1,
+                        layer.layer_name,
+                        layer.invalid_points
+                    );
                 }
-                println!(
-                    "[om-webp] scope={} frame={}/{} valid_time={} elapsed_ms={}",
-                    args.scope.group(),
-                    frame_index + 1,
-                    times.len(),
-                    time.to_rfc3339(),
-                    frame_started.elapsed().as_millis()
-                );
-                Ok(())
-            })
-    })?;
+                fs::write(
+                    product_staging
+                        .join(layer.layer_name)
+                        .join(format!("{stem}.webp")),
+                    layer.bytes,
+                )?;
+                total_invalid.fetch_add(layer.invalid_points, std::sync::atomic::Ordering::Relaxed);
+            }
+            println!(
+                "[om-webp] scope={} frame={}/{} valid_time={} block_elapsed_ms={}",
+                args.scope.group(),
+                frame_index + 1,
+                times.len(),
+                time.to_rfc3339(),
+                block_started.elapsed().as_millis()
+            );
+        }
+    }
 
     let manifest = build_manifest(args.scope, &ready, &grid, &selected, &times);
     fs::write(
@@ -531,6 +532,15 @@ fn load_group_ready(data_root: &Path, scope: Scope) -> Result<GroupReady> {
 fn parse_run(run: &str) -> Result<DateTime<Utc>> {
     let parsed = NaiveDateTime::parse_from_str(&format!("{run}00"), "%Y%m%d%H%M")?;
     Ok(Utc.from_utc_datetime(&parsed))
+}
+
+fn render_times(start: DateTime<Utc>, frames: usize) -> Result<Vec<DateTime<Utc>>> {
+    if frames == 0 {
+        bail!("--frames must be positive");
+    }
+    Ok((0..frames)
+        .map(|offset| start + Duration::hours(offset as i64))
+        .collect())
 }
 
 fn compute_grid(left: f64, right: f64, bottom: f64, top: f64) -> Result<RegionGrid> {
@@ -614,18 +624,12 @@ fn select_layers(all: &'static [Layer], names: Option<&str>) -> Result<Vec<Layer
     Ok(selected)
 }
 
-fn render_layer(
-    snapshot: &OmDataSnapshot,
-    decoder: &OfficialDecoder,
+fn encode_layer_values(
     grid: &RegionGrid,
     layer: &Layer,
-    time: DateTime<Utc>,
+    values: &[f32],
+    values_v: Option<&[f32]>,
 ) -> Result<RenderedLayer> {
-    let values = read_layer_grid(snapshot, decoder, layer.variable, time, grid)?;
-    let values_v = match layer.variable_v {
-        Some(variable) => Some(read_layer_grid(snapshot, decoder, variable, time, grid)?),
-        None => None,
-    };
     let mut rgba = vec![0u8; grid.len() * 4];
     let invalid = std::sync::atomic::AtomicUsize::new(0);
     rgba.par_chunks_mut(4)
@@ -638,7 +642,7 @@ fn render_layer(
             }
             Encoding::Wind => {
                 let u = values[index];
-                let v = values_v.as_ref().expect("wind v")[index];
+                let v = values_v.expect("wind v")[index];
                 encode_wind(pixel, u, v, &invalid);
             }
         });
@@ -656,31 +660,54 @@ fn render_layer(
     })
 }
 
-fn render_frame(
+fn render_series_block(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     grid: &RegionGrid,
     layers: &[Layer],
-    time: DateTime<Utc>,
-) -> Result<Vec<RenderedLayer>> {
-    let (weather_layers, regular_layers): (Vec<_>, Vec<_>) = layers
+    times: &[DateTime<Utc>],
+) -> Result<Vec<Vec<RenderedLayer>>> {
+    let (weather_layers, regular_layers): (Vec<&Layer>, Vec<&Layer>) = layers
         .iter()
         .partition(|layer| !matches!(layer.derive, Derive::None));
-    let mut rendered = regular_layers
-        .par_iter()
-        .map(|layer| render_layer(snapshot, decoder, grid, layer, time))
-        .collect::<Result<Vec<_>>>()?;
-    if weather_layers.is_empty() {
-        return Ok(rendered);
-    }
-
-    let weather_codes = read_layer_grid(snapshot, decoder, weather_layers[0].variable, time, grid)?;
-    rendered.extend(
-        weather_layers
+    let mut rendered = (0..times.len()).map(|_| Vec::new()).collect::<Vec<_>>();
+    for layer in regular_layers {
+        let values = read_layer_grid_series(snapshot, decoder, layer.variable, times, grid)?;
+        let values_v = match layer.variable_v {
+            Some(variable) => Some(read_layer_grid_series(
+                snapshot, decoder, variable, times, grid,
+            )?),
+            None => None,
+        };
+        let encoded = values
             .par_iter()
-            .map(|layer| encode_cached_scalar_layer(grid, layer, &weather_codes))
-            .collect::<Result<Vec<_>>>()?,
-    );
+            .enumerate()
+            .map(|(index, values)| {
+                encode_layer_values(
+                    grid,
+                    layer,
+                    values,
+                    values_v.as_ref().map(|series| series[index].as_slice()),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (frame, layer) in rendered.iter_mut().zip(encoded) {
+            frame.push(layer);
+        }
+    }
+    if !weather_layers.is_empty() {
+        let weather_codes =
+            read_layer_grid_series(snapshot, decoder, weather_layers[0].variable, times, grid)?;
+        for layer in weather_layers {
+            let encoded = weather_codes
+                .par_iter()
+                .map(|values| encode_cached_scalar_layer(grid, layer, values))
+                .collect::<Result<Vec<_>>>()?;
+            for (frame, layer) in rendered.iter_mut().zip(encoded) {
+                frame.push(layer);
+            }
+        }
+    }
     Ok(rendered)
 }
 
@@ -716,29 +743,31 @@ fn encode_cached_scalar_layer(
     })
 }
 
-fn read_layer_grid(
+fn read_layer_grid_series(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     variable: &str,
-    time: DateTime<Utc>,
+    times: &[DateTime<Utc>],
     grid: &RegionGrid,
-) -> Result<Vec<f32>> {
-    match read_variable_grid(
+) -> Result<Vec<Vec<f32>>> {
+    match read_variable_grid_series(
         snapshot,
         decoder,
         variable,
-        time,
+        times,
         &grid.latitudes,
         &grid.longitudes,
     ) {
-        Ok(mut values) => {
-            values
-                .iter_mut()
-                .for_each(|value| *value = round_variable_output_value(variable, *value));
-            Ok(values)
+        Ok(mut series) => {
+            for values in &mut series {
+                values
+                    .iter_mut()
+                    .for_each(|value| *value = round_variable_output_value(variable, *value));
+            }
+            Ok(series)
         }
         Err(error) if error.to_string().contains("variable/time is not available") => {
-            Ok(vec![f32::NAN; grid.len()])
+            Ok(vec![vec![f32::NAN; grid.len()]; times.len()])
         }
         Err(error) => Err(error),
     }
@@ -1015,5 +1044,32 @@ mod tests {
         assert_eq!(derive_value(80.0, Derive::PrecipPhase), 1.0);
         assert_eq!(derive_value(71.0, Derive::PrecipPhase), 2.0);
         assert_eq!(derive_value(66.0, Derive::PrecipPhase), 4.0);
+    }
+
+    #[test]
+    fn gfs_and_cams_each_render_121_hourly_webp_frames() {
+        let start = parse_run("2026071306").unwrap();
+        let gfs = render_times(start, 121).unwrap();
+        let cams = render_times(start, 121).unwrap();
+
+        assert_eq!(gfs.len(), 121);
+        assert_eq!(cams.len(), 121);
+        assert_eq!(gfs, cams);
+        assert_eq!(gfs[0], start);
+        assert_eq!(*gfs.last().unwrap(), start + Duration::hours(120));
+    }
+
+    #[test]
+    fn client_node_defaults_webp_to_two_workers() {
+        let args = Args::try_parse_from([
+            "om-webp",
+            "--scope",
+            "gfs",
+            "--decoder-lib",
+            "/tmp/libomfileformat.so",
+        ])
+        .unwrap();
+
+        assert_eq!(args.workers, 2);
     }
 }
