@@ -181,6 +181,30 @@ fn set_coverage_public_start(root: &Path, product: &str, coverage_id: &str, valu
     fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
+fn set_coverage_entry_source_run(
+    root: &Path,
+    product: &str,
+    coverage_id: &str,
+    variable: &str,
+    valid_time_utc: &str,
+    source_run: &str,
+) {
+    let path = root
+        .join(product)
+        .join("coverages")
+        .join(coverage_id)
+        .join("latest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entry = manifest["files"][0]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["variable"] == variable && entry["valid_time_utc"] == valid_time_utc)
+        .unwrap();
+    entry["source_run"] = Value::String(source_run.to_string());
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
 struct TestEntry {
     variable: &'static str,
     values: [f32; 4],
@@ -1092,6 +1116,134 @@ async fn forecast_endpoint_interpolates_sparse_temperature_with_hermite() {
     assert_eq!(
         body["hourly"]["temperature_2m"],
         serde_json::json!([0.0, 3.0, 7.0, 9.0, 7.0, 3.0, 0.0])
+    );
+}
+
+#[tokio::test]
+async fn forecast_endpoint_rejects_only_cross_run_hermite_core_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage_id = "gfs013_surface_cross_run_latent_heat_flux";
+    write_product_coverage_timed(
+        root.path(),
+        "gfs013_surface",
+        coverage_id,
+        vec![
+            TimedTestEntry {
+                variable: "latent_heat_flux",
+                values: [5.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T05:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "latent_heat_flux",
+                values: [7.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T07:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "latent_heat_flux",
+                values: [20.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T09:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "latent_heat_flux",
+                values: [20.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T12:00:00Z",
+            },
+        ],
+        false,
+    );
+    set_coverage_entry_source_run(
+        root.path(),
+        "gfs013_surface",
+        coverage_id,
+        "latent_heat_flux",
+        "2026-07-08T05:00:00Z",
+        "2026071200",
+    );
+    for time in [
+        "2026-07-08T07:00:00Z",
+        "2026-07-08T09:00:00Z",
+        "2026-07-08T12:00:00Z",
+    ] {
+        set_coverage_entry_source_run(
+            root.path(),
+            "gfs013_surface",
+            coverage_id,
+            "latent_heat_flux",
+            time,
+            "2026071206",
+        );
+    }
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage_id)]);
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+
+    let (status, boundary) = request_json(
+        app.clone(),
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=latent_heat_flux&start_hour=2026-07-08T06:00&end_hour=2026-07-08T06:00",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{boundary}");
+    assert_eq!(
+        boundary["hourly"]["latent_heat_flux"],
+        serde_json::json!([null])
+    );
+
+    let (status, same_run) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=latent_heat_flux&start_hour=2026-07-08T10:00&end_hour=2026-07-08T10:00",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{same_run}");
+    assert!(same_run["hourly"]["latent_heat_flux"][0].is_number());
+}
+
+#[tokio::test]
+async fn apparent_temperature_is_null_when_requested_shortwave_is_null() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage_id = write_product(
+        root.path(),
+        "gfs013_surface",
+        vec![
+            TestEntry {
+                variable: "temperature_2m",
+                values: [20.0, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "relative_humidity_2m",
+                values: [50.0, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "wind_u_component_10m",
+                values: [4.0, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "wind_v_component_10m",
+                values: [0.0, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "shortwave_radiation",
+                values: [f32::NAN, 0.0, 0.0, 0.0],
+            },
+        ],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", &coverage_id)]);
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=apparent_temperature,shortwave_radiation&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["hourly"]["apparent_temperature"],
+        serde_json::json!([null])
+    );
+    assert_eq!(
+        body["hourly"]["shortwave_radiation"],
+        serde_json::json!([null])
     );
 }
 

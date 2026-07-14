@@ -290,6 +290,20 @@ fn load_native_product(
         if meta.reference_time != expected_reference {
             bail!("native run reference time mismatch: {}", source_run);
         }
+        if product_ready.runtime_domain.starts_with("ncep_gfs") {
+            // Before loading a new six-hour GFS run, discard the previous
+            // run's f006 boundary entries. Variables with a real f000 frame
+            // are inserted again below; variables that officially skip f000
+            // must remain absent. Open-Meteo retains only the explicit
+            // interval/cloud exceptions at this boundary.
+            entries.retain(|key: &EntryKey, _| {
+                key.valid_time_utc != meta.reference_time
+                    || preserves_previous_gfs_boundary_variable(
+                        &product_ready.runtime_domain,
+                        &key.variable,
+                    )
+            });
+        }
         for variable in meta
             .variables
             .iter()
@@ -332,6 +346,8 @@ fn load_native_product(
                 };
                 let replace = should_replace_overlapping_native_entry(
                     &product_ready.runtime_domain,
+                    variable,
+                    forecast_hour,
                     valid_time,
                     latest_reference,
                     entries.contains_key(&key),
@@ -449,10 +465,23 @@ fn load_native_product(
 
 fn should_replace_overlapping_native_entry(
     runtime_domain: &str,
+    variable: &str,
+    forecast_hour: i64,
     valid_time: DateTime<Utc>,
     latest_reference: DateTime<Utc>,
     already_present: bool,
 ) -> bool {
+    // Open-Meteo keeps the previous GFS run's f006 value at the six-hour
+    // boundary for fields whose new-run f000 value does not represent the
+    // same forecast interval. Source runs are loaded in ascending order, so
+    // an existing entry at a new run's f000 is the preceding run's f006.
+    let preserve_previous_gfs_boundary = already_present
+        && forecast_hour == 0
+        && preserves_previous_gfs_boundary_variable(runtime_domain, variable);
+    if preserve_previous_gfs_boundary {
+        return false;
+    }
+
     // Shanghai's current CAMS coverage starts at the latest run and resolves
     // the pre-run AQI window from the retained coverage with the same cycle
     // on the previous day. Singapore retains an additional 12-hour run for
@@ -463,6 +492,22 @@ fn should_replace_overlapping_native_entry(
         !already_present
     } else {
         true
+    }
+}
+
+fn preserves_previous_gfs_boundary_variable(runtime_domain: &str, variable: &str) -> bool {
+    match runtime_domain {
+        "ncep_gfs013" => matches!(
+            variable,
+            "cloud_cover"
+                | "cloud_cover_low"
+                | "cloud_cover_mid"
+                | "cloud_cover_high"
+                | "precipitation"
+                | "showers"
+        ),
+        "ncep_gfs025" => variable == "categorical_freezing_rain",
+        _ => false,
     }
 }
 
@@ -619,32 +664,118 @@ mod tests {
 
         assert!(should_replace_overlapping_native_entry(
             "cams_global",
+            "pm2_5",
+            11,
             latest - Duration::hours(1),
             latest,
             false,
         ));
         assert!(!should_replace_overlapping_native_entry(
             "cams_global",
+            "pm2_5",
+            11,
             latest - Duration::hours(1),
             latest,
             true,
         ));
         assert!(should_replace_overlapping_native_entry(
             "cams_global",
+            "pm2_5",
+            0,
             latest,
             latest,
             true,
         ));
         assert!(should_replace_overlapping_native_entry(
             "ncep_gfs013",
+            "temperature_2m",
+            5,
             latest - Duration::hours(1),
             latest,
             true,
         ));
         assert!(should_replace_overlapping_native_entry(
             "cams_global_greenhouse_gases",
+            "carbon_monoxide",
+            23,
             latest - Duration::hours(1),
             latest,
+            true,
+        ));
+    }
+
+    #[test]
+    fn gfs_run_boundary_preserves_only_official_previous_f006_entries() {
+        let boundary = "2026-07-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let gfs013_boundary_variables = [
+            "cloud_cover",
+            "cloud_cover_low",
+            "cloud_cover_mid",
+            "cloud_cover_high",
+            "precipitation",
+            "showers",
+        ];
+
+        for variable in gfs013_boundary_variables {
+            assert!(!should_replace_overlapping_native_entry(
+                "ncep_gfs013",
+                variable,
+                0,
+                boundary,
+                boundary,
+                true,
+            ));
+        }
+        assert!(!should_replace_overlapping_native_entry(
+            "ncep_gfs025",
+            "categorical_freezing_rain",
+            0,
+            boundary,
+            boundary,
+            true,
+        ));
+
+        // The exception is only for an actual f000 overlap. All normal
+        // variables, later forecast hours, and entries without a predecessor
+        // continue to use the newly loaded run.
+        assert!(should_replace_overlapping_native_entry(
+            "ncep_gfs013",
+            "temperature_2m",
+            0,
+            boundary,
+            boundary,
+            true,
+        ));
+        assert!(should_replace_overlapping_native_entry(
+            "ncep_gfs013",
+            "cloud_cover",
+            1,
+            boundary + Duration::hours(1),
+            boundary,
+            true,
+        ));
+        assert!(should_replace_overlapping_native_entry(
+            "ncep_gfs013",
+            "precipitation",
+            0,
+            boundary,
+            boundary,
+            false,
+        ));
+        assert!(should_replace_overlapping_native_entry(
+            "ncep_gfs025",
+            "cloud_cover",
+            0,
+            boundary,
+            boundary,
+            true,
+        ));
+        assert!(should_replace_overlapping_native_entry(
+            "ncep_gfs013",
+            "categorical_freezing_rain",
+            0,
+            boundary,
+            boundary,
             true,
         ));
     }
@@ -1006,6 +1137,197 @@ mod tests {
         assert_eq!(greenhouse.entries[&day_two].source_run, "2026071200");
         assert_eq!(greenhouse.entries[&latest].source_run, "2026071300");
         assert_eq!(greenhouse.native_handles.len(), 3);
+    }
+
+    #[test]
+    fn loads_ascending_gfs_runs_with_official_f006_boundary_precedence() {
+        let temp = TempDir::new().unwrap();
+        let coverage = temp.path().join("gfs_boundary_coverage");
+        fs::create_dir_all(&coverage).unwrap();
+        fs::write(coverage.join("coverage.json"), b"{}").unwrap();
+
+        let source_runs = ["2026071200", "2026071206"];
+        let gfs013_variables = [
+            "cloud_cover",
+            "cloud_cover_low",
+            "cloud_cover_mid",
+            "cloud_cover_high",
+            "precipitation",
+            "showers",
+            "latent_heat_flux",
+            "shortwave_radiation",
+            "temperature_2m",
+        ];
+        for (run, latest) in source_runs.iter().copied().zip([false, true]) {
+            let reference_time =
+                DateTime::parse_from_str(&format!("{run}00 +0000"), "%Y%m%d%H%M %z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+            let run_root = coverage
+                .join("data_run/ncep_gfs013")
+                .join(reference_time.format("%Y/%m/%d/%H00Z").to_string());
+            fs::create_dir_all(&run_root).unwrap();
+            for variable in gfs013_variables {
+                let stored_times =
+                    if latest && matches!(variable, "latent_heat_flux" | "shortwave_radiation") {
+                        1
+                    } else if latest {
+                        2
+                    } else {
+                        1
+                    };
+                write_fake_om(
+                    &run_root.join(format!("{variable}.om")),
+                    [2, 3, stored_times],
+                );
+            }
+            let valid_times = if latest {
+                vec![reference_time, reference_time + Duration::hours(1)]
+            } else {
+                vec![reference_time + Duration::hours(6)]
+            };
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference_time,
+                    "variables": gfs013_variables,
+                    "valid_times": valid_times,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "gfs",
+            "coverage_id": "gfs_boundary_coverage",
+            "latest_complete_run": "2026071206",
+            "source_runs": source_runs,
+            "public_start_utc": "2026-07-12T00:00:00Z",
+            "coverage_path": "gfs_boundary_coverage",
+            "products": {}
+        }))
+        .unwrap();
+        let product_ready: NativeProductReady = serde_json::from_value(json!({
+            "runtime_domain": "ncep_gfs013",
+            "grid": {
+                "nx": 3,
+                "ny": 2,
+                "lon_min": 70.0,
+                "lat_min": 0.0,
+                "dx": 0.25,
+                "dy": 0.25,
+                "dt_seconds": 3600,
+                "om_file_length": 481
+            }
+        }))
+        .unwrap();
+
+        let product =
+            load_native_product(&coverage, &ready, "gfs013_surface", &product_ready).unwrap();
+        let boundary = "2026-07-12T06:00:00Z".parse().unwrap();
+        for variable in [
+            "cloud_cover",
+            "cloud_cover_low",
+            "cloud_cover_mid",
+            "cloud_cover_high",
+            "precipitation",
+            "showers",
+        ] {
+            let entry = product
+                .entries
+                .get(&EntryKey {
+                    variable: variable.to_string(),
+                    valid_time_utc: boundary,
+                })
+                .unwrap();
+            assert_eq!(entry.source_run, "2026071200", "{variable}");
+            assert_eq!(entry.forecast_hour, 6, "{variable}");
+        }
+        for variable in ["latent_heat_flux", "shortwave_radiation"] {
+            assert!(!product.entries.contains_key(&EntryKey {
+                variable: variable.to_string(),
+                valid_time_utc: boundary,
+            }));
+            let next_hour = product
+                .entries
+                .get(&EntryKey {
+                    variable: variable.to_string(),
+                    valid_time_utc: boundary + Duration::hours(1),
+                })
+                .unwrap();
+            assert_eq!(next_hour.source_run, "2026071206", "{variable}");
+            assert_eq!(next_hour.forecast_hour, 1, "{variable}");
+        }
+        let temperature = product
+            .entries
+            .get(&EntryKey {
+                variable: "temperature_2m".to_string(),
+                valid_time_utc: boundary,
+            })
+            .unwrap();
+
+        assert_eq!(temperature.source_run, "2026071206");
+        assert_eq!(temperature.forecast_hour, 0);
+
+        for (run, forecast_hour) in source_runs.iter().copied().zip([6_i64, 0]) {
+            let reference_time =
+                DateTime::parse_from_str(&format!("{run}00 +0000"), "%Y%m%d%H%M %z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+            let run_root = coverage
+                .join("data_run/ncep_gfs025")
+                .join(reference_time.format("%Y/%m/%d/%H00Z").to_string());
+            fs::create_dir_all(&run_root).unwrap();
+            for variable in ["categorical_freezing_rain", "wind_gusts_10m"] {
+                write_fake_om(&run_root.join(format!("{variable}.om")), [2, 3, 1]);
+            }
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference_time,
+                    "variables": ["categorical_freezing_rain", "wind_gusts_10m"],
+                    "valid_times": [reference_time + Duration::hours(forecast_hour)],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let gfs025_ready: NativeProductReady = serde_json::from_value(json!({
+            "runtime_domain": "ncep_gfs025",
+            "grid": {
+                "nx": 3,
+                "ny": 2,
+                "lon_min": 70.0,
+                "lat_min": 0.0,
+                "dx": 0.25,
+                "dy": 0.25,
+                "dt_seconds": 3600,
+                "om_file_length": 481
+            }
+        }))
+        .unwrap();
+        let gfs025 = load_native_product(&coverage, &ready, "gfs025", &gfs025_ready).unwrap();
+        let freezing_rain = gfs025
+            .entries
+            .get(&EntryKey {
+                variable: "categorical_freezing_rain".to_string(),
+                valid_time_utc: boundary,
+            })
+            .unwrap();
+        let wind_gusts = gfs025
+            .entries
+            .get(&EntryKey {
+                variable: "wind_gusts_10m".to_string(),
+                valid_time_utc: boundary,
+            })
+            .unwrap();
+        assert_eq!(freezing_rain.source_run, "2026071200");
+        assert_eq!(freezing_rain.forecast_hour, 6);
+        assert_eq!(wind_gusts.source_run, "2026071206");
+        assert_eq!(wind_gusts.forecast_hour, 0);
     }
 
     #[test]

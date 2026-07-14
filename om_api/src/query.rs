@@ -2620,6 +2620,9 @@ fn read_hermite_grid(
     let Some((index, fraction)) = interpolation_index(&native_times, time) else {
         return Ok(vec![f32::NAN; latitudes.len() * longitudes.len()]);
     };
+    if rejects_cross_run_hermite_core(product, raw_variable, &native_times, index, time) {
+        return Ok(vec![f32::NAN; latitudes.len() * longitudes.len()]);
+    }
     let b = read_native_grid(
         product,
         decoder,
@@ -2849,10 +2852,10 @@ fn read_exact_native_grid_series(
             }
         }
     }
-    // Accumulated/cloud variables may omit latest-run f000 while the retained
-    // previous run supplies f005 and the new run supplies f001. Preserve the
-    // established interpolation for that single gap; all stored hours above
-    // still use the one-call time slab.
+    // A variable may omit latest-run f000 while the retained history supplies
+    // f-001 and the new run supplies f001. Resolve that gap through the same
+    // grid interpolation policy as the point API; a cross-run Hermite core is
+    // returned as NaN rather than synthesized across model initializations.
     for (index, entry) in entries.iter().enumerate() {
         if entry.is_some() {
             continue;
@@ -3766,6 +3769,9 @@ fn read_hermite_value(
     let Some((index, fraction)) = interpolation_index(&native_times, time) else {
         return Ok(f32::NAN);
     };
+    if rejects_cross_run_hermite_core(product, raw_variable, &native_times, index, time) {
+        return Ok(f32::NAN);
+    }
     let b = read_native_value(
         product,
         decoder,
@@ -3862,6 +3868,23 @@ fn entries_share_source_run(
             .map(|entry| entry.source_run.as_str())
     };
     matches!((source_run(left), source_run(right)), (Some(left), Some(right)) if left == right)
+}
+
+fn rejects_cross_run_hermite_core(
+    product: &ProductSnapshot,
+    raw_variable: &str,
+    native_times: &[DateTime<Utc>],
+    index: usize,
+    time: DateTime<Utc>,
+) -> bool {
+    index + 1 < native_times.len()
+        && native_times[index] != time
+        && !entries_share_source_run(
+            product,
+            raw_variable,
+            native_times[index],
+            native_times[index + 1],
+        )
 }
 
 fn interpolation_index(times: &[DateTime<Utc>], time: DateTime<Utc>) -> Option<(usize, f32)> {
@@ -4834,6 +4857,15 @@ mod tests {
     }
 
     #[test]
+    fn apparent_temperature_propagates_explicit_missing_shortwave_only() {
+        let fallback = apparent_temperature(20.0, 50.0, 4.0, None);
+
+        assert!(fallback.is_finite());
+        assert_eq!(fallback, apparent_temperature(20.0, 50.0, 4.0, Some(550.0)));
+        assert!(apparent_temperature(20.0, 50.0, 4.0, Some(f32::NAN)).is_nan());
+    }
+
+    #[test]
     fn webp_output_rounding_matches_json_precision() {
         assert_eq!(round_variable_output_value("temperature_2m", 24.85), 24.9);
         assert_eq!(round_variable_output_value("cloud_cover", 49.6), 50.0);
@@ -5611,11 +5643,16 @@ fn apparent_temperature(
     wind_speed_10m: f32,
     shortwave_radiation: Option<f32>,
 ) -> f32 {
+    let shortwave_radiation = match shortwave_radiation {
+        Some(value) if !value.is_finite() => return f32::NAN,
+        Some(value) => value,
+        None => 550.0,
+    };
     let wind_speed_2m = wind_speed_10m * 0.75;
     let vapor_pressure = relative_humidity_2m / 100.0
         * 6.105
         * (17.27 * temperature_2m / (237.7 + temperature_2m)).exp();
-    let radiation = (0.1 * (shortwave_radiation.unwrap_or(550.0) - 550.0)).max(0.0);
+    let radiation = (0.1 * (shortwave_radiation - 550.0)).max(0.0);
     temperature_2m + 0.348 * vapor_pressure - 0.70 * wind_speed_2m
         + 0.70 * (radiation / (wind_speed_2m + 10.0))
         - 4.25
