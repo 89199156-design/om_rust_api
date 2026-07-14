@@ -1,4 +1,5 @@
 use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
+use crate::native::read_native_array_metadata;
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{anyhow, bail, Context, Result};
@@ -20,6 +21,14 @@ const GFS013_STATIC_LUT_SIZE: u64 = 15_438;
 const GFS013_STATIC_FILE_SIZE: u64 = 1_455_544;
 type GfsElevationCache = HashMap<(PathBuf, u64, u64), f32>;
 static GFS_ELEVATION_CACHE: OnceLock<Mutex<GfsElevationCache>> = OnceLock::new();
+type Dem90FileCache = HashMap<PathBuf, Arc<Dem90File>>;
+static DEM90_FILE_CACHE: OnceLock<Mutex<Dem90FileCache>> = OnceLock::new();
+
+#[derive(Debug)]
+struct Dem90File {
+    file: Arc<File>,
+    metadata: Vec<u64>,
+}
 
 pub const OPENMETEO_UPSTREAM_BASELINE: &str = "4efb9c49fb4a3718ed385fb22580d2e0fc56bdb2";
 pub const OPENMETEO_IMAGE_BASELINE: &str = "weather-forecast-openmeteo:9849315";
@@ -48,6 +57,8 @@ pub struct PointQuery {
     pub forecast_days: Option<usize>,
     #[serde(default)]
     pub timezone: Option<String>,
+    #[serde(default)]
+    pub elevation: Option<String>,
     #[serde(default)]
     pub cell_selection: Option<String>,
 }
@@ -256,6 +267,15 @@ pub fn forecast_for_query(
     if latitudes.len() != longitudes.len() {
         bail!("latitude and longitude count must match");
     }
+    let explicit_elevations = if let Some(value) = query.elevation.as_deref() {
+        let values = parse_csv_f64(value, "elevation")?;
+        if values.len() != latitudes.len() {
+            bail!("elevation count must match latitude and longitude count");
+        }
+        values.into_iter().map(Some).collect::<Vec<_>>()
+    } else {
+        vec![None; latitudes.len()]
+    };
     let daily_variables = query
         .daily
         .as_deref()
@@ -274,21 +294,25 @@ pub fn forecast_for_query(
         && daily_variables
             .iter()
             .all(|variable| is_chinese_aqi_variable(variable));
-    let has_gfs_weather = variables
-        .iter()
-        .any(|variable| !is_air_quality_variable(variable))
-        || (!daily_variables.is_empty() && !daily_is_aqi);
-
     if daily_has_aqi && !daily_is_aqi {
         bail!("daily weather and Chinese AQI variables cannot be mixed in one request");
     }
 
     let mut responses = Vec::new();
-    for ((latitude, longitude), timezone) in latitudes
+    for (((latitude, longitude), timezone), explicit_elevation) in latitudes
         .into_iter()
         .zip(longitudes.into_iter())
         .zip(timezones.into_iter())
+        .zip(explicit_elevations.into_iter())
     {
+        let target_elevation = if include_gfs_elevation {
+            match explicit_elevation {
+                Some(value) => Some(value as f32),
+                None => read_dem90_elevation(snapshot, decoder, latitude, longitude)?,
+            }
+        } else {
+            None
+        };
         let start = parse_hour_with_timezone(query.start_hour.as_deref(), &timezone)?;
         let end = parse_hour_with_timezone(query.end_hour.as_deref(), &timezone)?;
         let mut response = point_forecast(
@@ -301,6 +325,7 @@ pub fn forecast_for_query(
             end,
             query.forecast_hours,
             include_gfs_elevation,
+            target_elevation,
         )?;
         apply_response_timezone(&mut response, &timezone)?;
         if daily_is_aqi {
@@ -328,15 +353,6 @@ pub fn forecast_for_query(
                 query.forecast_days,
                 &timezone,
             )?;
-        }
-        if has_gfs_weather {
-            if let Some((model_latitude, model_longitude, model_elevation)) =
-                gfs013_model_location(snapshot, decoder, latitude, longitude)?
-            {
-                response.latitude = model_latitude;
-                response.longitude = model_longitude;
-                response.elevation = Some(model_elevation as f64);
-            }
         }
         responses.push(response);
     }
@@ -373,6 +389,7 @@ pub fn route_forecast(
             start,
             Some(1),
             true,
+            None,
         )?;
         points.push(RoutePointResponse {
             latitude: point.latitude,
@@ -398,6 +415,7 @@ pub fn point_forecast(
     end: Option<DateTime<Utc>>,
     limit: Option<usize>,
     include_gfs_elevation: bool,
+    target_elevation: Option<f32>,
 ) -> Result<ForecastResponse> {
     validate_coordinate(latitude, longitude)?;
     let started = std::time::Instant::now();
@@ -419,7 +437,20 @@ pub fn point_forecast(
         for variable in variables {
             let mut values = Vec::with_capacity(times.len());
             for time in &times {
-                match read_variable_value(snapshot, decoder, variable, *time, latitude, longitude) {
+                let result = if matches!(variable.as_str(), "surface_pressure" | "surfacepressure")
+                {
+                    read_surface_pressure_value(
+                        snapshot,
+                        decoder,
+                        *time,
+                        latitude,
+                        longitude,
+                        target_elevation,
+                    )
+                } else {
+                    read_variable_value(snapshot, decoder, variable, *time, latitude, longitude)
+                };
+                match result {
                     Ok(value) => values.push(value),
                     Err(error) if error.to_string().contains("variable/time is not available") => {
                         values.push(f32::NAN)
@@ -437,8 +468,9 @@ pub fn point_forecast(
     } else {
         None
     };
-    let (response_latitude, response_longitude, elevation) =
+    let (response_latitude, response_longitude, model_elevation) =
         point_metadata.unwrap_or((latitude, longitude, f32::NAN));
+    let elevation = target_elevation.unwrap_or(model_elevation);
     Ok(ForecastResponse {
         latitude: response_latitude,
         longitude: response_longitude,
@@ -1061,20 +1093,7 @@ pub fn read_variable_value(
             ));
         }
         "surface_pressure" => {
-            let temperature = read_direct(
-                snapshot,
-                decoder,
-                "temperature_2m",
-                time,
-                latitude,
-                longitude,
-            )?;
-            let pressure_msl =
-                read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
-            let elevation = gfs013_model_location(snapshot, decoder, latitude, longitude)?
-                .map(|(_, _, elevation)| elevation)
-                .unwrap_or(0.0);
-            return Ok(surface_pressure(temperature, pressure_msl, elevation));
+            return read_surface_pressure_value(snapshot, decoder, time, latitude, longitude, None);
         }
         "dew_point_2m" | "dewpoint_2m" => {
             let temperature = read_direct(
@@ -2257,6 +2276,133 @@ fn finite_max(values: &[f32]) -> f32 {
         .filter(|value| value.is_finite())
         .reduce(f32::max)
         .unwrap_or(f32::NAN)
+}
+
+fn read_surface_pressure_value(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+    target_elevation: Option<f32>,
+) -> Result<f32> {
+    let temperature = read_direct(
+        snapshot,
+        decoder,
+        "temperature_2m",
+        time,
+        latitude,
+        longitude,
+    )?;
+    let pressure_msl = read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
+    let elevation = match target_elevation {
+        Some(value) => value,
+        None => gfs013_model_location(snapshot, decoder, latitude, longitude)?
+            .map(|(_, _, value)| value)
+            .unwrap_or(0.0),
+    };
+    Ok(surface_pressure(temperature, pressure_msl, elevation))
+}
+
+fn dem90_pixel(latitude: i32) -> u64 {
+    match latitude {
+        value if value < -85 => 120,
+        value if value < -80 => 240,
+        value if value < -70 => 400,
+        value if value < -60 => 600,
+        value if value < -50 => 800,
+        value if value < 50 => 1200,
+        value if value < 60 => 800,
+        value if value < 70 => 600,
+        value if value < 80 => 400,
+        value if value < 85 => 240,
+        _ => 120,
+    }
+}
+
+fn dem90_latitude_chunk(latitude: f64) -> i32 {
+    if latitude < 0.0 {
+        latitude as i32 - 1
+    } else {
+        latitude as i32
+    }
+}
+
+fn read_dem90_elevation(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Option<f32>> {
+    if !(-90.0..90.0).contains(&latitude) || !(-180.0..180.0).contains(&longitude) {
+        return Ok(None);
+    }
+    let Some(product) = snapshot.product("gfs013_surface") else {
+        return Ok(None);
+    };
+    let static_root = product.product_root.join("copernicus_dem90/static");
+    if !static_root.exists() {
+        return Ok(None);
+    }
+    let latitude_chunk = dem90_latitude_chunk(latitude);
+    let path = static_root.join(format!("lat_{latitude_chunk}.om"));
+    if !path.is_file() {
+        bail!(
+            "required Copernicus DEM90 latitude chunk is missing: {}",
+            path.display()
+        );
+    }
+    let pixels = dem90_pixel(latitude_chunk);
+    let cached = {
+        let cache = DEM90_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("Copernicus DEM90 file cache poisoned"))?;
+        if let Some(value) = cache.get(&path) {
+            value.clone()
+        } else {
+            let file =
+                Arc::new(File::open(&path).with_context(|| format!("open {}", path.display()))?);
+            let array = read_native_array_metadata(&file)
+                .with_context(|| format!("parse Copernicus DEM90 file {}", path.display()))?;
+            if array.dimensions != [1200, pixels * 360] || array.chunks.len() != 2 {
+                bail!(
+                    "Copernicus DEM90 dimensions do not match latitude chunk: {}",
+                    path.display()
+                );
+            }
+            let metadata = build_v3_array_metadata_blob(
+                "",
+                array.data_type,
+                array.compression,
+                &array.dimensions,
+                &array.chunks,
+                array
+                    .lut_size
+                    .context("Copernicus DEM90 metadata missing lut_size")?,
+                array
+                    .lut_offset
+                    .context("Copernicus DEM90 metadata missing lut_offset")?,
+                array.scale_factor.unwrap_or(1.0),
+                array.add_offset.unwrap_or(0.0),
+            );
+            let value = Arc::new(Dem90File { file, metadata });
+            cache.insert(path.clone(), value.clone());
+            value
+        }
+    };
+    let latitude_row = ((latitude * 1200.0 + 90.0 * 1200.0) as u64) % 1200;
+    let longitude_row = ((longitude + 180.0) * pixels as f64) as u64;
+    let decoder =
+        decoder.context("official OM decoder library is required for Copernicus DEM90")?;
+    let reader = FullFileRangeReader {
+        file: cached.file.clone(),
+    };
+    Ok(Some(decoder.decode_point(
+        &cached.metadata,
+        &reader,
+        &[latitude_row, longitude_row],
+    )?))
 }
 
 fn surface_pressure(temperature: f32, pressure_msl: f32, elevation: f32) -> f32 {
@@ -4257,13 +4403,6 @@ fn is_cams_variable(variable: &str) -> bool {
     )
 }
 
-fn is_air_quality_variable(variable: &str) -> bool {
-    is_cams_variable(seed_variable_for_times(variable))
-        || variable.starts_with("european_aqi")
-        || variable.starts_with("us_aqi")
-        || variable.starts_with("chinese_aqi")
-}
-
 fn is_gfs025_variable(variable: &str) -> bool {
     matches!(
         variable,
@@ -4854,6 +4993,25 @@ mod tests {
             seed_variable_for_times("surface_pressure"),
             "temperature_2m"
         );
+    }
+
+    #[test]
+    fn dem90_resolution_matches_official_latitude_bands() {
+        assert_eq!(dem90_pixel(0), 1200);
+        assert_eq!(dem90_pixel(49), 1200);
+        assert_eq!(dem90_pixel(50), 800);
+        assert_eq!(dem90_pixel(59), 800);
+        assert_eq!(dem90_pixel(60), 600);
+        assert_eq!(dem90_pixel(80), 240);
+        assert_eq!(dem90_pixel(85), 120);
+    }
+
+    #[test]
+    fn dem90_latitude_chunk_matches_official_swift_truncation() {
+        assert_eq!(dem90_latitude_chunk(0.0), 0);
+        assert_eq!(dem90_latitude_chunk(58.999), 58);
+        assert_eq!(dem90_latitude_chunk(-0.001), -1);
+        assert_eq!(dem90_latitude_chunk(-1.25), -2);
     }
 
     #[test]
