@@ -32,12 +32,17 @@ Build that decoder on Ubuntu:
 
 ```bash
 cd /opt/1panel/apps/weather_om_downloader
-bash scripts/build_omfileformat_decoder.sh /opt/1panel/apps/weather_om_api/native
+OM_FILE_FORMAT_REF=71f422b2706d8a81f1cecf52ae3073990de1ddbe \
+  bash scripts/build_omfileformat_decoder.sh /opt/1panel/apps/weather_om_api/native
 ```
 
 If an exact approved `om-file-format` source checkout is available, pass it with
-`OM_FILE_FORMAT_SRC=/path/to/om-file-format`. This keeps the decoder aligned with
-the Singapore/Open-Meteo baseline instead of silently mixing source versions.
+`OM_FILE_FORMAT_SRC=/path/to/om-file-format` and the matching
+`OM_FILE_FORMAT_REF`. The checkout must be clean. The build writes
+`libomfileformat.build.json`; keep it next to the decoder so installation can
+verify both the source revision and artifact SHA-256. This keeps the decoder
+aligned with the Singapore/Open-Meteo baseline instead of silently mixing
+source versions.
 
 GFS model coordinates, model elevation, and `surface_pressure` require the
 official static file `ncep_gfs013/static/HSURF.om`. The installer downloads the

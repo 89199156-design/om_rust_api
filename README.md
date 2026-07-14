@@ -1,5 +1,40 @@
 # OM Weather Pipeline
 
+## Singapore native OM backend
+
+The Rust API can read the official Open-Meteo `data_run` files produced by the
+Swift GFS/CAMS importers directly. Point `OM_DATA_ROOT` at the producer root
+(the directory containing `current` and immutable coverage directories). When
+the current marker has `runtime_format=openmeteo-native-v1`, the API selects the
+native backend automatically; existing `.omranges` deployments remain
+supported.
+
+The native coverage contract is intentionally separate from the WebP horizon:
+
+- GFS retains five consecutive 6-hour source runs. The oldest four contain
+  `f000..f005`; the latest contains the official horizon through `f384`.
+- CAMS retains three consecutive 12-hour source runs, each through `f120`.
+- The public API covers the oldest retained run through the end of the latest
+  run. GFS therefore exposes 409 hourly timestamps and CAMS exposes 145.
+- WebP generation starts at the latest run and always writes 121 hourly files
+  per variable (`f000..f120`) for both GFS and CAMS.
+- GFS pressure products retain the Shanghai-compatible 22 levels from
+  `1000 hPa` through `50 hPa`.
+
+The producer removes source downloads after a successful atomic publication and
+prunes `data_run` directories older than the retained source-run set. It does
+not impose a fixed free-disk threshold.
+
+Client requests never scan manifests or rebuild indexes. They only clone the
+current immutable in-memory snapshot. There is no timer or filesystem polling:
+after an OM publisher atomically writes both group markers it sends `SIGHUP` to
+the API. The signal handler compares only marker identity fields (`status`,
+runtime format, latest run, group/product coverage IDs), so timestamp/report
+changes cannot trigger a rebuild. On a real identity change it builds the next
+snapshot without holding the request lock, verifies that the marker did not
+change during construction, and atomically swaps the snapshot. Build failures
+retain the previous working snapshot.
+
 Silicon Valley is a generic download gateway, not an Open-Meteo runtime. It must not run Open-Meteo containers, Swift services, WebP builders, Shanghai package builders, or business parsers.
 
 Local test command:

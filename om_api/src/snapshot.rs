@@ -1,4 +1,5 @@
 use crate::manifest::{load_product_snapshot_for_coverage, ProductSnapshot};
+use crate::native::load_native_group_products;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -21,22 +22,30 @@ impl OmDataSnapshot {
         let data_root = data_root.as_ref().to_path_buf();
         let mut products = HashMap::new();
         let mut historical_products = HashMap::new();
-        load_group_products(&data_root, "gfs", GFS_PRODUCTS, &mut products)?;
-        load_group_products(&data_root, "cams", CAMS_PRODUCTS, &mut products)?;
-        load_group_release_history(
-            &data_root,
-            "gfs",
-            GFS_PRODUCTS,
-            &products,
-            &mut historical_products,
-        )?;
-        load_group_release_history(
-            &data_root,
-            "cams",
-            CAMS_PRODUCTS,
-            &products,
-            &mut historical_products,
-        )?;
+        let gfs_native =
+            load_native_group_products(&data_root, "gfs", GFS_PRODUCTS, &mut products)?;
+        let cams_native =
+            load_native_group_products(&data_root, "cams", CAMS_PRODUCTS, &mut products)?;
+        if !gfs_native {
+            load_group_products(&data_root, "gfs", GFS_PRODUCTS, &mut products)?;
+            load_group_release_history(
+                &data_root,
+                "gfs",
+                GFS_PRODUCTS,
+                &products,
+                &mut historical_products,
+            )?;
+        }
+        if !cams_native {
+            load_group_products(&data_root, "cams", CAMS_PRODUCTS, &mut products)?;
+            load_group_release_history(
+                &data_root,
+                "cams",
+                CAMS_PRODUCTS,
+                &products,
+                &mut historical_products,
+            )?;
+        }
         Ok(Self {
             data_root,
             products,

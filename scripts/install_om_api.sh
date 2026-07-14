@@ -9,6 +9,7 @@ INSTALL_OWNER="${OM_API_USER:-ubuntu}"
 GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
 GFS013_STATIC_SHA256="${OM_GFS013_STATIC_SHA256:-203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0}"
 GFS013_STATIC_PATH="$DATA_ROOT/static/ncep_gfs013/HSURF.om"
+OM_FILE_FORMAT_REF="${OM_FILE_FORMAT_REF:-71f422b2706d8a81f1cecf52ae3073990de1ddbe}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -66,9 +67,27 @@ if [ ! -f "$GFS013_STATIC_PATH" ] || [ "$(sha256sum "$GFS013_STATIC_PATH" | awk 
   trap - EXIT
 fi
 
-if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] || [ ! -f "$NATIVE_DIR/libomfileformat.so" ]; then
-  bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" "$NATIVE_DIR"
+if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] || [ ! -f "$NATIVE_DIR/libomfileformat.so" ] || [ ! -f "$NATIVE_DIR/libomfileformat.build.json" ]; then
+  OM_FILE_FORMAT_REF="$OM_FILE_FORMAT_REF" \
+    bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" "$NATIVE_DIR"
 else
+  python3 - "$NATIVE_DIR/libomfileformat.so" "$NATIVE_DIR/libomfileformat.build.json" "$OM_FILE_FORMAT_REF" <<'PY'
+import hashlib
+import json
+import sys
+
+artifact_path, manifest_path, required_revision = sys.argv[1:]
+with open(manifest_path, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+if manifest.get("source_revision") != required_revision:
+    raise SystemExit("existing decoder source revision does not match OM_FILE_FORMAT_REF")
+digest = hashlib.sha256()
+with open(artifact_path, "rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+if manifest.get("artifact_sha256") != digest.hexdigest():
+    raise SystemExit("existing decoder SHA-256 does not match build provenance")
+PY
   echo "reusing=$NATIVE_DIR/libomfileformat.so"
 fi
 
@@ -79,7 +98,6 @@ cat > "$ENV_FILE" <<EOF
 OM_DATA_ROOT=$DATA_ROOT
 OM_API_BIND=$BIND_ADDR
 OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
-OM_SNAPSHOT_REFRESH_SECONDS=30
 RUST_LOG=info,tower_http=warn
 EOF
 
@@ -96,8 +114,13 @@ Group=$INSTALL_OWNER
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$BIN_DIR/om-api
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=3
+CPUWeight=1000
+IOWeight=1000
+OOMScoreAdjust=-500
+LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 

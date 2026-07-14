@@ -52,6 +52,32 @@ pub struct BundleEntry {
     pub byte_ranges: Vec<[u64; 2]>,
     pub bundle_offset: u64,
     pub bundle_bytes: u64,
+    #[serde(default)]
+    pub native_file_path: Option<String>,
+    #[serde(default)]
+    pub native_time_index: Option<u64>,
+    #[serde(default)]
+    pub native_grid: Option<NativeGridMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NativeGridMetadata {
+    pub nx: u64,
+    pub ny: u64,
+    pub lon_min: f64,
+    pub lat_min: f64,
+    pub dx: f64,
+    pub dy: f64,
+    pub dt_seconds: i64,
+    pub om_file_length: u64,
+    #[serde(default)]
+    pub full_nx: Option<u64>,
+    #[serde(default)]
+    pub full_ny: Option<u64>,
+    #[serde(default)]
+    pub x0: Option<u64>,
+    #[serde(default)]
+    pub y0: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -85,6 +111,8 @@ pub struct ProductSnapshot {
     pub bundle_path: PathBuf,
     pub bundle_handle: Arc<File>,
     pub entries: HashMap<EntryKey, BundleEntry>,
+    pub static_entries: HashMap<String, BundleEntry>,
+    pub native_handles: HashMap<String, Arc<File>>,
 }
 
 pub fn load_product_snapshot(data_root: &Path, product: &str) -> Result<ProductSnapshot> {
@@ -176,6 +204,8 @@ fn load_product_snapshot_from_manifest_path(
         bundle_path,
         bundle_handle,
         entries,
+        static_entries: HashMap::new(),
+        native_handles: HashMap::new(),
     })
 }
 

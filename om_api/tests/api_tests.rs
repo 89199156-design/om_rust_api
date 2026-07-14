@@ -5,7 +5,6 @@ use om_api::query::weather_code;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -241,7 +240,7 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage_id)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
@@ -261,7 +260,7 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
 }
 
 #[tokio::test]
-async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
+async fn cams_greenhouse_returns_null_between_direct_source_hours() {
     let root = tempfile::tempdir().unwrap();
     let coverage_id = "cams_global_greenhouse_gases_hermite_edge";
     write_product_coverage_timed(
@@ -293,7 +292,7 @@ async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
         &[("cams_global_greenhouse_gases", coverage_id)],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -301,52 +300,8 @@ async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body["hourly"]["carbon_monoxide"],
-        serde_json::json!([135.0])
-    );
-}
-
-#[tokio::test]
-async fn cams_global_hermite_uses_c_when_second_lookahead_is_missing() {
-    let root = tempfile::tempdir().unwrap();
-    let coverage_id = "cams_global_hermite_edge";
-    write_product_coverage_timed(
-        root.path(),
-        "cams_global",
-        coverage_id,
-        vec![
-            TimedTestEntry {
-                variable: "ozone",
-                values: [131.0, 0.0, 0.0, 0.0],
-                valid_time_utc: "2026-07-08T00:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "ozone",
-                values: [127.0, 0.0, 0.0, 0.0],
-                valid_time_utc: "2026-07-08T03:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "ozone",
-                values: [107.0, 0.0, 0.0, 0.0],
-                valid_time_utc: "2026-07-08T06:00:00Z",
-            },
-        ],
-        false,
-    );
-    write_group_ready(root.path(), "cams", &[("cams_global", coverage_id)]);
-
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
-    let app = router(state);
-    let (status, body) = request_json(
-        app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=ozone&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["hourly"]["ozone"], serde_json::json!([113.0]));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["carbon_monoxide"], serde_json::json!([null]));
 }
 
 #[tokio::test]
@@ -394,7 +349,7 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
         ],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -410,11 +365,94 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
 }
 
 #[tokio::test]
+async fn cams_global_returns_null_between_direct_source_hours() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage_id = "cams_global_hermite_edge";
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global",
+        coverage_id,
+        vec![
+            TimedTestEntry {
+                variable: "ozone",
+                values: [131.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [127.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [107.0, 0.0, 0.0, 0.0],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", coverage_id)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=ozone&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hourly"]["ozone"], serde_json::json!([null]));
+}
+
+#[tokio::test]
+async fn gfs_solar_variables_expand_three_hour_source_steps_to_every_hour() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage_id = "gfs013_surface_sparse_uv";
+    write_product_coverage_timed(
+        root.path(),
+        "gfs013_surface",
+        coverage_id,
+        vec![
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [6.0; 4],
+                valid_time_utc: "2026-07-14T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [8.0; 4],
+                valid_time_utc: "2026-07-14T06:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [5.0; 4],
+                valid_time_utc: "2026-07-14T09:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage_id)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=uv_index_clear_sky&start_hour=2026-07-14T04:00&end_hour=2026-07-14T06:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let values = body["hourly"]["uv_index_clear_sky"].as_array().unwrap();
+    assert_eq!(values.len(), 3);
+    assert!(values.iter().all(Value::is_number), "{values:?}");
+}
+
+#[tokio::test]
 async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() {
     let root = tempfile::tempdir().unwrap();
     let historical_global = "cams_global_2026070700_120h";
     let current_global = "cams_global_2026070800_120h";
-    let current_ghg = "cams_global_greenhouse_gases_2026070800_37h";
     let cells = [100.0, 100.0, 100.0, 100.0];
     let historical_ozone = (9..16)
         .map(|hour| TimedTestEntry {
@@ -460,43 +498,15 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
         current_entries,
         false,
     );
-    let current_co = (0..24)
-        .map(|hour| TimedTestEntry {
-            variable: "carbon_monoxide",
-            values: [2000.0, 2000.0, 2000.0, 2000.0],
-            valid_time_utc: Box::leak(
-                format!(
-                    "2026-07-{:02}T{:02}:00:00Z",
-                    if hour < 8 { 7 } else { 8 },
-                    (hour + 16) % 24
-                )
-                .into_boxed_str(),
-            ),
-        })
-        .collect();
-    write_product_coverage_timed(
-        root.path(),
-        "cams_global_greenhouse_gases",
-        current_ghg,
-        current_co,
-        false,
-    );
     write_group_release(
         root.path(),
         "cams",
         "2026070700",
         &[("cams_global", historical_global)],
     );
-    write_group_ready(
-        root.path(),
-        "cams",
-        &[
-            ("cams_global", current_global),
-            ("cams_global_greenhouse_gases", current_ghg),
-        ],
-    );
+    write_group_ready(root.path(), "cams", &[("cams_global", current_global)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
@@ -546,7 +556,7 @@ async fn missing_historical_release_coverage_does_not_block_current_cams_api() {
         &[("cams_global", "cams_global_missing_120h")],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -571,7 +581,7 @@ async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
     );
     write_group_ready(root.path(), "cams", &[("cams_global", &current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -731,7 +741,7 @@ async fn request_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn forecast_endpoint_returns_point_data_without_client_manifest() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -750,7 +760,7 @@ async fn forecast_endpoint_returns_point_data_without_client_manifest() {
 #[tokio::test]
 async fn forecast_endpoint_uses_official_json_precision_time_and_units() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -786,7 +796,7 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
         }],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -837,7 +847,7 @@ async fn forecast_endpoint_uses_official_soil_and_radiation_units_and_precision(
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -927,7 +937,7 @@ async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipi
         "gfs",
         &[("gfs013_surface", &gfs013), ("gfs025", &gfs025)],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -968,7 +978,7 @@ async fn forecast_endpoint_derives_weather_code_from_rounded_cloud_cover() {
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1008,7 +1018,7 @@ async fn forecast_endpoint_expands_sparse_backwards_sum_to_hourly_values() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_sparse_precip")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1069,7 +1079,7 @@ async fn forecast_endpoint_interpolates_sparse_temperature_with_hermite() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_sparse_temperature")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1131,7 +1141,7 @@ async fn forecast_endpoint_uses_model_stride_for_hermite_padding() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_mixed_stride_cloud_cover")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1165,7 +1175,7 @@ async fn forecast_endpoint_preserves_official_wind_direction_360_boundary() {
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1181,7 +1191,7 @@ async fn forecast_endpoint_preserves_official_wind_direction_360_boundary() {
 #[tokio::test]
 async fn forecast_endpoint_derives_dew_point_from_temperature_and_relative_humidity() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1247,7 +1257,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
             ("gfs_pressure_profile", "gfs_pressure_profile_old_1h"),
         ],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1263,7 +1273,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
 #[tokio::test]
 async fn air_quality_endpoint_reads_cams_product_directly() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1274,6 +1284,33 @@ async fn air_quality_endpoint_reads_cams_product_directly() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hourly"]["pm2_5"][0], 6.0);
+}
+
+#[tokio::test]
+async fn air_quality_endpoint_reads_global_carbon_monoxide() {
+    let root = tempfile::tempdir().unwrap();
+    write_product_coverage(
+        root.path(),
+        "cams_global",
+        "cams_global_test",
+        vec![TestEntry {
+            variable: "carbon_monoxide",
+            values: [500.0, 500.0, 500.0, 500.0],
+        }],
+        true,
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", "cams_global_test")]);
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&forecast_hours=1",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hourly"]["carbon_monoxide"][0], 500.0);
 }
 
 #[tokio::test]
@@ -1310,7 +1347,7 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
             ),
         ],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1319,14 +1356,14 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["hourly"]["carbon_monoxide"][0], 74.0);
 }
 
 #[tokio::test]
 async fn air_quality_endpoint_returns_official_and_chinese_aqi_derivatives() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1391,7 +1428,7 @@ async fn air_quality_sparse_variable_hour_returns_null_without_failing_group() {
         "cams",
         &[("cams_global", "cams_global_sparse")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1406,7 +1443,7 @@ async fn air_quality_sparse_variable_hour_returns_null_without_failing_group() {
 }
 
 #[tokio::test]
-async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() {
+async fn air_quality_endpoint_keeps_only_direct_sparse_cams_hours() {
     let root = tempfile::tempdir().unwrap();
     write_product_coverage_timed(
         root.path(),
@@ -1441,7 +1478,7 @@ async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() 
         "cams",
         &[("cams_global", "cams_global_sparse_dust")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1453,14 +1490,14 @@ async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body["hourly"]["dust"],
-        serde_json::json!([1.0, 1.0, 2.0, 2.0])
+        serde_json::json!([1.0, null, null, 2.0])
     );
 }
 
 #[tokio::test]
 async fn pressure_profile_endpoint_uses_official_units() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1942,7 +1979,7 @@ fn weather_code_reference_returns_drizzle_for_weak_showers() {
 #[tokio::test]
 async fn health_endpoint_is_not_exposed() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -1961,7 +1998,7 @@ async fn health_endpoint_is_not_exposed() {
 #[tokio::test]
 async fn latest_json_is_not_a_client_api() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -1980,7 +2017,7 @@ async fn latest_json_is_not_a_client_api() {
 #[tokio::test]
 async fn route_endpoint_returns_each_point_without_client_manifest() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -2015,7 +2052,7 @@ async fn route_endpoint_returns_each_point_without_client_manifest() {
 #[tokio::test]
 async fn land_cell_selection_requires_dem_before_serving() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -2085,7 +2122,7 @@ fn daily_weather_fixture_root() -> TempDir {
 #[tokio::test]
 async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2137,7 +2174,7 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
 #[tokio::test]
 async fn daily_weather_supports_multiple_coordinates() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2163,7 +2200,7 @@ async fn daily_weather_supports_multiple_coordinates() {
 #[tokio::test]
 async fn explicit_timezone_applies_to_hour_selection_and_output() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2182,7 +2219,7 @@ async fn explicit_timezone_applies_to_hour_selection_and_output() {
 #[tokio::test]
 async fn daily_weather_rejects_non_exact_features() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (auto_status, auto_body) = request_json(
