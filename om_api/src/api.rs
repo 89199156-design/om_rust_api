@@ -87,7 +87,12 @@ async fn forecast(
     Query(query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
-    let payload = forecast_for_query(&snapshot, state.decoder.as_ref(), &query)?;
+    let decoder = state.decoder.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("forecast worker failed")??;
     Ok(Json(payload))
 }
 
@@ -96,7 +101,12 @@ async fn air_quality(
     Query(query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
-    let payload = forecast_for_query(&snapshot, state.decoder.as_ref(), &query)?;
+    let decoder = state.decoder.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("air-quality worker failed")??;
     Ok(Json(payload))
 }
 
@@ -105,7 +115,11 @@ async fn route(
     Json(query): Json<RouteQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
-    let payload = route_forecast(&snapshot, state.decoder.as_ref(), &query)?;
+    let decoder = state.decoder.clone();
+    let payload =
+        tokio::task::spawn_blocking(move || route_forecast(&snapshot, decoder.as_ref(), &query))
+            .await
+            .context("route worker failed")??;
     Ok(Json(serde_json::to_value(payload)?))
 }
 

@@ -520,7 +520,7 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     )
     .await;
     assert_eq!(daily_only_status, StatusCode::OK, "{daily_only_body}");
-    assert_eq!(daily_only_body["hourly"], serde_json::json!({}));
+    assert!(daily_only_body.get("hourly").is_none());
     assert_eq!(
         daily_only_body["daily"]["chinese_aqi"],
         serde_json::json!([110.0])
@@ -800,67 +800,22 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
 }
 
 #[tokio::test]
-async fn forecast_endpoint_uses_official_soil_and_radiation_units_and_precision() {
-    let root = tempfile::tempdir().unwrap();
-    let gfs013 = write_product(
-        root.path(),
-        "gfs013_surface",
-        vec![
-            TestEntry {
-                variable: "soil_moisture_0_to_10cm",
-                values: [0.3284, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "soil_moisture_10_to_40cm",
-                values: [0.3334, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "soil_moisture_40_to_100cm",
-                values: [0.3354, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "soil_moisture_100_to_200cm",
-                values: [0.3674, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "shortwave_radiation",
-                values: [123.4, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "diffuse_radiation",
-                values: [45.6, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "total_column_integrated_water_vapour",
-                values: [22.3, 0.0, 0.0, 0.0],
-            },
-        ],
-    );
-    write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
+async fn forecast_endpoint_hides_soil_radiation_and_internal_wind_components() {
+    let root = fixture_root();
     let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_moisture_40_to_100cm,soil_moisture_100_to_200cm,shortwave_radiation,diffuse_radiation,total_column_integrated_water_vapour&forecast_hours=1",
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_moisture_0_to_10cm,shortwave_radiation,wind_u_component_10m&forecast_hours=1",
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["hourly"]["soil_moisture_0_to_10cm"][0], 0.328);
-    assert_eq!(body["hourly"]["soil_moisture_10_to_40cm"][0], 0.333);
-    assert_eq!(body["hourly"]["soil_moisture_40_to_100cm"][0], 0.335);
-    assert_eq!(body["hourly"]["soil_moisture_100_to_200cm"][0], 0.367);
-    assert_eq!(
-        body["hourly_units"]["soil_moisture_0_to_10cm"],
-        "m\u{00B3}/m\u{00B3}"
-    );
-    assert_eq!(body["hourly_units"]["shortwave_radiation"], "W/m\u{00B2}");
-    assert_eq!(body["hourly_units"]["diffuse_radiation"], "W/m\u{00B2}");
-    assert_eq!(
-        body["hourly_units"]["total_column_integrated_water_vapour"],
-        "kg/m\u{00B2}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("unsupported public hourly variable: soil_moisture_0_to_10cm"));
 }
 
 #[tokio::test]
@@ -1324,35 +1279,18 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
 }
 
 #[tokio::test]
-async fn air_quality_endpoint_returns_official_and_chinese_aqi_derivatives() {
+async fn air_quality_endpoint_returns_chinese_aqi_derivative_aliases() {
     let root = fixture_root();
     let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=european_aqi_no2,european_aqi_nitrogen_dioxide,us_aqi_no2,us_aqi_nitrogen_dioxide,chinese_aqi_no2,chinese_aqi_nitrogen_dioxide&forecast_hours=1",
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_no2,chinese_aqi_nitrogen_dioxide&forecast_hours=1",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_approx(
-        body["hourly"]["european_aqi_no2"][0].as_f64().unwrap(),
-        43.0,
-    );
-    assert_approx(
-        body["hourly"]["european_aqi_nitrogen_dioxide"][0]
-            .as_f64()
-            .unwrap(),
-        43.0,
-    );
-    assert_approx(body["hourly"]["us_aqi_no2"][0].as_f64().unwrap(), 46.0);
-    assert_approx(
-        body["hourly"]["us_aqi_nitrogen_dioxide"][0]
-            .as_f64()
-            .unwrap(),
-        46.0,
-    );
     assert_approx(body["hourly"]["chinese_aqi_no2"][0].as_f64().unwrap(), 47.0);
     assert_approx(
         body["hourly"]["chinese_aqi_nitrogen_dioxide"][0]
@@ -1360,8 +1298,6 @@ async fn air_quality_endpoint_returns_official_and_chinese_aqi_derivatives() {
             .unwrap(),
         47.0,
     );
-    assert_eq!(body["hourly_units"]["european_aqi_no2"], "EAQI");
-    assert_eq!(body["hourly_units"]["us_aqi_no2"], "USAQI");
     assert_eq!(body["hourly_units"]["chinese_aqi_no2"], "Chinese AQI");
 }
 
@@ -2089,7 +2025,7 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,shortwave_radiation_sum,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
     )
     .await;
 
@@ -2116,10 +2052,6 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
         serde_json::json!([3.0])
     );
     assert_eq!(
-        body["daily"]["shortwave_radiation_sum"],
-        serde_json::json!([8.64])
-    );
-    assert_eq!(
         body["daily"]["wind_speed_10m_max"],
         serde_json::json!([3.0])
     );
@@ -2127,11 +2059,8 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
         body["daily"]["wind_direction_10m_dominant"],
         serde_json::json!([90])
     );
-    assert_eq!(
-        body["daily_units"]["shortwave_radiation_sum"],
-        "MJ/m\u{00B2}"
-    );
-    assert_eq!(body["hourly"], serde_json::json!({}));
+    assert!(body.get("hourly").is_none());
+    assert!(body.get("hourly_units").is_none());
 }
 
 #[tokio::test]
@@ -2148,6 +2077,8 @@ async fn daily_weather_supports_multiple_coordinates() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let responses = body.as_array().unwrap();
     assert_eq!(responses.len(), 2);
+    assert!(responses[0].get("location_id").is_none());
+    assert_eq!(responses[1]["location_id"], serde_json::json!(1));
     for response in responses {
         assert_eq!(
             response["daily"]["temperature_2m_max"],
