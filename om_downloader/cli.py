@@ -20,6 +20,7 @@ from .checksum import sha256_file
 from .coverage import (
     build_complete_run_coverage_plan,
     build_coverage_plan,
+    build_run_forecast_hour_coverage_plan,
     required_start_for_anchors,
 )
 from .locking import file_lock
@@ -51,6 +52,7 @@ from .mirror_sync import (
     activate_group_release,
     group_release_id,
     prune_expired_group_releases,
+    retain_group_release_from_mirror,
     sync_from_manifest_path,
     sync_from_manifest_url,
     sync_group_from_mirror,
@@ -63,10 +65,23 @@ OPENMETEO_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
 }
-GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs", "cams"})
+GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
+GFS_COMPLETE_RUN_RETENTION = 2
+GFS_PARTIAL_RUN_RETENTION = 2
+GFS_PARTIAL_FORECAST_HOUR_END = 5
+GFS_TOTAL_RELEASE_RETENTION = GFS_COMPLETE_RUN_RETENTION + GFS_PARTIAL_RUN_RETENTION
+CAMS_COMPLETE_RUN_RETENTION = 3
 
 APP_LOG_RETENTION_DAYS = 45
 APP_LOG_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _effective_group_retention(group: str, requested: int) -> int:
+    if group == "gfs":
+        return max(requested, GFS_TOTAL_RELEASE_RETENTION)
+    if group == "cams":
+        return max(requested, CAMS_COMPLETE_RUN_RETENTION)
+    return requested
 
 
 def _parse_utc(value: str) -> datetime:
@@ -1124,7 +1139,13 @@ def _write_group_manifest(
             for name, manifest in product_manifests.items()
         },
     }
-    atomic_write_json(output_root / "published" / "groups" / group_name / "latest.json", payload)
+    group_root = output_root / "published" / "groups" / group_name
+    atomic_write_json(group_root / "latest.json", payload)
+    if complete:
+        release_id = group_release_id(payload)
+        archived = json.loads(json.dumps(payload))
+        archived["release_id"] = release_id
+        atomic_write_json(group_root / "releases" / f"{release_id}.json", archived)
     return payload
 
 
@@ -1142,6 +1163,7 @@ def _download_openmeteo_group_release(
     parser: argparse.ArgumentParser,
     *,
     plan_by_product_override: dict[str, tuple[Any, list[Any], Any]] | None = None,
+    preserve_published: bool = False,
 ) -> int:
     if not args.config:
         parser.error("--config is required with --download-openmeteo-group")
@@ -1269,7 +1291,7 @@ def _download_openmeteo_group_release(
                 changed_product_names.append(product.name)
             cleared_paths: list[str] = []
             if not already_complete:
-                if not self_publish:
+                if not self_publish and not preserve_published:
                     cleared_paths = _clear_group_published_data(
                         output_root,
                         group_name=group_name,
@@ -1431,7 +1453,12 @@ def _group_release_payload_is_available(
         return False
     for product_name in OPENMETEO_GROUP_PRODUCTS[group_name]:
         summary = summaries.get(product_name)
-        if not isinstance(summary, dict) or summary.get("latest_complete_run") != group_run:
+        if not isinstance(summary, dict):
+            return False
+        product_run = str(summary.get("latest_complete_run") or "")
+        if not product_run:
+            return False
+        if group_name in GROUPS_REQUIRING_MATCHING_RUNS and product_run != group_run:
             return False
         coverage_id = str(summary.get("coverage_id") or "")
         coverage_root = api_root / product_name / "coverages" / coverage_id
@@ -1439,6 +1466,8 @@ def _group_release_payload_is_available(
         if not product_manifest or product_manifest.get("status") != "complete":
             return False
         if product_manifest.get("coverage_id") != coverage_id:
+            return False
+        if product_manifest.get("latest_complete_run") != product_run:
             return False
         files = product_manifest.get("files")
         if not isinstance(files, list) or not files:
@@ -1459,10 +1488,10 @@ def _group_release_payload_is_available(
     return True
 
 
-def _available_group_releases(
+def _available_group_release_candidates(
     api_root: Path,
     group_name: str,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
     manifests: list[dict[str, Any]] = []
     current = _read_json_if_exists(
         api_root / "groups" / group_name / "current" / "ready_for_processing.json"
@@ -1475,12 +1504,22 @@ def _available_group_releases(
             release = _read_json_if_exists(release_path)
             if release:
                 manifests.append(release)
-    available: dict[str, dict[str, Any]] = {}
+    available: dict[str, list[dict[str, Any]]] = {}
     for manifest in manifests:
         run = str(manifest.get("latest_complete_run") or "")
         if run and _group_release_payload_is_available(api_root, group_name, manifest):
-            available[run] = manifest
+            available.setdefault(run, []).append(manifest)
     return available
+
+
+def _available_group_releases(
+    api_root: Path,
+    group_name: str,
+) -> dict[str, dict[str, Any]]:
+    return {
+        run: candidates[-1]
+        for run, candidates in _available_group_release_candidates(api_root, group_name).items()
+    }
 
 
 def _group_release_matches_plans(
@@ -1507,6 +1546,22 @@ def _group_release_matches_plans(
         if summary.get("valid_time_count") != len(plan.slots):
             return False
     return True
+
+
+def _matching_group_releases(
+    api_root: Path,
+    group_name: str,
+    products: list[ProductConfig],
+    plans_by_run: dict[str, dict[str, tuple[Any, list[Any], Any]]],
+) -> dict[str, dict[str, Any]]:
+    matches: dict[str, dict[str, Any]] = {}
+    candidates_by_run = _available_group_release_candidates(api_root, group_name)
+    for run, plans in plans_by_run.items():
+        for candidate in reversed(candidates_by_run.get(run, [])):
+            if _group_release_matches_plans(candidate, products, plans):
+                matches[run] = candidate
+                break
+    return matches
 
 
 def _complete_run_plan_data(
@@ -1594,7 +1649,119 @@ def _discover_recent_complete_group_plans(
             if len(discovered) == count:
                 return discovered
         candidate -= timedelta(hours=cadence_step)
-    raise ValueError(f"could not discover {count} recent complete coherent CAMS runs")
+    raise ValueError(f"could not discover {count} recent complete coherent group runs")
+
+
+def _discover_recent_gfs_retention_plans(
+    products: list[ProductConfig],
+    *,
+    bucket_url: str,
+) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
+    discovered = _discover_recent_complete_group_plans(
+        products,
+        bucket_url=bucket_url,
+        count=GFS_TOTAL_RELEASE_RETENTION,
+    )
+    product_by_name = {product.name: product for product in products}
+    ranked: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
+    for rank, (run_id, plans) in enumerate(discovered):
+        if rank < GFS_COMPLETE_RUN_RETENTION:
+            ranked.append((run_id, plans))
+            continue
+        partial_plans: dict[str, tuple[Any, list[Any], Any]] = {}
+        for product_name, (catalog, runs, _full_plan) in plans.items():
+            if len(runs) != 1:
+                raise ValueError(f"expected one source run for {product_name}/{run_id}")
+            partial_plans[product_name] = (
+                catalog,
+                runs,
+                build_run_forecast_hour_coverage_plan(
+                    product_by_name[product_name],
+                    runs[0],
+                    forecast_hour_end=GFS_PARTIAL_FORECAST_HOUR_END,
+                ),
+            )
+        ranked.append((run_id, partial_plans))
+    return ranked
+
+
+def _discover_recent_complete_product_plans(
+    product: ProductConfig,
+    *,
+    bucket_url: str,
+    count: int,
+) -> list[tuple[str, tuple[Any, list[Any], Any]]]:
+    if count < 1:
+        raise ValueError("complete product run count must be positive")
+    if product.run_cadence_hours <= 0:
+        raise ValueError(f"product run cadence must be positive: {product.name}")
+
+    latest = load_openmeteo_spatial_latest(
+        product.openmeteo_model,
+        bucket_url=bucket_url,
+    )
+    candidate = latest.reference_time_utc
+    discovered: list[tuple[str, tuple[Any, list[Any], Any]]] = []
+    max_probes = max(24, count * 8)
+    for _probe in range(max_probes):
+        try:
+            catalog = (
+                latest
+                if candidate == latest.reference_time_utc
+                else load_openmeteo_spatial_run(
+                    product.openmeteo_model,
+                    candidate,
+                    bucket_url=bucket_url,
+                )
+            )
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+            catalog = None
+        if (
+            catalog is not None
+            and catalog.completed
+            and catalog.reference_time_utc == candidate
+            and catalog.max_forecast_hour >= product.forecast_hour_end
+        ):
+            try:
+                plan_data = _complete_run_plan_data(product, catalog)
+            except ValueError:
+                plan_data = None
+            if plan_data is not None:
+                run_id = candidate.strftime("%Y%m%d%H")
+                discovered.append((run_id, plan_data))
+                if len(discovered) == count:
+                    return discovered
+        candidate -= timedelta(hours=product.run_cadence_hours)
+    raise ValueError(
+        f"could not discover {count} recent complete runs for CAMS product {product.name}"
+    )
+
+
+def _discover_recent_complete_cams_ranked_plans(
+    products: list[ProductConfig],
+    *,
+    bucket_url: str,
+    count: int,
+) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
+    product_plans = {
+        product.name: _discover_recent_complete_product_plans(
+            product,
+            bucket_url=bucket_url,
+            count=count,
+        )
+        for product in products
+    }
+    ranked: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
+    for rank in range(count):
+        plans = {
+            product.name: product_plans[product.name][rank][1]
+            for product in products
+        }
+        group_run = max(product_plans[product.name][rank][0] for product in products)
+        ranked.append((group_run, plans))
+    return ranked
 
 
 def _reconcile_cams_complete_runs(
@@ -1603,18 +1770,19 @@ def _reconcile_cams_complete_runs(
 ) -> int:
     if not args.config:
         parser.error("--config is required with --download-openmeteo-group")
-    if args.retain_complete_releases != 3:
-        parser.error("CAMS requires --retain-complete-releases 3")
+    if args.retain_complete_releases != CAMS_COMPLETE_RUN_RETENTION:
+        parser.error(
+            f"CAMS requires --retain-complete-releases {CAMS_COMPLETE_RUN_RETENTION}"
+        )
 
     config = load_models(Path(args.config))
     products = [config.products[name] for name in OPENMETEO_GROUP_PRODUCTS["cams"]]
-    target_plans = _discover_recent_complete_group_plans(
+    target_plans = _discover_recent_complete_cams_ranked_plans(
         products,
         bucket_url=args.openmeteo_bucket_url,
-        count=3,
+        count=CAMS_COMPLETE_RUN_RETENTION,
     )
     api_root = Path(args.publish_openmeteo_group_to)
-    prune_expired_group_releases(api_root, "cams", retain_complete_releases=3)
     target_runs = [run_id for run_id, _plans in target_plans]
     plans_by_run = dict(target_plans)
     all_available = _available_group_releases(api_root, "cams")
@@ -1643,7 +1811,6 @@ def _reconcile_cams_complete_runs(
         if lines:
             download_results.append(json.loads(lines[-1]))
 
-    prune_expired_group_releases(api_root, "cams", retain_complete_releases=3)
     all_available = _available_group_releases(api_root, "cams")
     available = {
         run_id: manifest
@@ -1665,7 +1832,11 @@ def _reconcile_cams_complete_runs(
     activation = None
     if not current or current.get("latest_complete_run") != newest_run:
         activation = activate_group_release(api_root, "cams", available[newest_run])
-    pruned = prune_expired_group_releases(api_root, "cams", retain_complete_releases=3)
+    pruned = prune_expired_group_releases(
+        api_root,
+        "cams",
+        retain_complete_releases=CAMS_COMPLETE_RUN_RETENTION,
+    )
     print(
         json.dumps(
             {
@@ -1685,7 +1856,136 @@ def _reconcile_cams_complete_runs(
     return 0
 
 
+def _reconcile_gfs_retention_window(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    if not args.config:
+        parser.error("--config is required with --download-openmeteo-group")
+
+    config = load_models(Path(args.config))
+    products = [config.products[name] for name in OPENMETEO_GROUP_PRODUCTS["gfs"]]
+    target_plans = _discover_recent_gfs_retention_plans(
+        products,
+        bucket_url=args.openmeteo_bucket_url,
+    )
+    source_root = Path(args.output) / "published"
+    api_root = (
+        Path(args.publish_openmeteo_group_to)
+        if args.publish_openmeteo_group_to
+        else source_root
+    )
+    target_runs = [run_id for run_id, _plans in target_plans]
+    plans_by_run = dict(target_plans)
+
+    available = _matching_group_releases(
+        api_root,
+        "gfs",
+        products,
+        plans_by_run,
+    )
+    missing_runs = [run_id for run_id in target_runs if run_id not in available]
+    download_results: list[dict[str, Any]] = []
+    retain_results: list[dict[str, Any]] = []
+    download_args = copy(args)
+    download_args.publish_openmeteo_group_to = None
+
+    for run_id in reversed(target_runs):
+        if run_id not in missing_runs:
+            continue
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = _download_openmeteo_group_release(
+                download_args,
+                parser,
+                plan_by_product_override=plans_by_run[run_id],
+                preserve_published=True,
+            )
+        if result != 0:
+            return result
+        lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+        if lines:
+            download_results.append(json.loads(lines[-1]))
+        retain_results.append(
+            retain_group_release_from_mirror("gfs", source_root, api_root)
+        )
+        if source_root.resolve(strict=False) != api_root.resolve(strict=False):
+            _clear_group_download_payloads(
+                Path(args.output),
+                product_names=[product.name for product in products],
+            )
+
+    available = _matching_group_releases(
+        api_root,
+        "gfs",
+        products,
+        plans_by_run,
+    )
+    absent_after_download = [run_id for run_id in target_runs if run_id not in available]
+    if absent_after_download:
+        raise ValueError(
+            "GFS retention window is incomplete after download: "
+            + ", ".join(absent_after_download)
+        )
+
+    newest_run = target_runs[0]
+    current = _read_json_if_exists(
+        api_root / "groups" / "gfs" / "current" / "ready_for_processing.json"
+    )
+    activation = None
+    if (
+        not current
+        or current.get("latest_complete_run") != newest_run
+        or not _group_release_matches_plans(current, products, plans_by_run[newest_run])
+    ):
+        activation = activate_group_release(api_root, "gfs", available[newest_run])
+    pruned = prune_expired_group_releases(
+        api_root,
+        "gfs",
+        retain_complete_releases=GFS_TOTAL_RELEASE_RETENTION,
+    )
+    print(
+        json.dumps(
+            {
+                "group": "gfs",
+                "status": "complete" if missing_runs else "skipped",
+                "reason": None if missing_runs else "target retention window already complete",
+                "latest_complete_run": newest_run,
+                "retained_complete_runs": target_runs[:GFS_COMPLETE_RUN_RETENTION],
+                "retained_partial_runs": target_runs[GFS_COMPLETE_RUN_RETENTION:],
+                "partial_forecast_hour_end": GFS_PARTIAL_FORECAST_HOUR_END,
+                "downloaded_missing_runs": list(reversed(missing_runs)),
+                "download_results": download_results,
+                "retain_results": retain_results,
+                "activation": activation,
+                "pruned_raw_paths": pruned,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.download_openmeteo_group == "gfs":
+        output_root = Path(args.output)
+        try:
+            with file_lock(output_root / "locks" / "gfs_reconcile.lock"):
+                return _reconcile_gfs_retention_window(args, parser)
+        except RuntimeError as exc:
+            if "already running" not in str(exc):
+                raise
+            print(
+                json.dumps(
+                    {
+                        "group": "gfs",
+                        "status": "skipped",
+                        "reason": "GFS reconciliation already running",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
     if args.download_openmeteo_group != "cams":
         return _download_openmeteo_group_release(args, parser)
     effective_args = args
@@ -1941,12 +2241,16 @@ def main(argv: list[str] | None = None) -> int:
                 "--source-stage-root or --mirror-root is required with "
                 "--sync-openmeteo-group-from-source"
             )
+        group = args.sync_openmeteo_group_from_source
         result = sync_group_from_mirror(
-            args.sync_openmeteo_group_from_source,
+            group,
             Path(source_root),
             Path(args.output),
             cleanup_grace_seconds=args.cleanup_grace_seconds,
-            retain_complete_releases=args.retain_complete_releases,
+            retain_complete_releases=_effective_group_retention(
+                group,
+                args.retain_complete_releases,
+            ),
         )
         print(json.dumps(result, ensure_ascii=False))
         return 0
@@ -1958,11 +2262,15 @@ def main(argv: list[str] | None = None) -> int:
                 "--source-stage-root or --mirror-root is required with "
                 "--sync-openmeteo-group-releases-from-source"
             )
+        group = args.sync_openmeteo_group_releases_from_source
         result = sync_retained_group_releases_from_mirror(
-            args.sync_openmeteo_group_releases_from_source,
+            group,
             Path(source_root),
             Path(args.output),
-            retain_complete_releases=args.retain_complete_releases,
+            retain_complete_releases=_effective_group_retention(
+                group,
+                args.retain_complete_releases,
+            ),
         )
         print(json.dumps(result, ensure_ascii=False))
         return 0

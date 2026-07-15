@@ -1,12 +1,44 @@
 import unittest
 from datetime import datetime, timezone
 
-from om_downloader.coverage import build_coverage_plan, required_start_for_anchors
+from om_downloader.coverage import (
+    build_coverage_plan,
+    build_run_forecast_hour_coverage_plan,
+    required_start_for_anchors,
+)
 from om_downloader.metadata import OmRun
 from om_downloader.model_config import Bounds, ProductConfig
 
 
 class CoverageTests(unittest.TestCase):
+    def test_builds_single_run_zero_through_five_hour_coverage(self):
+        product = ProductConfig(
+            name="gfs025",
+            download_product="om_gfs025",
+            openmeteo_model="ncep_gfs025",
+            forecast_hour_end=384,
+            run_cadence_hours=6,
+            timezone_anchors=(8,),
+            requested_bounds=Bounds(70.0, 0.0, 140.0, 58.0),
+            bounds_padding_degrees=2.0,
+            required_variables=("temperature_2m",),
+            optional_variables=(),
+            requested_pressure_levels_hpa=(),
+        )
+        base = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
+        run = OmRun("2026071500", base, 384, ("temperature_2m",), ())
+
+        plan = build_run_forecast_hour_coverage_plan(
+            product,
+            run,
+            forecast_hour_end=5,
+        )
+
+        self.assertEqual(plan.required_start_utc, base)
+        self.assertEqual(plan.required_end_utc, datetime(2026, 7, 15, 5, tzinfo=timezone.utc))
+        self.assertEqual([slot.forecast_hour for slot in plan.slots], list(range(6)))
+        self.assertEqual({slot.source_run for slot in plan.slots}, {"2026071500"})
+
     def test_required_start_uses_earliest_utc_anchor(self):
         now = datetime(2026, 7, 8, 14, 0, tzinfo=timezone.utc)
         start = required_start_for_anchors(now, (8, 6))

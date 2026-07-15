@@ -154,3 +154,47 @@ def build_complete_run_coverage_plan(product: ProductConfig, run: OmRun) -> Cove
         slots=slots,
         public_start_utc=base_time,
     )
+
+
+def build_run_forecast_hour_coverage_plan(
+    product: ProductConfig,
+    run: OmRun,
+    *,
+    forecast_hour_end: int,
+) -> CoveragePlan:
+    """Build a single-run coverage limited to an inclusive forecast-hour end."""
+    if forecast_hour_end < 0:
+        raise ValueError("forecast_hour_end must not be negative")
+    base_time = _as_utc(run.base_time_utc)
+    effective_end = min(product.forecast_hour_end, run.max_forecast_hour, forecast_hour_end)
+    required_end = base_time + timedelta(hours=effective_end)
+    valid_times = (
+        sorted(
+            _as_utc(valid_time)
+            for valid_time in run.valid_times_utc
+            if base_time <= _as_utc(valid_time) <= required_end
+        )
+        if run.valid_times_utc
+        else [base_time + timedelta(hours=hour) for hour in range(effective_end + 1)]
+    )
+    expected_times = [base_time + timedelta(hours=hour) for hour in range(effective_end + 1)]
+    if valid_times != expected_times:
+        raise ValueError(
+            f"run {run.run_id} does not contain every hour through forecast hour {effective_end}"
+        )
+    slots = tuple(
+        CoverageSlot(
+            valid_time_utc=valid_time,
+            source_run=run.run_id,
+            forecast_hour=int((valid_time - base_time).total_seconds() // 3600),
+        )
+        for valid_time in valid_times
+    )
+    return CoveragePlan(
+        product=product.name,
+        required_start_utc=base_time,
+        required_end_utc=required_end,
+        latest_complete_run=run.run_id,
+        slots=slots,
+        public_start_utc=base_time,
+    )

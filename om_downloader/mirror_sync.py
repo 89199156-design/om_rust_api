@@ -21,7 +21,7 @@ MINIMUM_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
 }
-GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs", "cams"})
+GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 DEFAULT_COMPLETE_RELEASE_RETENTION = 3
 GROUP_PRODUCT_SUMMARY_KEYS = (
     "coverage_id",
@@ -666,6 +666,58 @@ def _promote_coverage_stage_without_current(stage: dict[str, Any]) -> dict[str, 
     }
 
 
+def retain_group_release_from_mirror(
+    group: str,
+    mirror_root: Path,
+    output_root: Path,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Retain one complete release without changing the current group."""
+    if group not in OPENMETEO_GROUP_PRODUCTS:
+        raise ValueError(f"unknown Open-Meteo group: {group}")
+    mirror_root = mirror_root.resolve()
+    output_root = output_root.resolve()
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    group_manifest = _load_json(mirror_root / "groups" / group / "latest.json")
+    if not _group_manifest_is_complete(group_manifest, group):
+        raise ValueError(f"source group release is not complete: {group}")
+
+    manifests_to_stage: list[tuple[str, dict[str, Any]]] = []
+    for product in _products_from_group_manifest(group_manifest, group):
+        manifest = _load_product_manifest_for_group(mirror_root, group_manifest, product)
+        if not _local_coverage_matches_manifest(output_root, product, manifest):
+            manifests_to_stage.append((product, manifest))
+
+    _ensure_stage_capacity(output_root, [manifest for _product, manifest in manifests_to_stage])
+    staged: list[dict[str, Any]] = []
+    try:
+        for product, manifest in manifests_to_stage:
+            staged.append(
+                _stage_product_manifest_from_mirror(
+                    mirror_root,
+                    output_root,
+                    product,
+                    manifest,
+                )
+            )
+    except Exception:
+        for stage in staged:
+            _remove_stage(stage)
+        raise
+
+    promoted = [_promote_coverage_stage_without_current(stage) for stage in staged]
+    _write_group_release(output_root, group, group_manifest, mirror_root, now_utc=now)
+    return {
+        "status": "retained" if promoted else "skipped",
+        "reason": None if promoted else "release payloads already retained",
+        "group": group,
+        "latest_complete_run": group_manifest.get("latest_complete_run"),
+        "release_id": group_release_id(group_manifest),
+        "synced_coverages": len(promoted),
+    }
+
+
 def sync_retained_group_releases_from_mirror(
     group: str,
     mirror_root: Path,
@@ -750,7 +802,9 @@ def sync_retained_group_releases_from_mirror(
     )
     return {
         "status": "synced" if promoted else "skipped",
-        "reason": None if promoted else "three most recent complete runs already retained",
+        "reason": None
+        if promoted
+        else f"{retain_complete_releases} most recent complete runs already retained",
         "group": group,
         "latest_complete_run": newest_release.get("latest_complete_run"),
         "retained_complete_runs": [

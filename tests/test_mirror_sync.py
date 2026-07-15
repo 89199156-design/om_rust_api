@@ -250,12 +250,19 @@ class MirrorSyncTests(unittest.TestCase):
                 "group": "cams",
                 "status": "complete",
                 "latest_complete_run": "2026070800",
-                "products": ["cams_global"],
+                "products": ["cams_global", "cams_global_greenhouse_gases"],
                 "product_manifests": {
                     "cams_global": {
                         "coverage_id": "cams_global_2026070800_1h",
+                        "status": "complete",
                         "latest_complete_run": "2026070800",
                         "path": "../cams_global/latest.json",
+                    },
+                    "cams_global_greenhouse_gases": {
+                        "coverage_id": "cams_global_greenhouse_gases_2026070800_1h",
+                        "status": "complete",
+                        "latest_complete_run": "2026070800",
+                        "path": "../cams_global_greenhouse_gases/latest.json",
                     }
                 },
                 "files": 1,
@@ -284,6 +291,12 @@ class MirrorSyncTests(unittest.TestCase):
                 json.dumps({"coverage_id": "cams_global_2026070800_1h"}),
                 encoding="utf-8",
             )
+            greenhouse_current = output_root / "cams_global_greenhouse_gases" / "current"
+            greenhouse_current.mkdir(parents=True)
+            (greenhouse_current / "ready_for_processing.json").write_text(
+                json.dumps({"coverage_id": "cams_global_greenhouse_gases_2026070800_1h"}),
+                encoding="utf-8",
+            )
 
             result = sync_group_from_mirror("cams", mirror_root, output_root)
             old_raw_exists = old_raw.exists()
@@ -294,7 +307,7 @@ class MirrorSyncTests(unittest.TestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertEqual(result["reason"], "local group already current")
         self.assertFalse(old_raw_exists)
-        self.assertFalse(old_mirror_exists)
+        self.assertTrue(old_mirror_exists)
         self.assertTrue(keep_raw_exists)
         self.assertTrue(keep_mirror_exists)
 
@@ -306,10 +319,11 @@ class MirrorSyncTests(unittest.TestCase):
                 "group": "cams",
                 "status": "complete",
                 "latest_complete_run": "2026070800",
-                "products": ["cams_global"],
+                "products": ["cams_global", "cams_global_greenhouse_gases"],
                 "product_manifests": {
                     "cams_global": {
                         "coverage_id": "cams_global_2026070800_105h",
+                        "status": "complete",
                         "latest_complete_run": "2026070800",
                         "required_start_utc": "2026-07-07T16:00:00Z",
                         "required_end_utc": "2026-07-12T00:00:00Z",
@@ -318,11 +332,23 @@ class MirrorSyncTests(unittest.TestCase):
                         "bytes": 12,
                         "downloaded_bytes": 12,
                         "path": "../cams_global/latest.json",
+                    },
+                    "cams_global_greenhouse_gases": {
+                        "coverage_id": "cams_global_greenhouse_gases_2026070800_105h",
+                        "status": "complete",
+                        "latest_complete_run": "2026070800",
+                        "required_start_utc": "2026-07-07T16:00:00Z",
+                        "required_end_utc": "2026-07-12T00:00:00Z",
+                        "valid_time_count": 105,
+                        "files": 1,
+                        "bytes": 15,
+                        "downloaded_bytes": 15,
+                        "path": "../cams_global_greenhouse_gases/latest.json",
                     }
                 },
-                "files": 1,
-                "bytes": 12,
-                "downloaded_bytes": 12,
+                "files": 2,
+                "bytes": 27,
+                "downloaded_bytes": 27,
             }
             group_path = mirror_root / "groups" / "cams" / "latest.json"
             group_path.parent.mkdir(parents=True)
@@ -339,6 +365,12 @@ class MirrorSyncTests(unittest.TestCase):
             product_current.mkdir(parents=True)
             (product_current / "ready_for_processing.json").write_text(
                 json.dumps({"coverage_id": "cams_global_2026070800_105h"}),
+                encoding="utf-8",
+            )
+            greenhouse_current = output_root / "cams_global_greenhouse_gases" / "current"
+            greenhouse_current.mkdir(parents=True)
+            (greenhouse_current / "ready_for_processing.json").write_text(
+                json.dumps({"coverage_id": "cams_global_greenhouse_gases_2026070800_105h"}),
                 encoding="utf-8",
             )
             product_root = mirror_root / "cams_global"
@@ -366,6 +398,36 @@ class MirrorSyncTests(unittest.TestCase):
                 ],
             }
             (product_root / "latest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            greenhouse_root = mirror_root / "cams_global_greenhouse_gases"
+            greenhouse_file_rel = (
+                "coverages/cams_global_greenhouse_gases_2026070800_105h/"
+                "cams_global_greenhouse_gases.omranges"
+            )
+            greenhouse_payload = b"greenhouse-cams"
+            greenhouse_file = greenhouse_root / greenhouse_file_rel
+            greenhouse_file.parent.mkdir(parents=True)
+            greenhouse_file.write_bytes(greenhouse_payload)
+            greenhouse_manifest = {
+                "model": "cams_global_greenhouse_gases",
+                "coverage_id": "cams_global_greenhouse_gases_2026070800_105h",
+                "status": "complete",
+                "latest_complete_run": "2026070800",
+                "required_start_utc": "2026-07-07T16:00:00Z",
+                "required_end_utc": "2026-07-12T00:00:00Z",
+                "valid_time_count": 105,
+                "bytes": len(greenhouse_payload),
+                "downloaded_bytes": len(greenhouse_payload),
+                "files": [
+                    {
+                        "path": greenhouse_file_rel,
+                        "bytes": len(greenhouse_payload),
+                        "sha256": hashlib.sha256(greenhouse_payload).hexdigest(),
+                    }
+                ],
+            }
+            (greenhouse_root / "latest.json").write_text(
+                json.dumps(greenhouse_manifest), encoding="utf-8"
+            )
 
             result = sync_group_from_mirror("cams", mirror_root, output_root)
 
@@ -575,7 +637,7 @@ class MirrorSyncTests(unittest.TestCase):
                 self.assertTrue(product_ready_exists[product])
                 self.assertTrue(product_file_exists[product])
 
-    def test_sync_group_from_mirror_promotes_mixed_product_runs(self):
+    def test_sync_group_from_mirror_rejects_mixed_gfs_product_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
             mirror_root = Path(tmp) / "mirror"
             output_root = Path(tmp) / "raw"
@@ -635,16 +697,90 @@ class MirrorSyncTests(unittest.TestCase):
             group_path.write_text(json.dumps(group_manifest), encoding="utf-8")
 
             result = sync_group_from_mirror("gfs", mirror_root, output_root)
-            group_ready = json.loads(
-                (output_root / "groups" / "gfs" / "current" / "ready_for_processing.json").read_text(
-                    encoding="utf-8"
+            group_ready_exists = (
+                output_root / "groups" / "gfs" / "current" / "ready_for_processing.json"
+            ).exists()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertFalse(group_ready_exists)
+
+    def test_sync_group_from_mirror_promotes_cams_independent_product_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mirror_root = Path(tmp) / "mirror"
+            output_root = Path(tmp) / "raw"
+            product_runs = {
+                "cams_global": "2026071500",
+                "cams_global_greenhouse_gases": "2026071400",
+            }
+            product_manifest_summary = {}
+            for product, run in product_runs.items():
+                payload = product.encode("utf-8")
+                coverage_id = f"{product}_{run}_1h"
+                product_root = mirror_root / product
+                file_rel = f"coverages/{coverage_id}/{product}.omranges"
+                file_path = product_root / file_rel
+                file_path.parent.mkdir(parents=True)
+                file_path.write_bytes(payload)
+                manifest = {
+                    "model": product,
+                    "coverage_id": coverage_id,
+                    "status": "complete",
+                    "latest_complete_run": run,
+                    "bytes": len(payload),
+                    "downloaded_bytes": len(payload),
+                    "files": [
+                        {
+                            "path": file_rel,
+                            "bytes": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    ],
+                }
+                (product_root / "latest.json").write_text(
+                    json.dumps(manifest), encoding="utf-8"
                 )
+                product_manifest_summary[product] = {
+                    "coverage_id": coverage_id,
+                    "status": "complete",
+                    "latest_complete_run": run,
+                    "path": f"../{product}/latest.json",
+                    "files": 1,
+                    "bytes": len(payload),
+                    "downloaded_bytes": len(payload),
+                }
+            group_manifest = {
+                "group": "cams",
+                "status": "complete",
+                "latest_complete_run": "2026071500",
+                "products": list(product_runs),
+                "product_manifests": product_manifest_summary,
+                "files": 2,
+                "bytes": sum(
+                    summary["bytes"] for summary in product_manifest_summary.values()
+                ),
+                "downloaded_bytes": sum(
+                    summary["downloaded_bytes"]
+                    for summary in product_manifest_summary.values()
+                ),
+            }
+            group_path = mirror_root / "groups" / "cams" / "latest.json"
+            group_path.parent.mkdir(parents=True)
+            group_path.write_text(json.dumps(group_manifest), encoding="utf-8")
+
+            result = sync_group_from_mirror("cams", mirror_root, output_root)
+            group_ready = json.loads(
+                (
+                    output_root
+                    / "groups"
+                    / "cams"
+                    / "current"
+                    / "ready_for_processing.json"
+                ).read_text(encoding="utf-8")
             )
 
         self.assertEqual(result["status"], "synced")
-        self.assertIsNone(result["latest_complete_run"])
+        self.assertEqual(result["latest_complete_run"], "2026071500")
         self.assertEqual(group_ready["status"], "complete")
-        self.assertIsNone(group_ready["latest_complete_run"])
         self.assertEqual(
             {
                 product: summary["latest_complete_run"]
@@ -653,17 +789,22 @@ class MirrorSyncTests(unittest.TestCase):
             product_runs,
         )
 
-    def test_sync_group_from_mirror_prunes_old_raw_and_mirror_coverages_after_success(self):
+    def test_sync_group_from_mirror_preserves_previous_complete_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             mirror_root = Path(tmp) / "mirror"
             output_root = Path(tmp) / "raw"
             product = "cams_global"
+            greenhouse = "cams_global_greenhouse_gases"
             old_coverage = "cams_global_2026070712_1h"
             new_coverage = "cams_global_2026070800_1h"
+            old_greenhouse_coverage = "cams_global_greenhouse_gases_2026070712_1h"
+            new_greenhouse_coverage = "cams_global_greenhouse_gases_2026070800_1h"
             old_raw = output_root / product / "coverages" / old_coverage
             old_mirror = mirror_root / product / "coverages" / old_coverage
+            old_greenhouse_raw = output_root / greenhouse / "coverages" / old_greenhouse_coverage
             old_raw.mkdir(parents=True)
             old_mirror.mkdir(parents=True)
+            old_greenhouse_raw.mkdir(parents=True)
             (old_raw / "cams_global.omranges").write_bytes(b"old-raw")
             (old_mirror / "cams_global.omranges").write_bytes(b"old-mirror")
             current_group = output_root / "groups" / "cams" / "current"
@@ -677,6 +818,12 @@ class MirrorSyncTests(unittest.TestCase):
                         "product_manifests": {
                             product: {
                                 "coverage_id": old_coverage,
+                                "status": "complete",
+                                "latest_complete_run": "2026070712",
+                            },
+                            greenhouse: {
+                                "coverage_id": old_greenhouse_coverage,
+                                "status": "complete",
                                 "latest_complete_run": "2026070712",
                             }
                         },
@@ -709,22 +856,54 @@ class MirrorSyncTests(unittest.TestCase):
                 json.dumps(manifest),
                 encoding="utf-8",
             )
+            greenhouse_payload = b"new-greenhouse"
+            greenhouse_file_rel = (
+                f"coverages/{new_greenhouse_coverage}/cams_global_greenhouse_gases.omranges"
+            )
+            greenhouse_file = mirror_root / greenhouse / greenhouse_file_rel
+            greenhouse_file.parent.mkdir(parents=True)
+            greenhouse_file.write_bytes(greenhouse_payload)
+            greenhouse_manifest = {
+                "model": greenhouse,
+                "coverage_id": new_greenhouse_coverage,
+                "status": "complete",
+                "latest_complete_run": "2026070800",
+                "bytes": len(greenhouse_payload),
+                "downloaded_bytes": len(greenhouse_payload),
+                "files": [
+                    {
+                        "path": greenhouse_file_rel,
+                        "bytes": len(greenhouse_payload),
+                        "sha256": hashlib.sha256(greenhouse_payload).hexdigest(),
+                    }
+                ],
+            }
+            (mirror_root / greenhouse / "latest.json").write_text(
+                json.dumps(greenhouse_manifest),
+                encoding="utf-8",
+            )
             group_manifest = {
                 "group": "cams",
                 "status": "complete",
                 "latest_complete_run": "2026070800",
-                "products": [product],
+                "products": [product, greenhouse],
                 "product_manifests": {
                     product: {
                         "coverage_id": new_coverage,
                         "status": "complete",
                         "latest_complete_run": "2026070800",
                         "path": f"../{product}/latest.json",
+                    },
+                    greenhouse: {
+                        "coverage_id": new_greenhouse_coverage,
+                        "status": "complete",
+                        "latest_complete_run": "2026070800",
+                        "path": f"../{greenhouse}/latest.json",
                     }
                 },
-                "files": 1,
-                "bytes": len(payload),
-                "downloaded_bytes": len(payload),
+                "files": 2,
+                "bytes": len(payload) + len(greenhouse_payload),
+                "downloaded_bytes": len(payload) + len(greenhouse_payload),
             }
             group_path = mirror_root / "groups" / "cams" / "latest.json"
             group_path.parent.mkdir(parents=True)
@@ -733,9 +912,13 @@ class MirrorSyncTests(unittest.TestCase):
             result = sync_group_from_mirror("cams", mirror_root, output_root)
 
             self.assertEqual(result["status"], "synced")
-            self.assertFalse(old_raw.exists())
-            self.assertFalse(old_mirror.exists())
+            self.assertTrue(old_raw.exists())
+            self.assertTrue(old_mirror.exists())
+            self.assertTrue(old_greenhouse_raw.exists())
             self.assertTrue((output_root / product / "coverages" / new_coverage).exists())
+            self.assertTrue(
+                (output_root / greenhouse / "coverages" / new_greenhouse_coverage).exists()
+            )
             self.assertTrue((mirror_root / product / "coverages" / new_coverage).exists())
 
 
