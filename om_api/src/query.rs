@@ -242,6 +242,14 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "dewpoint_2m"
             | "wet_bulb_temperature_2m"
             | "surface_temperature"
+            | "soil_temperature_0_to_10cm"
+            | "soil_temperature_10_to_40cm"
+            | "soil_temperature_40_to_100cm"
+            | "soil_temperature_100_to_200cm"
+            | "soil_moisture_0_to_10cm"
+            | "soil_moisture_10_to_40cm"
+            | "soil_moisture_40_to_100cm"
+            | "soil_moisture_100_to_200cm"
             | "pressure_msl"
             | "surface_pressure"
             | "visibility"
@@ -457,20 +465,24 @@ pub fn forecast_for_query(
     };
     validate_public_hourly_variables(&variables)?;
     let timezones = parse_query_timezones(query.timezone.as_deref(), latitudes.len())?;
-    let daily_has_aqi = daily_variables
+    let daily_has_air_quality = daily_variables
         .iter()
-        .any(|variable| is_chinese_aqi_variable(variable));
-    let daily_is_aqi = !daily_variables.is_empty()
+        .any(|variable| is_chinese_air_quality_daily_variable(variable));
+    let daily_is_air_quality = !daily_variables.is_empty()
         && daily_variables
             .iter()
-            .all(|variable| is_chinese_aqi_variable(variable));
+            .all(|variable| is_chinese_air_quality_daily_variable(variable));
     let has_gfs_weather = variables
         .iter()
         .any(|variable| !is_air_quality_variable(variable))
-        || (!daily_variables.is_empty() && !daily_is_aqi);
+        || (!daily_variables.is_empty() && !daily_is_air_quality);
+    let has_air_quality = variables
+        .iter()
+        .any(|variable| is_air_quality_variable(variable))
+        || daily_is_air_quality;
 
-    if daily_has_aqi && !daily_is_aqi {
-        bail!("daily weather and Chinese AQI variables cannot be mixed in one request");
+    if daily_has_air_quality && !daily_is_air_quality {
+        bail!("daily weather and Chinese air-quality variables cannot be mixed in one request");
     }
 
     let mut responses = Vec::new();
@@ -515,8 +527,8 @@ pub fn forecast_for_query(
                 query.forecast_hours,
             )?;
             apply_response_timezone(&mut response, &timezone)?;
-            if daily_is_aqi {
-                attach_daily_chinese_aqi(
+            if daily_is_air_quality {
+                attach_daily_chinese_air_quality(
                     &mut response,
                     snapshot,
                     decoder,
@@ -546,6 +558,16 @@ pub fn forecast_for_query(
                     if let Some(model) = sampling.gfs013 {
                         response.latitude = model.latitude;
                         response.longitude = model.longitude;
+                        response.elevation = Some(sampling.response_elevation as f64);
+                    }
+                }
+            } else if has_air_quality {
+                if let Some(sampling) = sampling {
+                    if let Some((model_latitude, model_longitude)) =
+                        air_quality_model_location(snapshot, latitude, longitude)?
+                    {
+                        response.latitude = model_latitude;
+                        response.longitude = model_longitude;
                         response.elevation = Some(sampling.response_elevation as f64);
                     }
                 }
@@ -1063,7 +1085,7 @@ fn daily_weather_unit(variable: &str, aggregation: DailyWeatherAggregation) -> &
     }
 }
 
-fn attach_daily_chinese_aqi(
+fn attach_daily_chinese_air_quality(
     response: &mut ForecastResponse,
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -1075,9 +1097,9 @@ fn attach_daily_chinese_aqi(
 ) -> Result<()> {
     if variables
         .iter()
-        .any(|variable| !is_chinese_aqi_variable(variable))
+        .any(|variable| !is_chinese_air_quality_daily_variable(variable))
     {
-        bail!("daily currently supports Chinese AQI variables only")
+        bail!("unsupported daily Chinese air-quality variable")
     }
 
     let dates = select_chinese_aqi_dates(snapshot, start_date, end_date)?;
@@ -1091,14 +1113,10 @@ fn attach_daily_chinese_aqi(
         .collect::<BTreeMap<_, _>>();
 
     for date in dates {
+        let stats = daily_chinese_air_quality_stats(snapshot, decoder, date, latitude, longitude)?;
         let mut values = Vec::with_capacity(variables.len());
         for variable in variables {
-            values.push(daily_chinese_aqi_value(
-                snapshot, decoder, variable, date, latitude, longitude,
-            )?);
-        }
-        if values.iter().any(|value| !value.is_finite()) {
-            continue;
+            values.push(daily_chinese_air_quality_value(&stats, variable)?);
         }
         selected_dates.push(date.format("%Y-%m-%d").to_string());
         for (variable, value) in variables.iter().zip(values) {
@@ -2427,31 +2445,28 @@ const HJ633_O3_HOURLY: [f32; 8] = [0.0, 160.0, 200.0, 300.0, 400.0, 800.0, 1000.
 const HJ633_PM10_DAILY: [f32; 8] = [0.0, 50.0, 120.0, 250.0, 350.0, 420.0, 500.0, 600.0];
 const HJ633_PM2_5_DAILY: [f32; 8] = [0.0, 30.0, 60.0, 115.0, 150.0, 250.0, 350.0, 500.0];
 
-fn daily_chinese_aqi_value(
+#[derive(Debug, Clone, Copy)]
+struct ChineseDailyAirQualityStats {
+    pm2_5_mean: f32,
+    pm10_mean: f32,
+    nitrogen_dioxide_mean: f32,
+    ozone_maximum_8h_mean: f32,
+    sulphur_dioxide_mean: f32,
+    carbon_monoxide_mean: f32,
+}
+
+fn daily_chinese_air_quality_stats(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
-    variable: &str,
     date: NaiveDate,
     latitude: f64,
     longitude: f64,
-) -> Result<f32> {
+) -> Result<ChineseDailyAirQualityStats> {
     let day_start = china_day_start_utc(date)?;
-    let pm2_5 = chinese_daily_iaqi(
-        daily_mean(snapshot, decoder, "pm2_5", day_start, latitude, longitude)?,
-        &HJ633_PM2_5_DAILY,
-        &HJ633_AQI_BREAKPOINTS,
-        500.0,
-        0,
-    );
-    let pm10 = chinese_daily_iaqi(
-        daily_mean(snapshot, decoder, "pm10", day_start, latitude, longitude)?,
-        &HJ633_PM10_DAILY,
-        &HJ633_AQI_BREAKPOINTS,
-        500.0,
-        0,
-    );
-    let no2 = chinese_daily_iaqi(
-        daily_mean(
+    Ok(ChineseDailyAirQualityStats {
+        pm2_5_mean: daily_mean(snapshot, decoder, "pm2_5", day_start, latitude, longitude)?,
+        pm10_mean: daily_mean(snapshot, decoder, "pm10", day_start, latitude, longitude)?,
+        nitrogen_dioxide_mean: daily_mean(
             snapshot,
             decoder,
             "nitrogen_dioxide",
@@ -2459,20 +2474,10 @@ fn daily_chinese_aqi_value(
             latitude,
             longitude,
         )?,
-        &HJ633_NO2_DAILY,
-        &HJ633_AQI_BREAKPOINTS,
-        500.0,
-        0,
-    );
-    let o3 = chinese_daily_iaqi(
-        daily_maximum_8h_mean(snapshot, decoder, day_start, latitude, longitude)?,
-        &HJ633_O3_8H,
-        &HJ633_AQI_BREAKPOINTS[..6],
-        300.0,
-        0,
-    );
-    let so2 = chinese_daily_iaqi(
-        daily_mean(
+        ozone_maximum_8h_mean: daily_maximum_8h_mean(
+            snapshot, decoder, day_start, latitude, longitude,
+        )?,
+        sulphur_dioxide_mean: daily_mean(
             snapshot,
             decoder,
             "sulphur_dioxide",
@@ -2480,20 +2485,58 @@ fn daily_chinese_aqi_value(
             latitude,
             longitude,
         )?,
-        &HJ633_SO2_DAILY,
-        &HJ633_AQI_BREAKPOINTS,
-        500.0,
-        0,
-    );
-    let co = chinese_daily_iaqi(
-        daily_mean(
+        carbon_monoxide_mean: daily_mean(
             snapshot,
             decoder,
             "carbon_monoxide",
             day_start,
             latitude,
             longitude,
-        )? / 1000.0,
+        )?,
+    })
+}
+
+fn daily_chinese_air_quality_value(
+    stats: &ChineseDailyAirQualityStats,
+    variable: &str,
+) -> Result<f32> {
+    let pm2_5 = chinese_daily_iaqi(
+        stats.pm2_5_mean,
+        &HJ633_PM2_5_DAILY,
+        &HJ633_AQI_BREAKPOINTS,
+        500.0,
+        0,
+    );
+    let pm10 = chinese_daily_iaqi(
+        stats.pm10_mean,
+        &HJ633_PM10_DAILY,
+        &HJ633_AQI_BREAKPOINTS,
+        500.0,
+        0,
+    );
+    let no2 = chinese_daily_iaqi(
+        stats.nitrogen_dioxide_mean,
+        &HJ633_NO2_DAILY,
+        &HJ633_AQI_BREAKPOINTS,
+        500.0,
+        0,
+    );
+    let o3 = chinese_daily_iaqi(
+        stats.ozone_maximum_8h_mean,
+        &HJ633_O3_8H,
+        &HJ633_AQI_BREAKPOINTS[..6],
+        300.0,
+        0,
+    );
+    let so2 = chinese_daily_iaqi(
+        stats.sulphur_dioxide_mean,
+        &HJ633_SO2_DAILY,
+        &HJ633_AQI_BREAKPOINTS,
+        500.0,
+        0,
+    );
+    let co = chinese_daily_iaqi(
+        stats.carbon_monoxide_mean / 1000.0,
         &HJ633_CO_DAILY,
         &HJ633_AQI_BREAKPOINTS,
         500.0,
@@ -2508,6 +2551,12 @@ fn daily_chinese_aqi_value(
         "chinese_aqi_o3" | "chinese_aqi_ozone" => o3,
         "chinese_aqi_so2" | "chinese_aqi_sulphur_dioxide" => so2,
         "chinese_aqi_co" | "chinese_aqi_carbon_monoxide" => co,
+        "pm2_5_mean" => round_ties_to_even(stats.pm2_5_mean, 0),
+        "pm10_mean" => round_ties_to_even(stats.pm10_mean, 0),
+        "nitrogen_dioxide_mean" => round_ties_to_even(stats.nitrogen_dioxide_mean, 0),
+        "ozone_maximum_8h_mean" => round_ties_to_even(stats.ozone_maximum_8h_mean, 0),
+        "sulphur_dioxide_mean" => round_ties_to_even(stats.sulphur_dioxide_mean, 0),
+        "carbon_monoxide_mean" => round_ties_to_even(stats.carbon_monoxide_mean / 1000.0, 1),
         _ => bail!("unsupported daily Chinese AQI variable: {variable}"),
     };
     Ok(value)
@@ -2544,7 +2593,7 @@ fn daily_maximum_8h_mean(
     longitude: f64,
 ) -> Result<f32> {
     let mut maximum = f32::NEG_INFINITY;
-    for hour in 0..24 {
+    for hour in 8..=24 {
         let value = trailing_mean_including(
             snapshot,
             decoder,
@@ -2651,23 +2700,29 @@ fn hj633_2026_iaqi(
     if !concentration.is_finite() {
         return f32::NAN;
     }
-    let concentration = round_ties_to_even(concentration, decimals);
+    let scale = 10_i64.pow(decimals);
+    let concentration = round_ties_to_even(concentration.max(0.0), decimals);
+    let concentration_scaled = ((concentration as f64) * scale as f64).round() as i64;
     let Some((&last_concentration, &last_aqi)) =
         concentration_breakpoints.last().zip(aqi_breakpoints.last())
     else {
         return f32::NAN;
     };
-    if concentration > last_concentration {
+    let last_concentration_scaled = ((last_concentration as f64) * scale as f64).round() as i64;
+    if concentration_scaled > last_concentration_scaled {
         return upper_limit.min(last_aqi);
     }
     for index in 1..concentration_breakpoints.len() {
-        let low = concentration_breakpoints[index - 1];
-        let high = concentration_breakpoints[index];
-        if concentration <= high {
-            let aqi_low = aqi_breakpoints[index - 1];
-            let aqi_high = aqi_breakpoints[index];
-            let iaqi = (aqi_high - aqi_low) / (high - low) * (concentration - low) + aqi_low;
-            return iaqi.ceil().min(upper_limit);
+        let low_scaled =
+            ((concentration_breakpoints[index - 1] as f64) * scale as f64).round() as i64;
+        let high_scaled = ((concentration_breakpoints[index] as f64) * scale as f64).round() as i64;
+        if concentration_scaled <= high_scaled {
+            let aqi_low = aqi_breakpoints[index - 1] as f64;
+            let aqi_high = aqi_breakpoints[index] as f64;
+            let iaqi = aqi_low
+                + (aqi_high - aqi_low) * (concentration_scaled - low_scaled) as f64
+                    / (high_scaled - low_scaled) as f64;
+            return (iaqi.ceil() as f32).min(upper_limit);
         }
     }
     upper_limit.min(last_aqi)
@@ -2701,6 +2756,19 @@ fn is_chinese_aqi_variable(variable: &str) -> bool {
             | "chinese_aqi_co"
             | "chinese_aqi_carbon_monoxide"
     )
+}
+
+fn is_chinese_air_quality_daily_variable(variable: &str) -> bool {
+    is_chinese_aqi_variable(variable)
+        || matches!(
+            variable,
+            "pm2_5_mean"
+                | "pm10_mean"
+                | "nitrogen_dioxide_mean"
+                | "ozone_maximum_8h_mean"
+                | "sulphur_dioxide_mean"
+                | "carbon_monoxide_mean"
+        )
 }
 
 fn rolling_mean_before(
@@ -2844,6 +2912,62 @@ fn read_direct_grid(
     }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     let products = snapshot.product_snapshots(product_name);
+    if is_gfs_product(product_name) {
+        let full_products = products
+            .iter()
+            .filter(|product| {
+                gfs_snapshot_is_full(product) && product_covers_time(product, &raw_variable, time)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        if let Some(first) = full_products.first() {
+            let mut values = read_product_grid_with_rounding(
+                first,
+                decoder,
+                variable,
+                &raw_variable,
+                time,
+                latitudes,
+                longitudes,
+                round_values,
+            )?;
+            for product in full_products.iter().skip(1) {
+                if !values.iter().any(|value| value.is_nan()) {
+                    break;
+                }
+                let fallback = read_product_grid_with_rounding(
+                    product,
+                    decoder,
+                    variable,
+                    &raw_variable,
+                    time,
+                    latitudes,
+                    longitudes,
+                    round_values,
+                )?;
+                for (value, fallback_value) in values.iter_mut().zip(fallback) {
+                    if value.is_nan() && !fallback_value.is_nan() {
+                        *value = fallback_value;
+                    }
+                }
+            }
+            return Ok(values);
+        }
+        if let Some(product) = products.iter().find(|product| {
+            !gfs_snapshot_is_full(product) && product_covers_time(product, &raw_variable, time)
+        }) {
+            return read_product_grid_with_rounding(
+                product,
+                decoder,
+                variable,
+                &raw_variable,
+                time,
+                latitudes,
+                longitudes,
+                round_values,
+            );
+        }
+    }
     for product in &products {
         if !product_covers_time(product, &raw_variable, time) {
             continue;
@@ -2868,6 +2992,22 @@ fn read_direct_grid(
         return Ok(vec![f32::NAN; latitudes.len() * longitudes.len()]);
     }
     bail!("variable/time is not available: {} {}", raw_variable, time)
+}
+
+fn is_gfs_product(product_name: &str) -> bool {
+    matches!(
+        product_name,
+        "gfs013_surface" | "gfs025" | "gfs_pressure_profile"
+    )
+}
+
+fn gfs_snapshot_is_full(product: &ProductSnapshot) -> bool {
+    product
+        .entries
+        .values()
+        .map(|entry| entry.forecast_hour)
+        .max()
+        .is_some_and(|forecast_hour| forecast_hour > 5)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3102,6 +3242,50 @@ fn read_product_history_value_with_rounding(
     round_values: bool,
 ) -> Result<f32> {
     let products = snapshot.product_snapshots(product_name);
+    if is_gfs_product(product_name) {
+        let full_products = products
+            .iter()
+            .filter(|product| {
+                gfs_snapshot_is_full(product) && product_covers_time(product, raw_variable, time)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        if !full_products.is_empty() {
+            let mut value = f32::NAN;
+            for product in full_products {
+                value = read_product_value_with_rounding(
+                    product,
+                    decoder,
+                    variable,
+                    raw_variable,
+                    time,
+                    latitude,
+                    longitude,
+                    round_values,
+                )?;
+                value = apply_elevation_correction(&product.product, variable, value);
+                if !value.is_nan() {
+                    break;
+                }
+            }
+            return Ok(value);
+        }
+        if let Some(product) = products.iter().find(|product| {
+            !gfs_snapshot_is_full(product) && product_covers_time(product, raw_variable, time)
+        }) {
+            return read_product_value_with_rounding(
+                product,
+                decoder,
+                variable,
+                raw_variable,
+                time,
+                latitude,
+                longitude,
+                round_values,
+            )
+            .map(|value| apply_elevation_correction(&product.product, variable, value));
+        }
+    }
     for product in &products {
         if !product_covers_time(product, raw_variable, time) {
             continue;
@@ -4132,7 +4316,7 @@ fn grid_index_for_lat_lon(
     while lon >= 180.0 {
         lon -= 360.0;
     }
-    let x = ((lon + 180.0) / dx).round() as i64;
+    let x = ((lon + 180.0_f32) / dx).round() as i64;
     let y = (((latitude as f32) - lat_min) / dy).round() as i64;
     if y < 0 || y >= array.dimensions[0] as i64 || x < 0 || x >= array.dimensions[1] as i64 {
         bail!("point is outside grid");
@@ -4497,6 +4681,30 @@ fn gfs013_model_location(
     Ok(Some((model_latitude, model_longitude, elevation)))
 }
 
+fn air_quality_model_location(
+    snapshot: &OmDataSnapshot,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Option<(f64, f64)>> {
+    let Some(product) = snapshot
+        .product("cams_global_greenhouse_gases")
+        .or_else(|| snapshot.product("cams_global"))
+    else {
+        return Ok(None);
+    };
+    let entry = product
+        .entries
+        .values()
+        .find(|entry| entry.variable == "carbon_monoxide")
+        .or_else(|| product.entries.values().next())
+        .context("air-quality model has no grid entries")?;
+    let (y, x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
+    Ok(Some((
+        official_f32_json_number(grid_latitude_for_index(&entry.array, y)?)?,
+        official_f32_json_number(grid_longitude_for_index(&entry.array, x)?)?,
+    )))
+}
+
 fn official_f32_json_number(value: f32) -> Result<f64> {
     let mut buffer = ryu::Buffer::new();
     buffer
@@ -4547,6 +4755,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hj633_co_interpolation_does_not_ceil_exact_integer_due_to_f32_noise() {
+        assert_eq!(
+            hj633_2026_iaqi(0.6, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
+            15.0
+        );
+        assert_eq!(
+            hj633_2026_iaqi(0.7, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
+            18.0
+        );
+    }
+
+    #[test]
     fn grid_index_matches_official_float_rounding_on_half_cell() {
         let array = ArrayMetadata {
             data_type: 20,
@@ -4562,6 +4782,24 @@ mod tests {
         let (y, x) = grid_index_for_lat_lon(&array, 4.2, 75.3).unwrap();
 
         assert_eq!((y, x), (235, 638));
+    }
+
+    #[test]
+    fn greenhouse_grid_coordinates_match_air_quality_response_metadata() {
+        let array = ArrayMetadata {
+            data_type: 20,
+            compression: 4,
+            dimensions: vec![1801, 3600],
+            chunks: vec![32, 32],
+            lut_offset: None,
+            lut_size: None,
+            scale_factor: None,
+            add_offset: None,
+        };
+
+        let (y, x) = grid_index_for_lat_lon(&array, 29.5638, 106.5505).unwrap();
+        assert_eq!(grid_latitude_for_index(&array, y).unwrap(), 29.599998);
+        assert_eq!(grid_longitude_for_index(&array, x).unwrap(), 106.600006);
     }
 
     #[test]
@@ -5375,8 +5613,19 @@ fn unit_for_variable(variable: &str) -> &'static str {
         "freezing_level_height" | "boundary_layer_height" | "snow_depth" => "m",
         "weather_code" | "weathercode" => "wmo code",
         "precip_phase" | "thunderstorm_code" => "",
-        "pm2_5" | "pm10" | "dust" | "carbon_monoxide" | "nitrogen_dioxide" | "ozone"
-        | "sulphur_dioxide" => "μg/m³",
+        "pm2_5"
+        | "pm10"
+        | "dust"
+        | "carbon_monoxide"
+        | "nitrogen_dioxide"
+        | "ozone"
+        | "sulphur_dioxide"
+        | "pm2_5_mean"
+        | "pm10_mean"
+        | "nitrogen_dioxide_mean"
+        | "ozone_maximum_8h_mean"
+        | "sulphur_dioxide_mean" => "μg/m³",
+        "carbon_monoxide_mean" => "mg/m³",
         "aerosol_optical_depth" => "",
         "european_aqi"
         | "european_aqi_pm2_5"
@@ -5532,12 +5781,12 @@ mod output_tests {
             "wind_speed_850hPa",
             "vertical_velocity_500hPa",
             "chinese_aqi_pm2_5",
+            "soil_moisture_0_to_10cm",
+            "soil_temperature_0_to_10cm",
         ] {
             assert!(is_public_hourly_variable(variable), "{variable}");
         }
         for variable in [
-            "soil_moisture_0_to_10cm",
-            "soil_temperature_0_to_10cm",
             "shortwave_radiation",
             "direct_normal_irradiance",
             "et0_fao_evapotranspiration",
@@ -5637,7 +5886,7 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "chinese_aqi_nitrogen_dioxide"
         | "chinese_aqi_ozone"
         | "chinese_aqi_sulphur_dioxide"
-        | "chinese_aqi_carbon_monoxide" => OutputDecimals::Fixed(4),
+        | "chinese_aqi_carbon_monoxide" => OutputDecimals::Integer,
         "weather_code"
         | "weathercode"
         | "relative_humidity_2m"
@@ -5729,6 +5978,12 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "nitrogen_dioxide"
         | "ozone"
         | "sulphur_dioxide" => OutputDecimals::Fixed(1),
+        "pm2_5_mean"
+        | "pm10_mean"
+        | "nitrogen_dioxide_mean"
+        | "ozone_maximum_8h_mean"
+        | "sulphur_dioxide_mean" => OutputDecimals::Integer,
+        "carbon_monoxide_mean" => OutputDecimals::Fixed(1),
         _ => OutputDecimals::Fixed(1),
     }
 }

@@ -182,6 +182,21 @@ fn set_coverage_public_start(root: &Path, product: &str, coverage_id: &str, valu
     fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
+fn set_coverage_forecast_hour(root: &Path, product: &str, coverage_id: &str, forecast_hour: i64) {
+    let path = root
+        .join(product)
+        .join("coverages")
+        .join(coverage_id)
+        .join("latest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for file in manifest["files"].as_array_mut().unwrap() {
+        for entry in file["entries"].as_array_mut().unwrap() {
+            entry["forecast_hour"] = Value::from(forecast_hour);
+        }
+    }
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
 struct TestEntry {
     variable: &'static str,
     values: [f32; 4],
@@ -191,6 +206,104 @@ struct TimedTestEntry {
     variable: &'static str,
     values: [f32; 4],
     valid_time_utc: &'static str,
+}
+
+#[tokio::test]
+async fn gfs_nan_fallback_uses_only_the_other_retained_full_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "gfs013_surface_2026070800_full";
+    let previous = "gfs013_surface_2026070718_full";
+    let partial = "gfs013_surface_2026070712_6h";
+    for (coverage, value, forecast_hour) in [
+        (current, f32::NAN, 6),
+        (previous, 18.0, 6),
+        (partial, 30.0, 5),
+    ] {
+        write_product_coverage(
+            root.path(),
+            "gfs013_surface",
+            coverage,
+            vec![TestEntry {
+                variable: "temperature_2m",
+                values: [value, value, value, value],
+            }],
+            false,
+        );
+        set_coverage_forecast_hour(root.path(), "gfs013_surface", coverage, forecast_hour);
+    }
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("gfs013_surface", previous)],
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070712",
+        &[("gfs013_surface", partial)],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([18.0]));
+}
+
+#[tokio::test]
+async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "gfs013_surface_2026070800_full";
+    let previous = "gfs013_surface_2026070718_full";
+    let partial = "gfs013_surface_2026070712_6h";
+    for (coverage, value, forecast_hour) in [
+        (current, f32::NAN, 6),
+        (previous, f32::NAN, 6),
+        (partial, 30.0, 5),
+    ] {
+        write_product_coverage(
+            root.path(),
+            "gfs013_surface",
+            coverage,
+            vec![TestEntry {
+                variable: "temperature_2m",
+                values: [value, value, value, value],
+            }],
+            false,
+        );
+        set_coverage_forecast_hour(root.path(), "gfs013_surface", coverage, forecast_hour);
+    }
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("gfs013_surface", previous)],
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070712",
+        &[("gfs013_surface", partial)],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([null]));
 }
 
 fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
@@ -410,7 +523,7 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
 }
 
 #[tokio::test]
-async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() {
+async fn chinese_daily_aqi_uses_hj663_08_to_24_o3_windows() {
     let root = tempfile::tempdir().unwrap();
     let historical_global = "cams_global_2026070700_120h";
     let current_global = "cams_global_2026070800_120h";
@@ -432,7 +545,7 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     );
 
     let mut current_entries = Vec::new();
-    for hour in 0..24 {
+    for hour in 0..=24 {
         let timestamp = format!(
             "2026-07-{:02}T{:02}:00:00Z",
             if hour < 8 { 7 } else { 8 },
@@ -442,7 +555,16 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
             ("pm2_5", 30.0),
             ("pm10", 50.0),
             ("nitrogen_dioxide", 100.0),
-            ("ozone", 100.0),
+            (
+                "ozone",
+                if hour == 0 {
+                    800.0
+                } else if hour == 24 {
+                    300.0
+                } else {
+                    100.0
+                },
+            ),
             ("sulphur_dioxide", 50.0),
             ("carbon_monoxide", 2000.0),
         ] {
@@ -460,7 +582,7 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
         current_entries,
         false,
     );
-    let current_co = (0..24)
+    let current_co = (0..=24)
         .map(|hour| TimedTestEntry {
             variable: "carbon_monoxide",
             values: [2000.0, 2000.0, 2000.0, 2000.0],
@@ -500,19 +622,36 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-07T16:00&end_hour=2026-07-07T16:00&daily=chinese_aqi,chinese_aqi_o3,chinese_aqi_pm2_5&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-08T15:00&end_hour=2026-07-08T15:00&daily=chinese_aqi,chinese_aqi_o3,chinese_aqi_pm2_5,pm2_5_mean,pm10_mean,nitrogen_dioxide_mean,ozone_maximum_8h_mean,sulphur_dioxide_mean,carbon_monoxide_mean&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["hourly"]["chinese_aqi"], serde_json::json!([50.0]));
+    assert_eq!(body["hourly"]["chinese_aqi"], serde_json::json!([50]));
     assert_eq!(body["daily"]["time"], serde_json::json!(["2026-07-08"]));
-    assert_eq!(body["daily"]["chinese_aqi"], serde_json::json!([110.0]));
-    assert_eq!(body["daily"]["chinese_aqi_o3"], serde_json::json!([50.0]));
+    assert_eq!(body["daily"]["chinese_aqi"], serde_json::json!([110]));
+    assert_eq!(body["daily"]["chinese_aqi_o3"], serde_json::json!([71]));
+    assert_eq!(body["daily"]["chinese_aqi_pm2_5"], serde_json::json!([50]));
+    assert_eq!(body["daily"]["pm2_5_mean"], serde_json::json!([30]));
+    assert_eq!(body["daily"]["pm10_mean"], serde_json::json!([50]));
     assert_eq!(
-        body["daily"]["chinese_aqi_pm2_5"],
-        serde_json::json!([50.0])
+        body["daily"]["nitrogen_dioxide_mean"],
+        serde_json::json!([100])
     );
+    assert_eq!(
+        body["daily"]["ozone_maximum_8h_mean"],
+        serde_json::json!([125])
+    );
+    assert_eq!(
+        body["daily"]["sulphur_dioxide_mean"],
+        serde_json::json!([50])
+    );
+    assert_eq!(
+        body["daily"]["carbon_monoxide_mean"],
+        serde_json::json!([2.0])
+    );
+    assert_eq!(body["daily_units"]["pm2_5_mean"], "μg/m³");
+    assert_eq!(body["daily_units"]["carbon_monoxide_mean"], "mg/m³");
 
     let (daily_only_status, daily_only_body) = request_json(
         app,
@@ -523,8 +662,52 @@ async fn chinese_daily_aqi_uses_complete_history_for_cross_midnight_o3_window() 
     assert!(daily_only_body.get("hourly").is_none());
     assert_eq!(
         daily_only_body["daily"]["chinese_aqi"],
-        serde_json::json!([110.0])
+        serde_json::json!([110])
     );
+}
+
+#[tokio::test]
+async fn chinese_daily_air_quality_keeps_date_when_one_pollutant_is_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage = "cams_global_chinese_daily_missing_pollutant";
+    let mut entries = Vec::new();
+    for hour in 0..24 {
+        let timestamp = format!(
+            "2026-07-{:02}T{:02}:00:00Z",
+            if hour < 8 { 7 } else { 8 },
+            (hour + 16) % 24
+        );
+        for (variable, value) in [
+            ("pm2_5", 30.0),
+            ("pm10", if hour == 13 { f32::NAN } else { 50.0 }),
+            ("nitrogen_dioxide", 40.0),
+            ("ozone", 100.0),
+            ("sulphur_dioxide", 50.0),
+            ("carbon_monoxide", 2000.0),
+        ] {
+            entries.push(TimedTestEntry {
+                variable,
+                values: [value, value, value, value],
+                valid_time_utc: Box::leak(timestamp.clone().into_boxed_str()),
+            });
+        }
+    }
+    write_product_coverage_timed(root.path(), "cams_global", coverage, entries, false);
+    write_group_ready(root.path(), "cams", &[("cams_global", coverage)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&daily=pm2_5_mean,pm10_mean,chinese_aqi&start_date=2026-07-08&end_date=2026-07-08",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["daily"]["time"], serde_json::json!(["2026-07-08"]));
+    assert_eq!(body["daily"]["pm2_5_mean"], serde_json::json!([30]));
+    assert_eq!(body["daily"]["pm10_mean"], serde_json::json!([null]));
+    assert_eq!(body["daily"]["chinese_aqi"], serde_json::json!([null]));
 }
 
 #[tokio::test]
@@ -561,30 +744,72 @@ async fn missing_historical_release_coverage_does_not_block_current_cams_api() {
 #[tokio::test]
 async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
     let root = tempfile::tempdir().unwrap();
-    let current = write_product(
-        root.path(),
-        "cams_global",
-        vec![TestEntry {
+    let current = "cams_global_chinese_pm25_24h";
+    let entries = (0..24)
+        .map(|hour| TimedTestEntry {
             variable: "pm2_5",
             values: [60.0, 60.0, 60.0, 60.0],
-        }],
-    );
-    write_group_ready(root.path(), "cams", &[("cams_global", &current)]);
+            valid_time_utc: Box::leak(format!("2026-07-08T{hour:02}:00:00Z").into_boxed_str()),
+        })
+        .collect();
+    write_product_coverage_timed(root.path(), "cams_global", current, entries, false);
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
 
     let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5&forecast_hours=1",
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    // HJ 633-2026 defines PM2.5 24h breakpoints 30/60 at IAQI 50/100.
+    // HJ 633-2026 uses the PM2.5 daily-average breakpoint column for 1h reporting.
     assert_eq!(
         body["hourly"]["chinese_aqi_pm2_5"],
-        serde_json::json!([100.0])
+        serde_json::json!([100])
     );
+}
+
+#[tokio::test]
+async fn chinese_hourly_aqi_uses_current_one_hour_concentrations() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "cams_global_chinese_sliding_means";
+    let mut entries = Vec::new();
+    for hour in 0..24 {
+        let pm2_5 = if hour == 23 { 60.0 } else { 30.0 };
+        let ozone = if hour >= 16 && hour < 23 {
+            300.0
+        } else {
+            100.0
+        };
+        for (variable, value) in [("pm2_5", pm2_5), ("ozone", ozone)] {
+            entries.push(TimedTestEntry {
+                variable,
+                values: [value, value, value, value],
+                valid_time_utc: Box::leak(format!("2026-07-08T{hour:02}:00:00Z").into_boxed_str()),
+            });
+        }
+    }
+    write_product_coverage_timed(root.path(), "cams_global", current, entries, false);
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5,chinese_aqi_o3&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Real-time reporting uses the current preceding 1-hour concentration.
+    assert_eq!(
+        body["hourly"]["chinese_aqi_pm2_5"],
+        serde_json::json!([100])
+    );
+    // O3 also uses the current 1-hour concentration, not an 8-hour rolling mean.
+    assert_eq!(body["hourly"]["chinese_aqi_o3"], serde_json::json!([32]));
 }
 
 fn fixture_root() -> TempDir {
@@ -800,22 +1025,92 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
 }
 
 #[tokio::test]
-async fn forecast_endpoint_hides_soil_radiation_and_internal_wind_components() {
-    let root = fixture_root();
+async fn forecast_endpoint_exposes_all_soil_temperature_and_moisture_layers() {
+    let root = tempfile::tempdir().unwrap();
+    let gfs013 = write_product(
+        root.path(),
+        "gfs013_surface",
+        vec![
+            TestEntry {
+                variable: "soil_temperature_0_to_10cm",
+                values: [20.1; 4],
+            },
+            TestEntry {
+                variable: "soil_temperature_10_to_40cm",
+                values: [19.2; 4],
+            },
+            TestEntry {
+                variable: "soil_temperature_40_to_100cm",
+                values: [18.3; 4],
+            },
+            TestEntry {
+                variable: "soil_temperature_100_to_200cm",
+                values: [17.4; 4],
+            },
+            TestEntry {
+                variable: "soil_moisture_0_to_10cm",
+                values: [0.111; 4],
+            },
+            TestEntry {
+                variable: "soil_moisture_10_to_40cm",
+                values: [0.222; 4],
+            },
+            TestEntry {
+                variable: "soil_moisture_40_to_100cm",
+                values: [0.333; 4],
+            },
+            TestEntry {
+                variable: "soil_moisture_100_to_200cm",
+                values: [0.444; 4],
+            },
+        ],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
     let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_moisture_0_to_10cm,shortwave_radiation,wind_u_component_10m&forecast_hours=1",
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_temperature_0_to_10cm,soil_temperature_10_to_40cm,soil_temperature_40_to_100cm,soil_temperature_100_to_200cm,soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_moisture_40_to_100cm,soil_moisture_100_to_200cm&forecast_hours=1",
     )
     .await;
 
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["hourly"]["soil_temperature_0_to_10cm"],
+        serde_json::json!([20.1])
+    );
+    assert_eq!(
+        body["hourly"]["soil_temperature_100_to_200cm"],
+        serde_json::json!([17.4])
+    );
+    assert_eq!(
+        body["hourly"]["soil_moisture_0_to_10cm"],
+        serde_json::json!([0.111])
+    );
+    assert_eq!(
+        body["hourly"]["soil_moisture_100_to_200cm"],
+        serde_json::json!([0.444])
+    );
+    assert_eq!(body["hourly_units"]["soil_temperature_0_to_10cm"], "°C");
+    assert_eq!(body["hourly_units"]["soil_moisture_0_to_10cm"], "m³/m³");
+}
+
+#[tokio::test]
+async fn forecast_endpoint_hides_radiation_and_internal_wind_components() {
+    let root = fixture_root();
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=shortwave_radiation,wind_u_component_10m&forecast_hours=1",
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("unsupported public hourly variable: soil_moisture_0_to_10cm"));
+        .contains("unsupported public hourly variable: shortwave_radiation"));
 }
 
 #[tokio::test]
