@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "products": {
+    "gfs013_surface": {
+      "download_product": "om_gfs013_surface",
+      "openmeteo_model": "ncep_gfs013",
+      "forecast_hour_end": 384,
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "wind_u_component_10m",
+        "wind_v_component_10m",
+        "precipitation",
+        "showers",
+        "cloud_cover",
+        "cloud_cover_high",
+        "cloud_cover_mid",
+        "cloud_cover_low"
+      ],
+      "optional_variables": [
+        "boundary_layer_height",
+        "snow_depth",
+        "snowfall_water_equivalent",
+        "frozen_precipitation_percent",
+        "pressure_msl",
+        "surface_temperature",
+        "total_column_integrated_water_vapour",
+        "uv_index",
+        "uv_index_clear_sky",
+        "shortwave_radiation",
+        "diffuse_radiation",
+        "latent_heat_flux",
+        "sensible_heat_flux",
+        "soil_moisture_0_to_10cm",
+        "soil_moisture_10_to_40cm",
+        "soil_moisture_40_to_100cm",
+        "soil_moisture_100_to_200cm",
+        "soil_temperature_0_to_10cm",
+        "soil_temperature_10_to_40cm",
+        "soil_temperature_40_to_100cm",
+        "soil_temperature_100_to_200cm"
+      ],
+      "requested_pressure_levels_hpa": []
+    },
+    "gfs025": {
+      "download_product": "om_gfs025",
+      "openmeteo_model": "ncep_gfs025",
+      "forecast_hour_end": 384,
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "pressure_msl",
+        "visibility",
+        "wind_gusts_10m",
+        "cape",
+        "lifted_index",
+        "categorical_freezing_rain",
+        "freezing_level_height"
+      ],
+      "optional_variables": [
+        "convective_inhibition",
+        "latent_heat_flux",
+        "temperature_80m",
+        "temperature_100m",
+        "wind_u_component_80m",
+        "wind_v_component_80m",
+        "wind_u_component_100m",
+        "wind_v_component_100m"
+      ],
+      "requested_pressure_levels_hpa": []
+    },
+    "gfs_pressure_profile": {
+      "download_product": "om_gfs_pressure_profile",
+      "openmeteo_model": "ncep_gfs025",
+      "forecast_hour_end": 384,
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [],
+      "required_pressure_variable_prefixes": [
+        "temperature",
+        "relative_humidity",
+        "wind_u_component",
+        "wind_v_component",
+        "geopotential_height"
+      ],
+      "optional_variables": [],
+      "optional_pressure_variable_prefixes": [
+        "vertical_velocity",
+        "cloud_cover"
+      ],
+      "requested_pressure_levels_hpa": [1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50]
+    },
+    "cams_global": {
+      "download_product": "om_cams_global",
+      "openmeteo_model": "cams_global",
+      "forecast_hour_end": 120,
+        "history_hours": 0,
+      "run_cadence_hours": 12,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "aerosol_optical_depth",
+        "pm2_5",
+        "pm10",
+        "dust",
+        "carbon_monoxide",
+        "nitrogen_dioxide",
+        "ozone",
+        "sulphur_dioxide"
+      ],
+      "optional_variables": [],
+      "requested_pressure_levels_hpa": []
+    },
+      "cams_global_greenhouse_gases": {
+        "download_product": "om_cams_global_greenhouse_gases",
+        "openmeteo_model": "cams_global_greenhouse_gases",
+        "forecast_hour_end": 120,
+        "history_hours": 0,
+        "run_cadence_hours": 24,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "carbon_monoxide"
+      ],
+      "optional_variables": [],
+      "requested_pressure_levels_hpa": []
+    }
+  }
+}

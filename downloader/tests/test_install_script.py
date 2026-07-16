@@ -1,0 +1,106 @@
+from pathlib import Path
+import unittest
+
+from scripts.install_1panel_v2_cronjobs import (
+    REMOVED_PLACEHOLDER_TASKS,
+    api_source_sync_tasks,
+)
+
+
+class InstallScriptTests(unittest.TestCase):
+    def test_install_script_contains_server_deploy_steps_without_system_scheduler(self):
+        script = Path("scripts/install_from_zip.sh")
+        content = script.read_text(encoding="utf-8")
+
+        self.assertIn("set -euo pipefail", content)
+        self.assertIn("/opt/1panel/apps/weather_om_downloader", content)
+        self.assertIn("unzip", content)
+        self.assertIn("scripts/build_turbopfor_decoder.sh", content)
+        self.assertNotIn("python3 -m unittest discover -s tests -p", content)
+        self.assertIn("native_decoder_ok", content)
+        self.assertIn("--inspect-product-catalog gfs025", content)
+        self.assertIn("--inspect-product-catalog cams_global", content)
+        self.assertNotIn("crontab", content)
+        self.assertNotIn("systemctl", content)
+        self.assertNotIn("systemd", content)
+
+    def test_1panel_v2_cronjob_installer_uses_role_based_names(self):
+        content = Path("scripts/install_1panel_v2_cronjobs.py").read_text(encoding="utf-8")
+
+        self.assertIn("--role", content)
+        self.assertIn("--source-host", content)
+        self.assertNotIn("43.162.112.201", content)
+        self.assertIn("downloader", content)
+        self.assertIn("api-publisher", content)
+        self.assertIn("api-source-sync", content)
+        self.assertIn("--download-workers 6", content)
+        self.assertIn("--planning-workers 24", content)
+        self.assertIn("--range-workers 48", content)
+        self.assertIn("--object-fetch-mode auto", content)
+        self.assertIn("--object-range-max-bytes 8388608", content)
+        self.assertNotIn("--range-io-size-max 4194304", content)
+
+        removed_names = (
+            "OM_BUILD_GFS013_SURFACE",
+            "OM_BUILD_GFS_POINT_PACKAGE",
+            "OM_BUILD_GFS_PRESSURE_PROFILE",
+            "OM_BUILD_GFS_DERIVED",
+            "OM_BUILD_CAMS_GLOBAL",
+            "OM_CLEANUP",
+        )
+        self.assertEqual(REMOVED_PLACEHOLDER_TASKS, removed_names)
+
+        tasks = api_source_sync_tasks(
+            source_host="ubuntu@example.com",
+            source_root=Path("/tmp/source"),
+            source_ssh_key=Path("/tmp/id_ed25519"),
+            source_known_hosts=Path("/tmp/known_hosts"),
+            raw_root=Path("/tmp/raw"),
+        )
+        self.assertEqual(
+            [name for name, _spec, _script in tasks],
+            [
+                "OM_GFS_DOWNLOAD",
+                "OM_CAMS_DOWNLOAD",
+                "OM_GFS_SOURCE_SYNC",
+                "OM_CAMS_SOURCE_SYNC",
+            ],
+        )
+        self.assertEqual(
+            [spec for _name, spec, _script in tasks],
+            [
+                "*/10 * * * *",
+                "5,15,25,35,45,55 * * * *",
+                "*/5 * * * *",
+                "*/5 * * * *",
+            ],
+        )
+        scripts = {name: script for name, _spec, script in tasks}
+        self.assertIn("SOURCE_SYNC_TASK=OM_GFS_SOURCE_SYNC", scripts["OM_GFS_DOWNLOAD"])
+        self.assertIn("SOURCE_SYNC_TASK=OM_CAMS_SOURCE_SYNC", scripts["OM_CAMS_DOWNLOAD"])
+        self.assertIn(
+            "upstream source sync task enabled; direct download skipped",
+            scripts["OM_GFS_DOWNLOAD"],
+        )
+        self.assertIn("--group gfs", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--group cams", scripts["OM_CAMS_SOURCE_SYNC"])
+        self.assertIn("--source-host ubuntu@example.com", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-root /tmp/source", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-ssh-key /tmp/id_ed25519", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-known-hosts /tmp/known_hosts", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--raw-root /tmp/raw", scripts["OM_GFS_SOURCE_SYNC"])
+
+        sync_content = Path("scripts/sync_openmeteo_source_group.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rsync -a --whole-file", sync_content)
+        self.assertNotIn("rsync -az", sync_content)
+        self.assertIn("flock -n 9", sync_content)
+        self.assertIn('--files-from="$PAYLOAD_LIST"', sync_content)
+        self.assertIn("--partial-dir=.rsync-partial", sync_content)
+        self.assertIn("--source-ssh-key", sync_content)
+        self.assertIn("--source-known-hosts", sync_content)
+
+
+if __name__ == "__main__":
+    unittest.main()
