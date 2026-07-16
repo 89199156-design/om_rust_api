@@ -1,5 +1,18 @@
 # OM Weather Pipeline
 
+This repository is the single source of truth for the Shanghai production
+weather pipeline. It contains:
+
+- `om_api/`: Rust point forecast, daily aggregation, soil, and air-quality API.
+- `downloader/`: Python GFS/CAMS range downloader and mirror synchronization.
+- `webp/om_webp/`: Rust WebP grid renderer and verification tools.
+
+The repository root is a Cargo workspace containing the API and WebP crates.
+WebP uses the in-repository `om-api` crate through a path dependency, so a
+single Git commit identifies the complete production source state. The
+standalone `om_downloader_sh` and `om_weather_webp` repositories are retired
+and must not be used for production changes.
+
 ## Singapore native OM API
 
 The Rust API can read the producer's `openmeteo-native-v1` coverages directly.

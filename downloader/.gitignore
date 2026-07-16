@@ -15,7 +15,6 @@ venv/
 *.lock
 
 data/
-fixtures/
 docs/
 
 *.om
