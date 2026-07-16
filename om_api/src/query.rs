@@ -1325,7 +1325,7 @@ pub fn read_variable_value(
             let pressure_msl =
                 read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
             let elevation = current_product_sampling("gfs013_surface")
-                .map(|sampling| sampling.target_elevation)
+                .map(surface_pressure_elevation)
                 .or_else(|| {
                     gfs013_model_location(snapshot, decoder, latitude, longitude)
                         .ok()
@@ -2992,6 +2992,14 @@ fn surface_pressure(temperature: f32, pressure_msl: f32, elevation: f32) -> f32 
     let t0 = temperature + 273.15 + 0.0065 * elevation;
     let factor = (1.0 - (0.0065 * elevation) / t0).powf(-5.255_781_3);
     pressure_msl / factor
+}
+
+fn surface_pressure_elevation(sampling: ModelSampling) -> f32 {
+    if sampling.target_elevation.is_finite() {
+        sampling.target_elevation
+    } else {
+        sampling.model_elevation
+    }
 }
 
 fn read_gfs_surface_elevation_grid(
@@ -5602,6 +5610,17 @@ mod tests {
             seed_variable_for_times("surface_pressure"),
             "temperature_2m"
         );
+    }
+
+    #[test]
+    fn surface_pressure_uses_model_elevation_when_target_is_nan() {
+        let sampling = ModelSampling {
+            latitude: 30.0,
+            longitude: 120.0,
+            model_elevation: 864.0,
+            target_elevation: f32::NAN,
+        };
+        assert_eq!(surface_pressure_elevation(sampling), 864.0);
     }
 
     #[test]

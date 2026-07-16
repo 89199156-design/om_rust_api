@@ -459,6 +459,7 @@ fn fetch_api(
         .map(|sample| format!("{:.6}", sample.longitude))
         .collect::<Vec<_>>()
         .join(",");
+    let elevation = vec!["nan"; samples.len()].join(",");
     let hour = DateTime::from_timestamp(timestamp, 0)
         .context("manifest timestamp is out of range")?
         .format("%Y-%m-%dT%H:00")
@@ -473,6 +474,7 @@ fn fetch_api(
         .args(["--data", &format!("latitude={latitude}")])
         .args(["--data", &format!("longitude={longitude}")])
         .args(["--data", "cell_selection=nearest"])
+        .args(["--data", &format!("elevation={elevation}")])
         .args(["--data", &format!("hourly={}", variables.join(","))])
         .args(["--data", &format!("start_hour={hour}")])
         .args(["--data", &format!("end_hour={hour}")])
