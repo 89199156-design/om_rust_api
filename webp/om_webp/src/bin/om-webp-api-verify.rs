@@ -2,6 +2,9 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use image::RgbaImage;
+use om_api::official::OfficialDecoder;
+use om_api::query::{read_variable_value, round_variable_output_value};
+use om_api::snapshot::OmDataSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -22,6 +25,11 @@ struct Args {
     api_base: String,
     #[arg(long, default_value = "/data/om_raw")]
     raw_root: PathBuf,
+    #[arg(
+        long,
+        default_value = "/opt/1panel/apps/weather_om_api/native/libomfileformat.so"
+    )]
+    decoder_lib: PathBuf,
     #[arg(long, default_value_t = 5000)]
     points: usize,
     #[arg(
@@ -106,6 +114,8 @@ struct ScopeReport {
     run: String,
     points: usize,
     layers: usize,
+    public_api_layers: usize,
+    internal_point_layers: usize,
     comparisons: usize,
     api_requests: usize,
 }
@@ -187,6 +197,8 @@ fn main() -> Result<()> {
         bail!("points must be between 1 and {}", WIDTH * HEIGHT);
     }
     let started = Instant::now();
+    let snapshot = OmDataSnapshot::load(&args.raw_root)?;
+    let decoder = OfficialDecoder::load(&args.decoder_lib)?;
     let gfs_link = args.public_root.join("gfs013_surface");
     let gfs_root = gfs_link.canonicalize()?;
     let gfs_manifest = load_manifest(&gfs_root.join("gfs013_surface_data.json"))?;
@@ -202,6 +214,8 @@ fn main() -> Result<()> {
         GFS_LAYERS,
         &samples,
         &args.api_base,
+        &snapshot,
+        &decoder,
     )?;
     ensure_current_release(&args.raw_root, "gfs", &gfs_release_id)?;
     if gfs_link.canonicalize()? != gfs_root {
@@ -222,6 +236,8 @@ fn main() -> Result<()> {
         CAMS_LAYERS,
         &samples,
         &args.api_base,
+        &snapshot,
+        &decoder,
     )?;
     ensure_current_release(&args.raw_root, "cams", &cams_release_id)?;
     if cams_link.canonicalize()? != cams_root {
@@ -338,6 +354,8 @@ fn verify_scope(
     layers: &[LayerSpec],
     samples: &[Sample],
     api_base: &str,
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
 ) -> Result<ScopeReport> {
     if manifest.files.len() != 121 {
         bail!(
@@ -386,6 +404,8 @@ fn verify_scope(
                 &image,
                 &frame_samples,
                 &responses,
+                snapshot,
+                decoder,
             )?;
             comparisons += frame_samples.len();
         }
@@ -395,6 +415,14 @@ fn verify_scope(
         run: manifest.source_run,
         points: samples.len(),
         layers: layers.len(),
+        public_api_layers: layers
+            .iter()
+            .filter(|layer| !matches!(layer.encoding, Encoding::Wind))
+            .count(),
+        internal_point_layers: layers
+            .iter()
+            .filter(|layer| matches!(layer.encoding, Encoding::Wind))
+            .count(),
         comparisons,
         api_requests,
     })
@@ -409,6 +437,9 @@ fn fetch_api(
 ) -> Result<Vec<Value>> {
     let mut variables = Vec::new();
     for layer in layers {
+        if matches!(layer.encoding, Encoding::Wind) {
+            continue;
+        }
         if !variables.contains(&layer.variable) {
             variables.push(layer.variable);
         }
@@ -470,24 +501,49 @@ fn compare_layer(
     image: &RgbaImage,
     samples: &[Sample],
     responses: &[Value],
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
 ) -> Result<()> {
+    let valid_time =
+        DateTime::from_timestamp(timestamp, 0).context("manifest timestamp is out of range")?;
     for (sample, response) in samples.iter().zip(responses) {
         let actual = image.get_pixel(sample.x as u32, sample.y as u32).0;
-        let first = api_value(response, layer.variable)?;
+        let point_value;
         let expected = match layer.encoding {
-            Encoding::Scalar => encode_scalar(
-                first.map(|value| derive_value(value, layer.derive) * layer.multiplier),
-                manifest.vmin,
-                manifest.scale,
-            ),
-            Encoding::Wind => encode_wind(
-                first,
-                api_value(response, layer.variable_v.expect("wind v"))?,
-            ),
+            Encoding::Scalar => {
+                point_value = api_value(response, layer.variable)?;
+                encode_scalar(
+                    point_value.map(|value| derive_value(value, layer.derive) * layer.multiplier),
+                    manifest.vmin,
+                    manifest.scale,
+                )
+            }
+            Encoding::Wind => {
+                let u = read_variable_value(
+                    snapshot,
+                    Some(decoder),
+                    layer.variable,
+                    valid_time,
+                    sample.latitude,
+                    sample.longitude,
+                )?;
+                let v = read_variable_value(
+                    snapshot,
+                    Some(decoder),
+                    layer.variable_v.expect("wind v"),
+                    valid_time,
+                    sample.latitude,
+                    sample.longitude,
+                )?;
+                let u = round_variable_output_value(layer.variable, u);
+                let v = round_variable_output_value(layer.variable_v.expect("wind v"), v);
+                point_value = Some(u);
+                encode_wind(Some(u), Some(v))
+            }
         };
         if actual != expected {
             bail!(
-                "pixel mismatch scope={} layer={} timestamp={} flat_index={} x={} y={} lat={} lon={} api_value={:?} actual={:?} expected={:?}",
+                "pixel mismatch scope={} layer={} timestamp={} flat_index={} x={} y={} lat={} lon={} point_value={:?} actual={:?} expected={:?}",
                 scope,
                 layer.name,
                 timestamp,
@@ -496,7 +552,7 @@ fn compare_layer(
                 sample.y,
                 sample.latitude,
                 sample.longitude,
-                first,
+                point_value,
                 actual,
                 expected
             );
