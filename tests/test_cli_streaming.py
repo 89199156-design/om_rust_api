@@ -200,6 +200,7 @@ class CliStreamingTests(unittest.TestCase):
                 "coverage_id": "gfs025_2026070800_1h",
                 "latest_complete_run": "2026070800",
                 "required_start_utc": "2026-07-08T00:00:00Z",
+                "public_start_utc": "2026-07-08T00:00:00Z",
                 "required_end_utc": "2026-07-08T00:00:00Z",
                 "valid_time_count": 1,
                 "config_fingerprint": cli.product_config_fingerprint(product),

@@ -74,6 +74,20 @@ class ProcessingStageTests(unittest.TestCase):
                 },
             )
 
+            _write_ready(
+                raw_root
+                / "cams_global_greenhouse_gases"
+                / "current"
+                / "ready_for_processing.json",
+                {
+                    "model": "cams_global_greenhouse_gases",
+                    "status": "complete",
+                    "latest_complete_run": run,
+                    "files": 390,
+                    "bytes": 10891955,
+                },
+            )
+
             result = subprocess.run(
                 [
                     sys.executable,
@@ -101,7 +115,10 @@ class ProcessingStageTests(unittest.TestCase):
         self.assertEqual(payload["status"], "pending_implementation")
         self.assertEqual(status["status"], "pending_implementation")
         self.assertEqual(status["latest_complete_run"], run)
-        self.assertEqual(status["required_products"], ["cams_global"])
+        self.assertEqual(
+            status["required_products"],
+            ["cams_global", "cams_global_greenhouse_gases"],
+        )
         self.assertEqual(status["reason"], "processing stage is not implemented yet")
 
 

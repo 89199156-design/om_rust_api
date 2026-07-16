@@ -3,7 +3,7 @@ import unittest
 
 from scripts.install_1panel_v2_cronjobs import (
     REMOVED_PLACEHOLDER_TASKS,
-    mirror_sync_tasks,
+    api_source_sync_tasks,
 )
 
 
@@ -31,27 +31,15 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--source-host", content)
         self.assertNotIn("43.162.112.201", content)
         self.assertIn("downloader", content)
-        self.assertIn("mirror-sync", content)
         self.assertIn("api-publisher", content)
-        self.assertIn("OM_GFS_DOWNLOAD", content)
-        self.assertIn("OM_CAMS_DOWNLOAD", content)
-        self.assertIn("*/10 * * * *", content)
-        self.assertIn("--download-openmeteo-group {group}", content)
+        self.assertIn("api-source-sync", content)
         self.assertIn("--download-workers 6", content)
         self.assertIn("--planning-workers 24", content)
         self.assertIn("--range-workers 48", content)
         self.assertIn("--object-fetch-mode auto", content)
-        self.assertIn("--object-fetch-max-multiplier 1.5", content)
-        self.assertIn("--object-fetch-min-ranges 16", content)
-        self.assertIn("--object-range-merge-gap 16777216", content)
-        self.assertIn("--object-range-max-multiplier 1.5", content)
-        self.assertIn("--object-range-min-ranges 16", content)
         self.assertIn("--object-range-max-bytes 8388608", content)
-        self.assertIn("sudo -H -u ubuntu", content)
         self.assertNotIn("--range-io-size-max 4194304", content)
-        self.assertIn('download_group_script("gfs")', content)
-        self.assertIn('download_group_script("cams")', content)
-        self.assertIn("OM_MIRROR_SYNC", content)
+
         removed_names = (
             "OM_BUILD_GFS013_SURFACE",
             "OM_BUILD_GFS_POINT_PACKAGE",
@@ -61,55 +49,57 @@ class InstallScriptTests(unittest.TestCase):
             "OM_CLEANUP",
         )
         self.assertEqual(REMOVED_PLACEHOLDER_TASKS, removed_names)
-        self.assertEqual(
-            [name for name, _spec, _script in mirror_sync_tasks(
-                source_host="ubuntu@example.com",
-                mirror_root=Path("/tmp/mirror"),
-                raw_root=Path("/tmp/raw"),
-            )],
-            ["OM_MIRROR_SYNC"],
+
+        tasks = api_source_sync_tasks(
+            source_host="ubuntu@example.com",
+            source_root=Path("/tmp/source"),
+            source_ssh_key=Path("/tmp/id_ed25519"),
+            source_known_hosts=Path("/tmp/known_hosts"),
+            raw_root=Path("/tmp/raw"),
         )
-        self.assertIn("cleanup_names=REMOVED_PLACEHOLDER_TASKS", content)
-        self.assertIn("--sync-openmeteo-group-from-source", content)
-        self.assertIn("groups/{group}/latest.json", content)
-        self.assertIn("for group, products in OPENMETEO_GROUP_PRODUCTS.items()", content)
-        self.assertIn("/home/ubuntu/.ssh/id_ed25519", content)
-        self.assertIn("StrictHostKeyChecking=accept-new", content)
-        self.assertIn("rsync -a --whole-file", content)
-        self.assertNotIn("rsync -az", content)
-        self.assertIn("weather_om_mirror_sync.lock", content)
-        self.assertIn("flock -n 9", content)
-        self.assertIn("sync_product_files_from_manifest", content)
-        self.assertIn("group_needs_sync", content)
-        self.assertIn("--sync-openmeteo-group-from-source", content)
-        self.assertIn("--mirror-root", content)
-        self.assertNotIn("--write-om-http-status", content)
-        self.assertNotIn("--build-status-root /data/build_status", content)
         self.assertEqual(
-            mirror_sync_tasks(
-                source_host="ubuntu@example.com",
-                mirror_root=Path("/tmp/mirror"),
-                raw_root=Path("/tmp/raw"),
-            )[0][1],
-            "5,15,25,35,45,55 * * * *",
+            [name for name, _spec, _script in tasks],
+            [
+                "OM_GFS_DOWNLOAD",
+                "OM_CAMS_DOWNLOAD",
+                "OM_GFS_SOURCE_SYNC",
+                "OM_CAMS_SOURCE_SYNC",
+            ],
         )
-        self.assertNotIn('if pull_remote_file "{product}/latest.json"; then', content)
-        self.assertIn('GROUP_READY=1', content)
-        self.assertIn('if ! pull_remote_file "{product}/latest.json"; then', content)
-        self.assertIn('if ! sync_product_files_from_manifest "$MANIFEST"; then', content)
-        self.assertIn('if pull_remote_file "groups/{group}/latest.json"; then', content)
-        self.assertIn("PurePosixPath(product) / str(item.get('path', ''))", content)
-        self.assertIn("--files-from", content)
+        self.assertEqual(
+            [spec for _name, spec, _script in tasks],
+            [
+                "*/10 * * * *",
+                "5,15,25,35,45,55 * * * *",
+                "*/5 * * * *",
+                "*/5 * * * *",
+            ],
+        )
+        scripts = {name: script for name, _spec, script in tasks}
+        self.assertIn("SOURCE_SYNC_TASK=OM_GFS_SOURCE_SYNC", scripts["OM_GFS_DOWNLOAD"])
+        self.assertIn("SOURCE_SYNC_TASK=OM_CAMS_SOURCE_SYNC", scripts["OM_CAMS_DOWNLOAD"])
         self.assertIn(
-            'rsync -a --whole-file --partial --timeout=180 --files-from="$file_list"',
-            content,
+            "upstream source sync task enabled; direct download skipped",
+            scripts["OM_GFS_DOWNLOAD"],
         )
-        self.assertNotIn('for rel in "${FILES[@]}"', content)
-        self.assertIn('manifest_status_is_complete "$GROUP_MANIFEST"', content)
-        self.assertIn('group_needs_sync "$GROUP_MANIFEST" "$RAW/groups/{group}/current/ready_for_processing.json"', content)
-        self.assertIn("manifest.get('files') is not None", content)
-        self.assertIn("manifest.get('bytes') is not None", content)
-        self.assertNotIn('rsync -az --partial --delete --timeout=180 -e "$SSH_CMD" "$SOURCE_HOST:$SOURCE/" "$MIRROR/"', content)
+        self.assertIn("--group gfs", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--group cams", scripts["OM_CAMS_SOURCE_SYNC"])
+        self.assertIn("--source-host ubuntu@example.com", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-root /tmp/source", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-ssh-key /tmp/id_ed25519", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--source-known-hosts /tmp/known_hosts", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("--raw-root /tmp/raw", scripts["OM_GFS_SOURCE_SYNC"])
+
+        sync_content = Path("scripts/sync_openmeteo_source_group.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rsync -a --whole-file", sync_content)
+        self.assertNotIn("rsync -az", sync_content)
+        self.assertIn("flock -n 9", sync_content)
+        self.assertIn('--files-from="$PAYLOAD_LIST"', sync_content)
+        self.assertIn("--partial-dir=.rsync-partial", sync_content)
+        self.assertIn("--source-ssh-key", sync_content)
+        self.assertIn("--source-known-hosts", sync_content)
 
 
 if __name__ == "__main__":
