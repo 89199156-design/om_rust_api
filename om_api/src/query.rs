@@ -2968,6 +2968,45 @@ fn read_direct_grid(
             );
         }
     }
+    if is_cams_product(product_name) {
+        let covering_products = products
+            .iter()
+            .filter(|product| product_covers_time(product, &raw_variable, time))
+            .collect::<Vec<_>>();
+        if let Some(first) = covering_products.first() {
+            let mut values = read_product_grid_with_rounding(
+                first,
+                decoder,
+                variable,
+                &raw_variable,
+                time,
+                latitudes,
+                longitudes,
+                round_values,
+            )?;
+            for product in covering_products.iter().skip(1) {
+                if !values.iter().any(|value| value.is_nan()) {
+                    break;
+                }
+                let fallback = read_product_grid_with_rounding(
+                    product,
+                    decoder,
+                    variable,
+                    &raw_variable,
+                    time,
+                    latitudes,
+                    longitudes,
+                    round_values,
+                )?;
+                for (value, fallback_value) in values.iter_mut().zip(fallback) {
+                    if value.is_nan() && !fallback_value.is_nan() {
+                        *value = fallback_value;
+                    }
+                }
+            }
+            return Ok(values);
+        }
+    }
     for product in &products {
         if !product_covers_time(product, &raw_variable, time) {
             continue;
@@ -2999,6 +3038,10 @@ fn is_gfs_product(product_name: &str) -> bool {
         product_name,
         "gfs013_surface" | "gfs025" | "gfs_pressure_profile"
     )
+}
+
+fn is_cams_product(product_name: &str) -> bool {
+    matches!(product_name, "cams_global" | "cams_global_greenhouse_gases")
 }
 
 fn gfs_snapshot_is_full(product: &ProductSnapshot) -> bool {
@@ -3284,6 +3327,33 @@ fn read_product_history_value_with_rounding(
                 round_values,
             )
             .map(|value| apply_elevation_correction(&product.product, variable, value));
+        }
+    }
+    if is_cams_product(product_name) {
+        let mut fallback = f32::NAN;
+        let mut found_coverage = false;
+        for product in &products {
+            if !product_covers_time(product, raw_variable, time) {
+                continue;
+            }
+            found_coverage = true;
+            fallback = read_product_value_with_rounding(
+                product,
+                decoder,
+                variable,
+                raw_variable,
+                time,
+                latitude,
+                longitude,
+                round_values,
+            )?;
+            fallback = apply_elevation_correction(&product.product, variable, fallback);
+            if !fallback.is_nan() {
+                return Ok(fallback);
+            }
+        }
+        if found_coverage {
+            return Ok(fallback);
         }
     }
     for product in &products {

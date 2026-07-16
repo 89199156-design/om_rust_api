@@ -1,76 +1,44 @@
 use crate::official::{BundleRangeReader, OfficialDecoder};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
-const DEFAULT_DEM_BASE_URL: &str = "https://openmeteo.s3.amazonaws.com/data";
-const HTTP_BLOCK_SIZE: u64 = 64 * 1024;
-const MAX_CACHED_BLOCKS: usize = 512;
+const DEFAULT_DEM_ROOT: &str = "/data/om_static";
 const MAX_CACHED_POINTS: usize = 100_000;
 const OM_TRAILER_SIZE: u64 = 24;
 const OM_LEGACY_HEADER_SIZE: u64 = 40;
 
-type BlockCache = HashMap<(String, u64), Arc<Vec<u8>>>;
 type PointCache = HashMap<(i32, u64, u64), f32>;
-type FileCache = HashMap<i32, Arc<RemoteOmFile>>;
+type FileCache = HashMap<i32, Arc<LocalOmFile>>;
 
-static BLOCK_CACHE: OnceLock<Mutex<BlockCache>> = OnceLock::new();
 static POINT_CACHE: OnceLock<Mutex<PointCache>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<FileCache>> = OnceLock::new();
 
 #[derive(Debug)]
-struct RemoteOmFile {
-    agent: ureq::Agent,
-    url: String,
+struct LocalOmFile {
+    file: File,
     size: u64,
     metadata: Vec<u64>,
 }
 
-impl RemoteOmFile {
-    fn open(url: String) -> Result<Self> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(8))
-            .timeout_read(Duration::from_secs(30))
-            .timeout_write(Duration::from_secs(10))
-            .build();
-        let probe = agent
-            .get(&url)
-            .set("Range", "bytes=0-0")
-            .call()
-            .map_err(|error| anyhow!("failed to open DEM file {url}: {error}"))?;
-        if probe.status() != 206 {
-            bail!(
-                "DEM server did not honor byte ranges for {}: HTTP {}",
-                url,
-                probe.status()
-            );
-        }
-        let size = probe
-            .header("Content-Range")
-            .and_then(|value| value.rsplit('/').next())
-            .context("DEM range response has no total file size")?
-            .parse::<u64>()
-            .context("DEM range response has an invalid total file size")?;
-        let mut probe_body = Vec::new();
-        probe
-            .into_reader()
-            .take(2)
-            .read_to_end(&mut probe_body)
-            .context("failed to read DEM range probe")?;
-        if probe_body.len() != 1 {
-            bail!("DEM range probe returned {} bytes", probe_body.len());
-        }
-
-        let mut file = Self {
-            agent,
-            url,
+impl LocalOmFile {
+    fn open(path: PathBuf) -> Result<Self> {
+        let file = File::open(&path)
+            .with_context(|| format!("failed to open local DEM file {}", path.display()))?;
+        let size = file
+            .metadata()
+            .with_context(|| format!("failed to stat local DEM file {}", path.display()))?
+            .len();
+        let mut dem = Self {
+            file,
             size,
             metadata: Vec::new(),
         };
-        file.metadata = file.read_root_metadata()?;
-        Ok(file)
+        dem.metadata = dem.read_root_metadata()?;
+        Ok(dem)
     }
 
     fn read_root_metadata(&self) -> Result<Vec<u64>> {
@@ -115,62 +83,6 @@ impl RemoteOmFile {
         }
         Ok(align_metadata(bytes))
     }
-
-    fn fetch_block(&self, block: u64) -> Result<Arc<Vec<u8>>> {
-        let key = (self.url.clone(), block);
-        let cache = BLOCK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(value) = cache
-            .lock()
-            .map_err(|_| anyhow!("DEM HTTP block cache poisoned"))?
-            .get(&key)
-            .cloned()
-        {
-            return Ok(value);
-        }
-
-        let start = block * HTTP_BLOCK_SIZE;
-        if start >= self.size {
-            bail!("DEM byte-range block starts beyond end of file");
-        }
-        let end = (start + HTTP_BLOCK_SIZE).min(self.size) - 1;
-        let response = self
-            .agent
-            .get(&self.url)
-            .set("Range", &format!("bytes={start}-{end}"))
-            .call()
-            .map_err(|error| anyhow!("failed to read DEM byte range: {error}"))?;
-        if response.status() != 206 {
-            bail!(
-                "DEM server did not honor byte range {}-{}: HTTP {}",
-                start,
-                end,
-                response.status()
-            );
-        }
-        let expected = (end - start + 1) as usize;
-        let mut bytes = Vec::with_capacity(expected);
-        response
-            .into_reader()
-            .take(expected as u64 + 1)
-            .read_to_end(&mut bytes)
-            .context("failed to read DEM byte-range response")?;
-        if bytes.len() != expected {
-            bail!(
-                "DEM byte-range response length mismatch: expected {}, got {}",
-                expected,
-                bytes.len()
-            );
-        }
-        let value = Arc::new(bytes);
-        let mut cache = cache
-            .lock()
-            .map_err(|_| anyhow!("DEM HTTP block cache poisoned"))?;
-        if cache.len() >= MAX_CACHED_BLOCKS {
-            cache.clear();
-        }
-        cache.insert(key, value.clone());
-        Ok(value)
-    }
 }
 
 fn align_metadata(bytes: Vec<u8>) -> Vec<u64> {
@@ -182,7 +94,14 @@ fn align_metadata(bytes: Vec<u8>) -> Vec<u64> {
     aligned
 }
 
-impl BundleRangeReader for RemoteOmFile {
+fn read_local_range(file: &File, start: u64, count: u64) -> Result<Vec<u8>> {
+    let mut output = vec![0_u8; count as usize];
+    file.read_exact_at(&mut output, start)
+        .context("failed to read local DEM byte range")?;
+    Ok(output)
+}
+
+impl BundleRangeReader for LocalOmFile {
     fn read_original_range(&self, start: u64, count: u64) -> Result<Vec<u8>> {
         if count == 0 {
             return Ok(Vec::new());
@@ -193,20 +112,7 @@ impl BundleRangeReader for RemoteOmFile {
         if end > self.size {
             bail!("DEM byte range exceeds file size");
         }
-        let mut output = Vec::with_capacity(count as usize);
-        let first_block = start / HTTP_BLOCK_SIZE;
-        let last_block = (end - 1) / HTTP_BLOCK_SIZE;
-        for block in first_block..=last_block {
-            let bytes = self.fetch_block(block)?;
-            let block_start = block * HTTP_BLOCK_SIZE;
-            let from = start.max(block_start) - block_start;
-            let to = end.min(block_start + bytes.len() as u64) - block_start;
-            output.extend_from_slice(&bytes[from as usize..to as usize]);
-        }
-        if output.len() != count as usize {
-            bail!("assembled DEM byte range has an invalid length");
-        }
-        Ok(output)
+        read_local_range(&self.file, start, count)
     }
 }
 
@@ -252,7 +158,7 @@ pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> R
     }
 
     let files = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    // Drop the cache guard before network I/O and before taking the lock for insertion.
+    // Drop the cache guard before file I/O and before taking the lock for insertion.
     let cached_file = {
         let files = files
             .lock()
@@ -262,14 +168,14 @@ pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> R
     let file = if let Some(file) = cached_file {
         file
     } else {
-        let base =
-            std::env::var("OM_DEM_BASE_URL").unwrap_or_else(|_| DEFAULT_DEM_BASE_URL.to_string());
-        let url = format!(
-            "{}/copernicus_dem90/static/lat_{}.om",
-            base.trim_end_matches('/'),
-            latitude_file
-        );
-        let file = Arc::new(RemoteOmFile::open(url)?);
+        let root = std::env::var_os("OM_DEM_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DEM_ROOT));
+        let path = root
+            .join("copernicus_dem90")
+            .join("static")
+            .join(format!("lat_{latitude_file}.om"));
+        let file = Arc::new(LocalOmFile::open(path)?);
         files
             .lock()
             .map_err(|_| anyhow!("DEM file cache poisoned"))?
@@ -289,4 +195,23 @@ pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> R
     }
     points.insert(key, value);
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_an_exact_local_byte_range() {
+        let path =
+            std::env::temp_dir().join(format!("om-api-dem-range-{}.bin", std::process::id()));
+        let bytes = (0_u8..64).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).expect("write test DEM file");
+        let file = File::open(&path).expect("open test DEM file");
+
+        let actual = read_local_range(&file, 11, 17).expect("read local byte range");
+
+        assert_eq!(actual, bytes[11..28]);
+        std::fs::remove_file(path).expect("remove test DEM file");
+    }
 }

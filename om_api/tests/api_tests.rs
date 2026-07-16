@@ -306,6 +306,43 @@ async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
     assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([null]));
 }
 
+#[tokio::test]
+async fn cams_nan_fallback_uses_previous_retained_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "cams_global_2026070800_120h";
+    let previous = "cams_global_2026070712_120h";
+    for (coverage, value) in [(current, f32::NAN), (previous, 2808.9)] {
+        write_product_coverage(
+            root.path(),
+            "cams_global",
+            coverage,
+            vec![TestEntry {
+                variable: "pm10",
+                values: [value, value, value, value],
+            }],
+            false,
+        );
+    }
+    write_group_release(
+        root.path(),
+        "cams",
+        "2026070712",
+        &[("cams_global", previous)],
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
+
+    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["pm10"], serde_json::json!([2808.9]));
+}
+
 fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for value in values {
