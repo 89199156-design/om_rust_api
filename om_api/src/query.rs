@@ -3008,13 +3008,18 @@ fn read_gfs_surface_elevation_grid(
     latitudes: &[f64],
     longitudes: &[f64],
 ) -> Result<Vec<f32>> {
-    let Some(product) = snapshot.product("gfs013_surface") else {
-        return Ok(vec![0.0; latitudes.len() * longitudes.len()]);
+    let product = snapshot.require_product("gfs013_surface")?;
+    let mut values = if let Some(entry) = product.static_entries.get("surface_elevation") {
+        read_entry_grid(&product, entry, decoder, latitudes, longitudes)?
+    } else {
+        read_static_elevation_grid_for_coordinates(
+            snapshot,
+            decoder,
+            GFS013_STATIC_SPEC,
+            latitudes,
+            longitudes,
+        )?
     };
-    let Some(entry) = product.static_entries.get("surface_elevation") else {
-        return Ok(vec![0.0; latitudes.len() * longitudes.len()]);
-    };
-    let mut values = read_entry_grid(&product, entry, decoder, latitudes, longitudes)?;
     values.iter_mut().for_each(|value| {
         if !value.is_finite() || *value <= -900.0 {
             *value = 0.0;
@@ -5306,6 +5311,65 @@ fn read_static_elevation_grid(
         &[y0, x0],
         &[height, width],
     )
+}
+
+fn read_static_elevation_grid_for_coordinates(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    spec: StaticElevationSpec,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<f32>> {
+    if latitudes.is_empty() || longitudes.is_empty() {
+        bail!("static elevation grid coordinates must not be empty");
+    }
+    let array = ArrayMetadata {
+        data_type: 20,
+        compression: 0,
+        dimensions: spec.dimensions.to_vec(),
+        chunks: spec.chunks.to_vec(),
+        lut_offset: Some(spec.lut_offset),
+        lut_size: Some(spec.lut_size),
+        scale_factor: Some(1.0),
+        add_offset: Some(0.0),
+    };
+    let y_indices = latitudes
+        .iter()
+        .map(|latitude| {
+            grid_index_for_lat_lon(&array, None, *latitude, longitudes[0]).map(|index| index.0)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let x_indices = longitudes
+        .iter()
+        .map(|longitude| {
+            grid_index_for_lat_lon(&array, None, latitudes[0], *longitude).map(|index| index.1)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let y0 = *y_indices
+        .iter()
+        .min()
+        .context("static elevation grid has no rows")?;
+    let y1 = *y_indices
+        .iter()
+        .max()
+        .context("static elevation grid has no rows")?;
+    let x0 = *x_indices
+        .iter()
+        .min()
+        .context("static elevation grid has no columns")?;
+    let x1 = *x_indices
+        .iter()
+        .max()
+        .context("static elevation grid has no columns")?;
+    let width = x1 - x0 + 1;
+    let decoded = read_static_elevation_grid(snapshot, decoder, spec, y0, x0, y1 - y0 + 1, width)?;
+    let mut values = Vec::with_capacity(latitudes.len() * longitudes.len());
+    for y in y_indices {
+        for x in &x_indices {
+            values.push(decoded[((y - y0) * width + (*x - x0)) as usize]);
+        }
+    }
+    Ok(values)
 }
 
 fn elevation_numeric(value: f32) -> f32 {
