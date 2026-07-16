@@ -3262,7 +3262,7 @@ fn read_direct_grid_series(
                     .any(|frame| frame.iter().any(|value| value.is_nan()))
                 {
                     if let Some(previous) = full_products.get(1) {
-                        if let Some(fallback) = read_exact_native_grid_series(
+                        if let Some(fallback_frames) = read_exact_native_grid_series(
                             previous,
                             decoder,
                             variable,
@@ -3272,7 +3272,37 @@ fn read_direct_grid_series(
                             longitudes,
                             round_values,
                         )? {
-                            for (frame, fallback_frame) in values.iter_mut().zip(fallback) {
+                            for (frame, fallback_frame) in values.iter_mut().zip(fallback_frames) {
+                                for (value, fallback_value) in frame.iter_mut().zip(fallback_frame)
+                                {
+                                    if value.is_nan() && !fallback_value.is_nan() {
+                                        *value = fallback_value;
+                                    }
+                                }
+                            }
+                        } else {
+                            // The previous complete run crosses the official
+                            // GFS f120 hourly-to-three-hour boundary at a
+                            // different output index, so it may not be
+                            // decodable as one contiguous slab. Only anomaly
+                            // frames take this slower path; healthy WebP runs
+                            // remain one-slab decodes.
+                            for (index, frame) in values.iter_mut().enumerate() {
+                                if !frame.iter().any(|value| value.is_nan())
+                                    || !product_covers_time(previous, &raw_variable, times[index])
+                                {
+                                    continue;
+                                }
+                                let fallback_frame = read_product_grid_with_rounding(
+                                    previous,
+                                    decoder,
+                                    variable,
+                                    &raw_variable,
+                                    times[index],
+                                    latitudes,
+                                    longitudes,
+                                    round_values,
+                                )?;
                                 for (value, fallback_value) in frame.iter_mut().zip(fallback_frame)
                                 {
                                     if value.is_nan() && !fallback_value.is_nan() {
