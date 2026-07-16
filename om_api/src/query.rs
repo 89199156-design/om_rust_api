@@ -5869,22 +5869,26 @@ fn read_weather_code_grid_series(
     )?;
 
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
-    let product = snapshot.require_product(product_name)?;
+    let products = snapshot.product_snapshots(product_name);
     let exact_cloud_times = times
         .iter()
         .map(|time| {
-            product.entries.contains_key(&EntryKey {
-                variable: raw_variable.clone(),
-                valid_time_utc: *time,
+            products.iter().any(|product| {
+                product.entries.contains_key(&EntryKey {
+                    variable: raw_variable.clone(),
+                    valid_time_utc: *time,
+                })
             })
         })
         .collect::<Vec<_>>();
     let entry = times
         .iter()
         .find_map(|time| {
-            product.entries.get(&EntryKey {
-                variable: raw_variable.clone(),
-                valid_time_utc: *time,
+            products.iter().find_map(|product| {
+                product.entries.get(&EntryKey {
+                    variable: raw_variable.clone(),
+                    valid_time_utc: *time,
+                })
             })
         })
         .context("weather-code series has no cloud-cover grid entry")?;
@@ -6041,12 +6045,14 @@ fn read_weather_code_grid(
         longitudes,
     )?;
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
-    let product = snapshot.require_product(product_name)?;
-    let entry = product
-        .entries
-        .get(&EntryKey {
-            variable: raw_variable,
-            valid_time_utc: time,
+    let products = snapshot.product_snapshots(product_name);
+    let entry = products
+        .iter()
+        .find_map(|product| {
+            product.entries.get(&EntryKey {
+                variable: raw_variable.clone(),
+                valid_time_utc: time,
+            })
         })
         .with_context(|| format!("variable/time is not available: cloud_cover {}", time))?;
     let model_latitudes = latitudes
