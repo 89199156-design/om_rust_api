@@ -44,7 +44,7 @@ struct GroupIdentity {
     #[serde(default)]
     coverage_id: String,
     #[serde(default)]
-    products: BTreeMap<String, ProductIdentity>,
+    products: serde_json::Value,
     #[serde(default)]
     product_manifests: BTreeMap<String, ProductIdentity>,
 }
@@ -242,6 +242,22 @@ impl axum::response::IntoResponse for ApiError {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn snapshot_identity_accepts_product_name_list() {
+        let identity: GroupIdentity = serde_json::from_value(json!({
+            "status": "complete",
+            "latest_complete_run": "2026071506",
+            "products": ["gfs013_surface", "gfs025", "gfs_pressure_profile"],
+            "product_manifests": {
+                "gfs013_surface": {"coverage_id": "gfs013_surface_2026071506_209h"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(identity.products.as_array().unwrap().len(), 3);
+        assert_eq!(identity.product_manifests.len(), 1);
+    }
 
     #[test]
     fn requests_keep_old_snapshot_until_explicit_publish_refresh() {
