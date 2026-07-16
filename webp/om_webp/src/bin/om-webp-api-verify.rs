@@ -472,6 +472,7 @@ fn fetch_api(
         ])
         .args(["--data", &format!("latitude={latitude}")])
         .args(["--data", &format!("longitude={longitude}")])
+        .args(["--data", "cell_selection=nearest"])
         .args(["--data", &format!("hourly={}", variables.join(","))])
         .args(["--data", &format!("start_hour={hour}")])
         .args(["--data", &format!("end_hour={hour}")])
