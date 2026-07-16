@@ -774,7 +774,7 @@ dependencies = [
 [[package]]
 name = "om-api"
 version = "0.1.0"
-source = "git+https://github.com/89199156-design/om_weather_server.git?rev=123369e521ee3f5bfe518ac1826fe5c3129f7706#123369e521ee3f5bfe518ac1826fe5c3129f7706"
+source = "git+https://github.com/89199156-design/om_weather_server.git?rev=a5b09d7886d471990e3f03131f4f461f04297b75#a5b09d7886d471990e3f03131f4f461f04297b75"
 dependencies = [
  "anyhow",
  "axum",
