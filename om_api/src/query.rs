@@ -1209,11 +1209,17 @@ fn select_times(
         .unwrap_or_else(|| "temperature_2m".to_string());
     let (product_name, raw_var) = product_for_variable(snapshot, &seed_var)?;
     let product = snapshot.require_product(product_name)?;
-    let mut times: Vec<DateTime<Utc>> = product
-        .entries
-        .keys()
-        .filter(|key| key.variable == raw_var)
-        .map(|key| key.valid_time_utc)
+    let mut times: Vec<DateTime<Utc>> = snapshot
+        .product_snapshots(product_name)
+        .into_iter()
+        .flat_map(|candidate| {
+            candidate
+                .entries
+                .keys()
+                .filter(|key| key.variable == raw_var)
+                .map(|key| key.valid_time_utc)
+                .collect::<Vec<_>>()
+        })
         .collect();
     times.sort();
     times.dedup();
@@ -2972,6 +2978,7 @@ fn read_direct_grid(
         let covering_products = products
             .iter()
             .filter(|product| product_covers_time(product, &raw_variable, time))
+            .take(2)
             .collect::<Vec<_>>();
         if let Some(first) = covering_products.first() {
             let mut values = read_product_grid_with_rounding(
@@ -3332,7 +3339,7 @@ fn read_product_history_value_with_rounding(
     if is_cams_product(product_name) {
         let mut fallback = f32::NAN;
         let mut found_coverage = false;
-        for product in &products {
+        for product in products.iter().take(2) {
             if !product_covers_time(product, raw_variable, time) {
                 continue;
             }
@@ -4186,12 +4193,26 @@ fn read_entry_grid(
 ) -> Result<Vec<f32>> {
     let y_indices = latitudes
         .iter()
-        .map(|latitude| grid_index_for_lat_lon(&entry.array, *latitude, longitudes[0]).map(|v| v.0))
+        .map(|latitude| {
+            grid_index_for_lat_lon(
+                &entry.array,
+                entry.native_grid.as_ref(),
+                *latitude,
+                longitudes[0],
+            )
+            .map(|v| v.0)
+        })
         .collect::<Result<Vec<_>>>()?;
     let x_indices = longitudes
         .iter()
         .map(|longitude| {
-            grid_index_for_lat_lon(&entry.array, latitudes[0], *longitude).map(|v| v.1)
+            grid_index_for_lat_lon(
+                &entry.array,
+                entry.native_grid.as_ref(),
+                latitudes[0],
+                *longitude,
+            )
+            .map(|v| v.1)
         })
         .collect::<Result<Vec<_>>>()?;
     let y0 = *y_indices
@@ -4212,7 +4233,7 @@ fn read_entry_grid(
         .context("regional grid has no columns")?;
     ensure_in_selection(entry, y0, x0)?;
     ensure_in_selection(entry, y1, x1)?;
-    if entry.array.compression == 4 {
+    if entry.native_time_index.is_none() && entry.array.compression == 4 {
         let mut values = Vec::with_capacity(latitudes.len() * longitudes.len());
         for y in y_indices {
             for x in &x_indices {
@@ -4229,8 +4250,12 @@ fn read_entry_grid(
         .array
         .lut_offset
         .context("array metadata missing lut_offset")?;
-    if entry.array.chunks.len() != 2 || entry.selection_ranges.len() != 2 {
-        bail!("only 2D OM regional decoding is supported");
+    let is_native = entry.native_time_index.is_some();
+    if (!is_native && entry.array.chunks.len() != 2)
+        || (is_native && entry.array.chunks.len() != 3)
+        || entry.selection_ranges.len() != 2
+    {
+        bail!("OM regional decoding dimensions do not match entry type");
     }
     let height = y1 - y0 + 1;
     let width = x1 - x0 + 1;
@@ -4245,8 +4270,13 @@ fn read_entry_grid(
         entry.array.scale_factor.unwrap_or(1.0),
         entry.array.add_offset.unwrap_or(0.0),
     );
-    let reader = EntryBundleReader::new(product.bundle_handle.clone(), entry.clone());
-    let rectangle = decoder.decode_grid(&metadata, &reader, &[y0, x0], &[height, width])?;
+    let reader = entry_range_reader(product, entry)?;
+    let (offset, count) = if let Some(time_index) = entry.native_time_index {
+        (vec![y0, x0, time_index], vec![height, width, 1])
+    } else {
+        (vec![y0, x0], vec![height, width])
+    };
+    let rectangle = decoder.decode_grid(&metadata, &reader, &offset, &count)?;
     let mut values = Vec::with_capacity(latitudes.len() * longitudes.len());
     for y in y_indices {
         for x in &x_indices {
@@ -4272,8 +4302,36 @@ fn read_entry_value(
     let (latitude, longitude) = current_product_sampling(&product.product)
         .map(|sampling| (sampling.latitude, sampling.longitude))
         .unwrap_or((latitude, longitude));
-    let (y, x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
+    let (y, x) = grid_index_for_lat_lon(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        latitude,
+        longitude,
+    )?;
     ensure_in_selection(entry, y, x)?;
+    if let Some(time_index) = entry.native_time_index {
+        let decoder =
+            decoder.context("official OM decoder library is required for native runtime files")?;
+        let metadata = build_v3_array_metadata_blob(
+            entry.variable_path.as_deref().unwrap_or(&entry.variable),
+            entry.array.data_type,
+            entry.array.compression,
+            &entry.array.dimensions,
+            &entry.array.chunks,
+            entry
+                .array
+                .lut_size
+                .context("array metadata missing lut_size")?,
+            entry
+                .array
+                .lut_offset
+                .context("array metadata missing lut_offset")?,
+            entry.array.scale_factor.unwrap_or(1.0),
+            entry.array.add_offset.unwrap_or(0.0),
+        );
+        let reader = entry_range_reader(product, entry)?;
+        return decoder.decode_point(&metadata, &reader, &[y, x, time_index]);
+    }
     if entry.array.compression == 4 {
         return read_uncompressed_point(product, entry, y, x);
     }
@@ -4306,8 +4364,9 @@ fn read_entry_value(
     let x1 = ((x / tile_x + 1) * tile_x).min(x_range[1]);
     let height = y1 - y0;
     let width = x1 - x0;
+    let cache_handle = entry_file_handle(product, entry)?;
     let key = TileCacheKey {
-        bundle: Arc::as_ptr(&product.bundle_handle) as usize,
+        bundle: Arc::as_ptr(&cache_handle) as usize,
         entry_offset: entry.bundle_offset,
         y0,
         x0,
@@ -4329,7 +4388,7 @@ fn read_entry_value(
             entry.array.scale_factor.unwrap_or(1.0),
             entry.array.add_offset.unwrap_or(0.0),
         );
-        let reader = EntryBundleReader::new(product.bundle_handle.clone(), entry.clone());
+        let reader = entry_range_reader(product, entry)?;
         let decoded =
             Arc::new(decoder.decode_grid(&metadata, &reader, &[y0, x0], &[height, width])?);
         DECODED_TILE_CACHE.with(|cache| {
@@ -4364,9 +4423,24 @@ thread_local! {
 
 fn grid_index_for_lat_lon(
     array: &ArrayMetadata,
+    native_grid: Option<&crate::manifest::NativeGridMetadata>,
     latitude: f64,
     longitude: f64,
 ) -> Result<(u64, u64)> {
+    if let Some(grid) = native_grid {
+        if !matches!(array.dimensions.len(), 2 | 3)
+            || array.dimensions[0] != grid.ny
+            || array.dimensions[1] != grid.nx
+        {
+            bail!("native OM array dimensions do not match grid contract");
+        }
+        let x = ((longitude - grid.lon_min) / grid.dx).round() as i64;
+        let y = ((latitude - grid.lat_min) / grid.dy).round() as i64;
+        if y < 0 || y >= grid.ny as i64 || x < 0 || x >= grid.nx as i64 {
+            bail!("point is outside native regional grid");
+        }
+        return Ok((y as u64, x as u64));
+    }
     if array.dimensions.len() != 2 {
         bail!("only 2D OM entries are supported by the point API");
     }
@@ -4394,7 +4468,23 @@ fn grid_index_for_lat_lon(
     Ok((y as u64, x as u64))
 }
 
-fn grid_latitude_for_index(array: &ArrayMetadata, y: u64) -> Result<f32> {
+fn grid_latitude_for_index(
+    array: &ArrayMetadata,
+    native_grid: Option<&crate::manifest::NativeGridMetadata>,
+    y: u64,
+) -> Result<f32> {
+    if let Some(grid) = native_grid {
+        if y >= grid.ny {
+            bail!("invalid native latitude grid index");
+        }
+        if grid.full_ny == Some(1536) {
+            let dy = grid.dy as f32;
+            let global_y = grid.y0.unwrap_or(0) + y;
+            let global_lat_min = -dy * (1536.0_f32 - 1.0) / 2.0;
+            return Ok(global_lat_min + global_y as f32 * dy);
+        }
+        return Ok((grid.lat_min + y as f64 * grid.dy) as f32);
+    }
     if array.dimensions.len() != 2 || y >= array.dimensions[0] {
         bail!("invalid latitude grid index");
     }
@@ -4408,7 +4498,21 @@ fn grid_latitude_for_index(array: &ArrayMetadata, y: u64) -> Result<f32> {
     Ok(lat_min + y as f32 * dy)
 }
 
-fn grid_longitude_for_index(array: &ArrayMetadata, x: u64) -> Result<f32> {
+fn grid_longitude_for_index(
+    array: &ArrayMetadata,
+    native_grid: Option<&crate::manifest::NativeGridMetadata>,
+    x: u64,
+) -> Result<f32> {
+    if let Some(grid) = native_grid {
+        if x >= grid.nx {
+            bail!("invalid native longitude grid index");
+        }
+        if let (Some(full_nx), Some(x0)) = (grid.full_nx, grid.x0) {
+            let dx = 360.0_f32 / full_nx as f32;
+            return Ok(-180.0_f32 + (x0 + x) as f32 * dx);
+        }
+        return Ok((grid.lon_min + x as f64 * grid.dx) as f32);
+    }
     if array.dimensions.len() != 2 || x >= array.dimensions[1] {
         bail!("invalid longitude grid index");
     }
@@ -4525,10 +4629,15 @@ fn resolve_model_sampling(
         .find(|entry| entry.variable == "temperature_2m")
         .or_else(|| product.entries.values().next())
         .with_context(|| format!("{product_name} has no grid entries"))?;
-    if entry.array.dimensions.as_slice() != spec.dimensions {
+    if entry.native_grid.is_none() && entry.array.dimensions.as_slice() != spec.dimensions {
         bail!("static elevation grid does not match {product_name} dimensions");
     }
-    let (center_y, center_x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
+    let (center_y, center_x) = grid_index_for_lat_lon(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        latitude,
+        longitude,
+    )?;
     let ny = entry.array.dimensions[0];
     let nx = entry.array.dimensions[1];
     let y0 = center_y.saturating_sub(1);
@@ -4537,7 +4646,23 @@ fn resolve_model_sampling(
     let x1 = (center_x + 1).min(nx - 1);
     let height = y1 - y0 + 1;
     let width = x1 - x0 + 1;
-    let elevations = read_static_elevation_grid(snapshot, decoder, spec, y0, x0, height, width)?;
+    let elevations = if let Some(static_entry) = product.static_entries.get("surface_elevation") {
+        let latitudes = (y0..=y1)
+            .map(|y| {
+                grid_latitude_for_index(&static_entry.array, static_entry.native_grid.as_ref(), y)
+                    .map(f64::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let longitudes = (x0..=x1)
+            .map(|x| {
+                grid_longitude_for_index(&static_entry.array, static_entry.native_grid.as_ref(), x)
+                    .map(f64::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        read_entry_grid(&product, static_entry, decoder, &latitudes, &longitudes)?
+    } else {
+        read_static_elevation_grid(snapshot, decoder, spec, y0, x0, height, width)?
+    };
     let center_index = (elevations.len() / 2).min(elevations.len().saturating_sub(1));
     let center_elevation = elevations[center_index];
     let center_position = center_y * nx + center_x;
@@ -4558,8 +4683,10 @@ fn resolve_model_sampling(
                     }
                     let x = x0 + index as u64 % width;
                     let y = y0 + index as u64 / width;
-                    let grid_latitude = grid_latitude_for_index(&entry.array, y)?;
-                    let grid_longitude = grid_longitude_for_index(&entry.array, x)?;
+                    let grid_latitude =
+                        grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)?;
+                    let grid_longitude =
+                        grid_longitude_for_index(&entry.array, entry.native_grid.as_ref(), x)?;
                     let distance_squared = (grid_latitude - latitude as f32).powi(2)
                         + (grid_longitude - longitude as f32).powi(2);
                     let distance_km = distance_squared.sqrt() * 111.0;
@@ -4593,8 +4720,10 @@ fn resolve_model_sampling(
                     }
                     let x = x0 + index as u64 % width;
                     let y = y0 + index as u64 / width;
-                    let grid_latitude = grid_latitude_for_index(&entry.array, y)?;
-                    let grid_longitude = grid_longitude_for_index(&entry.array, x)?;
+                    let grid_latitude =
+                        grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)?;
+                    let grid_longitude =
+                        grid_longitude_for_index(&entry.array, entry.native_grid.as_ref(), x)?;
                     let distance = (grid_latitude - latitude as f32).powi(2)
                         + (grid_longitude - longitude as f32).powi(2);
                     if distance < min_distance {
@@ -4621,8 +4750,16 @@ fn resolve_model_sampling(
         target_elevation
     };
     Ok(ModelSampling {
-        latitude: official_f32_json_number(grid_latitude_for_index(&entry.array, y)?)?,
-        longitude: official_f32_json_number(grid_longitude_for_index(&entry.array, x)?)?,
+        latitude: official_f32_json_number(grid_latitude_for_index(
+            &entry.array,
+            entry.native_grid.as_ref(),
+            y,
+        )?)?,
+        longitude: official_f32_json_number(grid_longitude_for_index(
+            &entry.array,
+            entry.native_grid.as_ref(),
+            x,
+        )?)?,
         model_elevation,
         target_elevation,
     })
@@ -4697,9 +4834,22 @@ fn gfs013_model_location(
         .find(|entry| entry.variable == "temperature_2m")
         .or_else(|| product.entries.values().next())
         .context("gfs013_surface has no grid entries")?;
-    let (y, x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
-    let model_latitude = official_f32_json_number(grid_latitude_for_index(&entry.array, y)?)?;
-    let model_longitude = official_f32_json_number(grid_longitude_for_index(&entry.array, x)?)?;
+    let (y, x) = grid_index_for_lat_lon(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        latitude,
+        longitude,
+    )?;
+    let model_latitude = official_f32_json_number(grid_latitude_for_index(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        y,
+    )?)?;
+    let model_longitude = official_f32_json_number(grid_longitude_for_index(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        x,
+    )?)?;
 
     let Some(decoder) = decoder else {
         return Ok(None);
@@ -4768,10 +4918,23 @@ fn air_quality_model_location(
         .find(|entry| entry.variable == "carbon_monoxide")
         .or_else(|| product.entries.values().next())
         .context("air-quality model has no grid entries")?;
-    let (y, x) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
+    let (y, x) = grid_index_for_lat_lon(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        latitude,
+        longitude,
+    )?;
     Ok(Some((
-        official_f32_json_number(grid_latitude_for_index(&entry.array, y)?)?,
-        official_f32_json_number(grid_longitude_for_index(&entry.array, x)?)?,
+        official_f32_json_number(grid_latitude_for_index(
+            &entry.array,
+            entry.native_grid.as_ref(),
+            y,
+        )?)?,
+        official_f32_json_number(grid_longitude_for_index(
+            &entry.array,
+            entry.native_grid.as_ref(),
+            x,
+        )?)?,
     )))
 }
 
@@ -4816,8 +4979,13 @@ fn model_latitude_for_variable(
         .entries
         .get(&key)
         .with_context(|| format!("variable/time is not available: {} {}", variable, time))?;
-    let (y, _) = grid_index_for_lat_lon(&entry.array, latitude, longitude)?;
-    grid_latitude_for_index(&entry.array, y)
+    let (y, _) = grid_index_for_lat_lon(
+        &entry.array,
+        entry.native_grid.as_ref(),
+        latitude,
+        longitude,
+    )?;
+    grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
 }
 
 #[cfg(test)]
@@ -4849,7 +5017,7 @@ mod tests {
             add_offset: None,
         };
 
-        let (y, x) = grid_index_for_lat_lon(&array, 4.2, 75.3).unwrap();
+        let (y, x) = grid_index_for_lat_lon(&array, None, 4.2, 75.3).unwrap();
 
         assert_eq!((y, x), (235, 638));
     }
@@ -4867,9 +5035,12 @@ mod tests {
             add_offset: None,
         };
 
-        let (y, x) = grid_index_for_lat_lon(&array, 29.5638, 106.5505).unwrap();
-        assert_eq!(grid_latitude_for_index(&array, y).unwrap(), 29.599998);
-        assert_eq!(grid_longitude_for_index(&array, x).unwrap(), 106.600006);
+        let (y, x) = grid_index_for_lat_lon(&array, None, 29.5638, 106.5505).unwrap();
+        assert_eq!(grid_latitude_for_index(&array, None, y).unwrap(), 29.599998);
+        assert_eq!(
+            grid_longitude_for_index(&array, None, x).unwrap(),
+            106.600006
+        );
     }
 
     #[test]
@@ -4885,7 +5056,7 @@ mod tests {
             add_offset: None,
         };
 
-        let (y, x) = grid_index_for_lat_lon(&array, 11.6, 85.9).unwrap();
+        let (y, x) = grid_index_for_lat_lon(&array, None, 11.6, 85.9).unwrap();
 
         assert_eq!((y, x), (867, 2269));
     }
@@ -4903,8 +5074,8 @@ mod tests {
             add_offset: None,
         };
 
-        let (y, _) = grid_index_for_lat_lon(&array, 22.75, 125.0).unwrap();
-        let model_latitude = grid_latitude_for_index(&array, y).unwrap();
+        let (y, _) = grid_index_for_lat_lon(&array, None, 22.75, 125.0).unwrap();
+        let model_latitude = grid_latitude_for_index(&array, None, y).unwrap();
 
         assert!((model_latitude - 22.78555).abs() < 0.00001);
     }
@@ -4980,7 +5151,7 @@ fn read_uncompressed_point(
     let nx = entry.array.dimensions[1];
     let offset = (y * nx + x) * 4;
     let original_start = data_range[0] + offset;
-    let reader = EntryBundleReader::new(product.bundle_handle.clone(), entry.clone());
+    let reader = entry_range_reader(product, entry)?;
     let bytes = reader.read_original_range(original_start, 4)?;
     Ok(f32::from_le_bytes(
         bytes.try_into().expect("length checked"),
@@ -4991,6 +5162,7 @@ fn read_uncompressed_point(
 struct EntryBundleReader {
     bundle_handle: Arc<File>,
     entry: BundleEntry,
+    direct_file: bool,
 }
 
 impl EntryBundleReader {
@@ -4998,12 +5170,26 @@ impl EntryBundleReader {
         Self {
             bundle_handle,
             entry,
+            direct_file: false,
+        }
+    }
+
+    fn direct(bundle_handle: Arc<File>, entry: BundleEntry) -> Self {
+        Self {
+            bundle_handle,
+            entry,
+            direct_file: true,
         }
     }
 }
 
 impl BundleRangeReader for EntryBundleReader {
     fn read_original_range(&self, start: u64, count: u64) -> Result<Vec<u8>> {
+        if self.direct_file {
+            let mut output = vec![0_u8; count as usize];
+            self.bundle_handle.read_exact_at(&mut output, start)?;
+            return Ok(output);
+        }
         let end = start
             .checked_add(count)
             .ok_or_else(|| anyhow!("range overflow"))?;
@@ -5038,6 +5224,26 @@ impl BundleRangeReader for EntryBundleReader {
         }
         bail!("requested original range is not present in bundle")
     }
+}
+
+fn entry_file_handle(product: &ProductSnapshot, entry: &BundleEntry) -> Result<Arc<File>> {
+    if let Some(path) = &entry.native_file_path {
+        return product
+            .native_handles
+            .get(path)
+            .cloned()
+            .with_context(|| format!("native OM handle is missing: {path}"));
+    }
+    Ok(product.bundle_handle.clone())
+}
+
+fn entry_range_reader(product: &ProductSnapshot, entry: &BundleEntry) -> Result<EntryBundleReader> {
+    let handle = entry_file_handle(product, entry)?;
+    Ok(if entry.native_file_path.is_some() {
+        EntryBundleReader::direct(handle, entry.clone())
+    } else {
+        EntryBundleReader::new(handle, entry.clone())
+    })
 }
 
 fn read_optional_direct_grid_unrounded(
@@ -5156,8 +5362,13 @@ fn read_weather_code_grid(
     let model_latitudes = latitudes
         .iter()
         .map(|latitude| {
-            let (y, _) = grid_index_for_lat_lon(&entry.array, *latitude, longitudes[0])?;
-            grid_latitude_for_index(&entry.array, y)
+            let (y, _) = grid_index_for_lat_lon(
+                &entry.array,
+                entry.native_grid.as_ref(),
+                *latitude,
+                longitudes[0],
+            )?;
+            grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
         })
         .collect::<Result<Vec<_>>>()?;
     let width = longitudes.len();

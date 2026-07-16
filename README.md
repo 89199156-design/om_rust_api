@@ -1,5 +1,21 @@
 # OM Weather Pipeline
 
+## Singapore native OM API
+
+The Rust API can read the producer's `openmeteo-native-v1` coverages directly.
+GFS is loaded as five independent candidates in newest-first query order: the
+latest complete run, the previous complete run, and three strict `f000...f005`
+runs. A non-finite value in the latest complete run falls back only to the same
+valid time in the previous complete run; the forecast tail covered only by the
+latest run never falls back. CAMS retains three complete runs but likewise uses
+only the immediately previous run as a null fallback.
+
+API requests never scan or rebuild the snapshot. After OM and WebP publication
+finish, the pipeline sends one `SIGHUP`; the API builds the replacement snapshot
+in a background worker and atomically swaps it only after successful validation.
+Regional GFS `HSURF.om` and Copernicus DEM90 remain part of the official
+elevation/cell-selection path.
+
 Silicon Valley is a generic download gateway, not an Open-Meteo runtime. It must not run Open-Meteo containers, Swift services, WebP builders, Shanghai package builders, or business parsers.
 
 Local test command:

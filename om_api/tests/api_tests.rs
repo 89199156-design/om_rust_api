@@ -5,7 +5,6 @@ use om_api::query::weather_code;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -245,7 +244,7 @@ async fn gfs_nan_fallback_uses_only_the_other_retained_full_run() {
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -294,7 +293,7 @@ async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -331,7 +330,7 @@ async fn cams_nan_fallback_uses_previous_retained_run() {
     );
     write_group_ready(root.path(), "cams", &[("cams_global", current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -391,7 +390,7 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage_id)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
@@ -443,7 +442,7 @@ async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
         &[("cams_global_greenhouse_gases", coverage_id)],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -487,7 +486,7 @@ async fn cams_global_hermite_uses_c_when_second_lookahead_is_missing() {
     );
     write_group_ready(root.path(), "cams", &[("cams_global", coverage_id)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -544,7 +543,7 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
         ],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -655,7 +654,7 @@ async fn chinese_daily_aqi_uses_hj663_08_to_24_o3_windows() {
         ],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
@@ -732,7 +731,7 @@ async fn chinese_daily_air_quality_keeps_date_when_one_pollutant_is_missing() {
     write_product_coverage_timed(root.path(), "cams_global", coverage, entries, false);
     write_group_ready(root.path(), "cams", &[("cams_global", coverage)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -766,7 +765,7 @@ async fn missing_historical_release_coverage_does_not_block_current_cams_api() {
         &[("cams_global", "cams_global_missing_120h")],
     );
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -792,7 +791,7 @@ async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
     write_product_coverage_timed(root.path(), "cams_global", current, entries, false);
     write_group_ready(root.path(), "cams", &[("cams_global", current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -831,7 +830,7 @@ async fn chinese_hourly_aqi_uses_current_one_hour_concentrations() {
     write_product_coverage_timed(root.path(), "cams_global", current, entries, false);
     write_group_ready(root.path(), "cams", &[("cams_global", current)]);
 
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -993,7 +992,7 @@ async fn request_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn forecast_endpoint_returns_point_data_without_client_manifest() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1012,7 +1011,7 @@ async fn forecast_endpoint_returns_point_data_without_client_manifest() {
 #[tokio::test]
 async fn forecast_endpoint_uses_official_json_precision_time_and_units() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1048,7 +1047,7 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
         }],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1103,7 +1102,7 @@ async fn forecast_endpoint_exposes_all_soil_temperature_and_moisture_layers() {
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1136,7 +1135,7 @@ async fn forecast_endpoint_exposes_all_soil_temperature_and_moisture_layers() {
 #[tokio::test]
 async fn forecast_endpoint_hides_radiation_and_internal_wind_components() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -1214,7 +1213,7 @@ async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipi
         "gfs",
         &[("gfs013_surface", &gfs013), ("gfs025", &gfs025)],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1255,7 +1254,7 @@ async fn forecast_endpoint_derives_weather_code_from_rounded_cloud_cover() {
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1295,7 +1294,7 @@ async fn forecast_endpoint_expands_sparse_backwards_sum_to_hourly_values() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_sparse_precip")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1356,7 +1355,7 @@ async fn forecast_endpoint_interpolates_sparse_temperature_with_hermite() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_sparse_temperature")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1418,7 +1417,7 @@ async fn forecast_endpoint_uses_model_stride_for_hermite_padding() {
         "gfs",
         &[("gfs013_surface", "gfs013_surface_mixed_stride_cloud_cover")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1452,7 +1451,7 @@ async fn forecast_endpoint_preserves_official_wind_direction_360_boundary() {
         ],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1468,7 +1467,7 @@ async fn forecast_endpoint_preserves_official_wind_direction_360_boundary() {
 #[tokio::test]
 async fn forecast_endpoint_derives_dew_point_from_temperature_and_relative_humidity() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1534,7 +1533,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
             ("gfs_pressure_profile", "gfs_pressure_profile_old_1h"),
         ],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1550,7 +1549,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
 #[tokio::test]
 async fn air_quality_endpoint_reads_cams_product_directly() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1597,7 +1596,7 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
             ),
         ],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1613,7 +1612,7 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
 #[tokio::test]
 async fn air_quality_endpoint_returns_chinese_aqi_derivative_aliases() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1659,7 +1658,7 @@ async fn air_quality_sparse_variable_hour_returns_null_without_failing_group() {
         "cams",
         &[("cams_global", "cams_global_sparse")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1709,7 +1708,7 @@ async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() 
         "cams",
         &[("cams_global", "cams_global_sparse_dust")],
     );
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -1728,7 +1727,7 @@ async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() 
 #[tokio::test]
 async fn pressure_profile_endpoint_uses_official_units() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -2210,7 +2209,7 @@ fn weather_code_reference_returns_drizzle_for_weak_showers() {
 #[tokio::test]
 async fn health_endpoint_is_not_exposed() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -2229,7 +2228,7 @@ async fn health_endpoint_is_not_exposed() {
 #[tokio::test]
 async fn latest_json_is_not_a_client_api() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -2248,7 +2247,7 @@ async fn latest_json_is_not_a_client_api() {
 #[tokio::test]
 async fn route_endpoint_returns_each_point_without_client_manifest() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let response = app
@@ -2283,7 +2282,7 @@ async fn route_endpoint_returns_each_point_without_client_manifest() {
 #[tokio::test]
 async fn land_cell_selection_requires_dem_before_serving() {
     let root = fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (status, body) = request_json(
@@ -2353,7 +2352,7 @@ fn daily_weather_fixture_root() -> TempDir {
 #[tokio::test]
 async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2398,7 +2397,7 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
 #[tokio::test]
 async fn daily_weather_supports_multiple_coordinates() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2426,7 +2425,7 @@ async fn daily_weather_supports_multiple_coordinates() {
 #[tokio::test]
 async fn explicit_timezone_applies_to_hour_selection_and_output() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
         app,
@@ -2445,7 +2444,7 @@ async fn explicit_timezone_applies_to_hour_selection_and_output() {
 #[tokio::test]
 async fn daily_weather_rejects_non_exact_features() {
     let root = daily_weather_fixture_root();
-    let state = AppState::new(root.path().to_path_buf(), None, Duration::from_secs(30)).unwrap();
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
 
     let (auto_status, auto_body) = request_json(
