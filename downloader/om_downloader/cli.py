@@ -1785,6 +1785,12 @@ def _reconcile_cams_complete_runs(
     api_root = Path(args.publish_openmeteo_group_to)
     target_runs = [run_id for run_id, _plans in target_plans]
     plans_by_run = dict(target_plans)
+    pre_pruned_raw_paths = prune_expired_group_releases(
+        api_root,
+        "cams",
+        retain_complete_releases=CAMS_COMPLETE_RUN_RETENTION,
+        preserve_current=True,
+    )
     all_available = _available_group_releases(api_root, "cams")
     available = {
         run_id: manifest
@@ -1848,6 +1854,7 @@ def _reconcile_cams_complete_runs(
                 "downloaded_missing_runs": list(reversed(missing_runs)),
                 "download_results": download_results,
                 "activation": activation,
+                "pre_pruned_raw_paths": pre_pruned_raw_paths,
                 "pruned_raw_paths": pruned,
             },
             ensure_ascii=False,
@@ -1877,6 +1884,20 @@ def _reconcile_gfs_retention_window(
     )
     target_runs = [run_id for run_id, _plans in target_plans]
     plans_by_run = dict(target_plans)
+    pre_pruned_source_paths = prune_expired_group_releases(
+        source_root,
+        "gfs",
+        retain_complete_releases=GFS_TOTAL_RELEASE_RETENTION,
+        preserve_current=True,
+    )
+    pre_pruned_raw_paths: list[str] = []
+    if source_root.resolve(strict=False) != api_root.resolve(strict=False):
+        pre_pruned_raw_paths = prune_expired_group_releases(
+            api_root,
+            "gfs",
+            retain_complete_releases=GFS_TOTAL_RELEASE_RETENTION,
+            preserve_current=True,
+        )
 
     available = _matching_group_releases(
         api_root,
@@ -1957,6 +1978,8 @@ def _reconcile_gfs_retention_window(
                 "downloaded_missing_runs": list(reversed(missing_runs)),
                 "download_results": download_results,
                 "retain_results": retain_results,
+                "pre_pruned_source_paths": pre_pruned_source_paths,
+                "pre_pruned_raw_paths": pre_pruned_raw_paths,
                 "activation": activation,
                 "pruned_raw_paths": pruned,
             },

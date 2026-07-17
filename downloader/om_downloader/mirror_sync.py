@@ -841,6 +841,7 @@ def prune_expired_group_releases(
     *,
     now_utc: datetime | None = None,
     retain_complete_releases: int = DEFAULT_COMPLETE_RELEASE_RETENTION,
+    preserve_current: bool = False,
 ) -> list[str]:
     if group not in OPENMETEO_GROUP_PRODUCTS:
         raise ValueError(f"unknown Open-Meteo group: {group}")
@@ -860,6 +861,7 @@ def prune_expired_group_releases(
 
     releases = _load_complete_group_releases(output_root, group)
     current_path = output_root / "groups" / group / "current" / "ready_for_processing.json"
+    current_release_id: str | None = None
     if current_path.exists():
         current = _load_json(current_path)
         current_release_id = group_release_id(current)
@@ -873,7 +875,13 @@ def prune_expired_group_releases(
     expired_releases: list[tuple[Path, dict[str, Any]]] = []
     retained_runs: set[str] = set()
     for release in releases:
-        run = str(release[1].get("latest_complete_run") or "")
+        payload = release[1]
+        run = str(payload.get("latest_complete_run") or "")
+        release_id = str(payload.get("release_id") or group_release_id(payload))
+        if preserve_current and release_id == current_release_id:
+            retained_releases.append(release)
+            retained_runs.add(run)
+            continue
         if run in retained_runs or len(retained_releases) >= retain_complete_releases:
             expired_releases.append(release)
             continue

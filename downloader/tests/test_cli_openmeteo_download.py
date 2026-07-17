@@ -488,13 +488,16 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 return_value={"latest_complete_run": runs[1]},
             ),
             patch.object(cli_module, "activate_group_release", return_value={"status": "activated"}),
-            patch.object(cli_module, "prune_expired_group_releases", return_value=[]),
+            patch.object(cli_module, "prune_expired_group_releases", return_value=[]) as prune,
         ):
             result = cli_module._reconcile_gfs_retention_window(args, SimpleNamespace())
 
         self.assertEqual(result, 0)
         self.assertEqual(downloaded, [runs[2], runs[0]])
         self.assertEqual(retain.call_count, 2)
+        self.assertEqual(prune.call_count, 3)
+        self.assertTrue(prune.call_args_list[0].kwargs["preserve_current"])
+        self.assertTrue(prune.call_args_list[1].kwargs["preserve_current"])
 
     def test_cams_reconcile_downloads_missing_runs_before_activation_and_prune(self):
         products = [
@@ -580,9 +583,9 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             events,
-            [("download", runs[0]), ("activate", runs[0]), ("prune", None)],
+            [("prune", None), ("download", runs[0]), ("activate", runs[0]), ("prune", None)],
         )
-        self.assertEqual(prune.call_count, 1)
+        self.assertEqual(prune.call_count, 2)
 
     def test_cams_group_manifest_accepts_independent_product_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
