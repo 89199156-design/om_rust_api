@@ -306,6 +306,139 @@ async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
 }
 
 #[tokio::test]
+async fn gfs_newest_covering_short_run_overrides_previous_complete_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "gfs013_surface_2026070800_full";
+    let short = "gfs013_surface_2026070718_6h";
+    let previous = "gfs013_surface_2026070700_full";
+    for (coverage, value, forecast_hour, valid_time) in [
+        (current, 40.0, 6, "2026-07-08T00:00:00Z"),
+        (short, 30.0, 5, "2026-07-07T18:00:00Z"),
+        (previous, 18.0, 18, "2026-07-07T18:00:00Z"),
+    ] {
+        write_product_coverage_timed(
+            root.path(),
+            "gfs013_surface",
+            coverage,
+            vec![TimedTestEntry {
+                variable: "temperature_2m",
+                values: [value, value, value, value],
+                valid_time_utc: valid_time,
+            }],
+            false,
+        );
+        set_coverage_forecast_hour(root.path(), "gfs013_surface", coverage, forecast_hour);
+    }
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070700",
+        &[("gfs013_surface", previous)],
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("gfs013_surface", short)],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([30.0]));
+}
+
+#[tokio::test]
+async fn gfs_null_short_run_falls_back_only_to_previous_complete_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "gfs013_surface_2026070800_full";
+    let short = "gfs013_surface_2026070718_6h";
+    let previous = "gfs013_surface_2026070700_full";
+    for (coverage, value, forecast_hour, valid_time) in [
+        (current, 40.0, 6, "2026-07-08T00:00:00Z"),
+        (short, f32::NAN, 5, "2026-07-07T18:00:00Z"),
+        (previous, 18.0, 18, "2026-07-07T18:00:00Z"),
+    ] {
+        write_product_coverage_timed(
+            root.path(),
+            "gfs013_surface",
+            coverage,
+            vec![TimedTestEntry {
+                variable: "temperature_2m",
+                values: [value, value, value, value],
+                valid_time_utc: valid_time,
+            }],
+            false,
+        );
+        set_coverage_forecast_hour(root.path(), "gfs013_surface", coverage, forecast_hour);
+    }
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070700",
+        &[("gfs013_surface", previous)],
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("gfs013_surface", short)],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([18.0]));
+}
+
+#[tokio::test]
+async fn rain_remains_null_when_any_direct_component_is_null() {
+    let root = tempfile::tempdir().unwrap();
+    let coverage = "gfs013_surface_2026070800_full";
+    write_product_coverage(
+        root.path(),
+        "gfs013_surface",
+        coverage,
+        vec![
+            TestEntry {
+                variable: "precipitation",
+                values: [f32::NAN; 4],
+            },
+            TestEntry {
+                variable: "showers",
+                values: [f32::NAN; 4],
+            },
+            TestEntry {
+                variable: "snowfall_water_equivalent",
+                values: [f32::NAN; 4],
+            },
+        ],
+        false,
+    );
+    set_coverage_forecast_hour(root.path(), "gfs013_surface", coverage, 6);
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", coverage)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/forecast?latitude=-90&longitude=-180&hourly=rain&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["rain"], serde_json::json!([null]));
+}
+
+#[tokio::test]
 async fn cams_nan_fallback_uses_previous_retained_run() {
     let root = tempfile::tempdir().unwrap();
     let current = "cams_global_2026070800_120h";

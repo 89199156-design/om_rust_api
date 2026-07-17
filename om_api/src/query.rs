@@ -1504,6 +1504,9 @@ pub fn read_variable_value(
                 longitude,
             )?;
             let showers = read_direct(snapshot, decoder, "showers", time, latitude, longitude)?;
+            if !precipitation.is_finite() || !swe.is_finite() || !showers.is_finite() {
+                return Ok(f32::NAN);
+            }
             return Ok((precipitation - swe - showers).max(0.0));
         }
         "wind_speed_10m" | "windspeed_10m" => {
@@ -2351,7 +2354,14 @@ pub fn read_variable_grid_series(
                         .zip(snowfall)
                         .zip(showers)
                         .map(|((precipitation, snowfall), showers)| {
-                            (precipitation - snowfall - showers).max(0.0)
+                            if precipitation.is_finite()
+                                && snowfall.is_finite()
+                                && showers.is_finite()
+                            {
+                                (precipitation - snowfall - showers).max(0.0)
+                            } else {
+                                f32::NAN
+                            }
                         })
                         .collect()
                 })
@@ -3454,16 +3464,12 @@ fn read_direct_grid(
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     let products = snapshot.product_snapshots(product_name);
     if is_gfs_product(product_name) {
-        let full_products = products
+        if let Some(primary) = products
             .iter()
-            .filter(|product| {
-                gfs_snapshot_is_full(product) && product_covers_time(product, &raw_variable, time)
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        if let Some(first) = full_products.first() {
+            .find(|product| product_covers_time(product, &raw_variable, time))
+        {
             let mut values = read_product_grid_with_rounding(
-                first,
+                primary,
                 decoder,
                 variable,
                 &raw_variable,
@@ -3472,41 +3478,31 @@ fn read_direct_grid(
                 longitudes,
                 round_values,
             )?;
-            for product in full_products.iter().skip(1) {
-                if !values.iter().any(|value| value.is_nan()) {
-                    break;
-                }
-                let fallback = read_product_grid_with_rounding(
-                    product,
-                    decoder,
-                    variable,
-                    &raw_variable,
-                    time,
-                    latitudes,
-                    longitudes,
-                    round_values,
-                )?;
-                for (value, fallback_value) in values.iter_mut().zip(fallback) {
-                    if value.is_nan() && !fallback_value.is_nan() {
-                        *value = fallback_value;
+            if values.iter().any(|value| value.is_nan()) {
+                let fallback = products.iter().find(|product| {
+                    !Arc::ptr_eq(primary, product)
+                        && gfs_snapshot_is_full(product)
+                        && product_covers_time(product, &raw_variable, time)
+                });
+                if let Some(product) = fallback {
+                    let fallback = read_product_grid_with_rounding(
+                        product,
+                        decoder,
+                        variable,
+                        &raw_variable,
+                        time,
+                        latitudes,
+                        longitudes,
+                        round_values,
+                    )?;
+                    for (value, fallback_value) in values.iter_mut().zip(fallback) {
+                        if value.is_nan() && !fallback_value.is_nan() {
+                            *value = fallback_value;
+                        }
                     }
                 }
             }
             return Ok(values);
-        }
-        if let Some(product) = products.iter().find(|product| {
-            !gfs_snapshot_is_full(product) && product_covers_time(product, &raw_variable, time)
-        }) {
-            return read_product_grid_with_rounding(
-                product,
-                decoder,
-                variable,
-                &raw_variable,
-                time,
-                latitudes,
-                longitudes,
-                round_values,
-            );
         }
     }
     if is_cams_product(product_name) {
@@ -4212,38 +4208,12 @@ fn read_product_history_value_with_rounding(
 ) -> Result<f32> {
     let products = snapshot.product_snapshots(product_name);
     if is_gfs_product(product_name) {
-        let full_products = products
+        if let Some(primary) = products
             .iter()
-            .filter(|product| {
-                gfs_snapshot_is_full(product) && product_covers_time(product, raw_variable, time)
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        if !full_products.is_empty() {
-            let mut value = f32::NAN;
-            for product in full_products {
-                value = read_product_value_with_rounding(
-                    product,
-                    decoder,
-                    variable,
-                    raw_variable,
-                    time,
-                    latitude,
-                    longitude,
-                    round_values,
-                )?;
-                value = apply_elevation_correction(&product.product, variable, value);
-                if !value.is_nan() {
-                    break;
-                }
-            }
-            return Ok(value);
-        }
-        if let Some(product) = products.iter().find(|product| {
-            !gfs_snapshot_is_full(product) && product_covers_time(product, raw_variable, time)
-        }) {
-            return read_product_value_with_rounding(
-                product,
+            .find(|product| product_covers_time(product, raw_variable, time))
+        {
+            let mut value = read_product_value_with_rounding(
+                primary,
                 decoder,
                 variable,
                 raw_variable,
@@ -4251,8 +4221,28 @@ fn read_product_history_value_with_rounding(
                 latitude,
                 longitude,
                 round_values,
-            )
-            .map(|value| apply_elevation_correction(&product.product, variable, value));
+            )?;
+            value = apply_elevation_correction(&primary.product, variable, value);
+            if value.is_nan() {
+                if let Some(fallback) = products.iter().find(|product| {
+                    !Arc::ptr_eq(primary, product)
+                        && gfs_snapshot_is_full(product)
+                        && product_covers_time(product, raw_variable, time)
+                }) {
+                    value = read_product_value_with_rounding(
+                        fallback,
+                        decoder,
+                        variable,
+                        raw_variable,
+                        time,
+                        latitude,
+                        longitude,
+                        round_values,
+                    )?;
+                    value = apply_elevation_correction(&fallback.product, variable, value);
+                }
+            }
+            return Ok(value);
         }
     }
     if is_cams_product(product_name) {
