@@ -336,7 +336,7 @@ fn attach_static_elevation(
         .with_context(|| format!("parse native static OM {}", path.display()))?;
     if array.dimensions != [product_ready.grid.ny, product_ready.grid.nx] || array.chunks.len() != 2
     {
-        bail!("native HSURF dimensions do not match GFS013 regional grid");
+        bail!("native HSURF dimensions do not match regional grid");
     }
     let relative = path
         .strip_prefix(coverage_root)?
@@ -366,6 +366,13 @@ fn attach_static_elevation(
         },
     );
     Ok(())
+}
+
+fn product_uses_static_elevation(product: &str) -> bool {
+    matches!(
+        product,
+        "gfs013_surface" | "gfs025" | "gfs_pressure_profile"
+    )
 }
 
 fn load_native_product_run(
@@ -462,7 +469,7 @@ fn load_native_product_run(
     if entries.is_empty() {
         bail!("native product has no entries: {product} {source_run}");
     }
-    if include_static && product == "gfs013_surface" {
+    if include_static && product_uses_static_elevation(product) {
         attach_static_elevation(
             coverage_root,
             ready,
@@ -668,6 +675,14 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn attaches_regional_static_elevation_to_every_gfs_product() {
+        assert!(product_uses_static_elevation("gfs013_surface"));
+        assert!(product_uses_static_elevation("gfs025"));
+        assert!(product_uses_static_elevation("gfs_pressure_profile"));
+        assert!(!product_uses_static_elevation("cams_global"));
+    }
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
