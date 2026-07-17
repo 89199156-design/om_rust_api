@@ -3,16 +3,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-const DEFAULT_DEM_ROOT: &str = "/data/om_static";
 const MAX_CACHED_POINTS: usize = 100_000;
 const OM_TRAILER_SIZE: u64 = 24;
 const OM_LEGACY_HEADER_SIZE: u64 = 40;
 
-type PointCache = HashMap<(i32, u64, u64), f32>;
-type FileCache = HashMap<i32, Arc<LocalOmFile>>;
+type PointCache = HashMap<(PathBuf, i32, u64, u64), f32>;
+type FileCache = HashMap<(PathBuf, i32), Arc<LocalOmFile>>;
 
 static POINT_CACHE: OnceLock<Mutex<PointCache>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<FileCache>> = OnceLock::new();
@@ -132,7 +131,18 @@ fn pixels_per_longitude(latitude: i32) -> u64 {
     }
 }
 
-pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> Result<f32> {
+fn dem_file_path(root: &Path, latitude_file: i32) -> PathBuf {
+    root.join("copernicus_dem90")
+        .join("static")
+        .join(format!("lat_{latitude_file}.om"))
+}
+
+pub fn read_dem90(
+    decoder: &OfficialDecoder,
+    snapshot_root: &Path,
+    latitude: f64,
+    longitude: f64,
+) -> Result<f32> {
     let latitude = latitude as f32;
     let longitude = longitude as f32;
     if !(-90.0..90.0).contains(&latitude) || !(-180.0..180.0).contains(&longitude) {
@@ -146,7 +156,10 @@ pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> R
     let latitude_row = ((latitude * 1200.0 + 90.0 * 1200.0) as u64) % 1200;
     let pixels = pixels_per_longitude(latitude_file);
     let longitude_row = ((longitude + 180.0) * pixels as f32) as u64;
-    let key = (latitude_file, latitude_row, longitude_row);
+    let root = std::env::var_os("OM_DEM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshot_root.to_path_buf());
+    let key = (root.clone(), latitude_file, latitude_row, longitude_row);
     let points = POINT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(value) = points
         .lock()
@@ -163,23 +176,17 @@ pub fn read_dem90(decoder: &OfficialDecoder, latitude: f64, longitude: f64) -> R
         let files = files
             .lock()
             .map_err(|_| anyhow!("DEM file cache poisoned"))?;
-        files.get(&latitude_file).cloned()
+        files.get(&(root.clone(), latitude_file)).cloned()
     };
     let file = if let Some(file) = cached_file {
         file
     } else {
-        let root = std::env::var_os("OM_DEM_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DEM_ROOT));
-        let path = root
-            .join("copernicus_dem90")
-            .join("static")
-            .join(format!("lat_{latitude_file}.om"));
+        let path = dem_file_path(&root, latitude_file);
         let file = Arc::new(LocalOmFile::open(path)?);
         files
             .lock()
             .map_err(|_| anyhow!("DEM file cache poisoned"))?
-            .insert(latitude_file, file.clone());
+            .insert((root, latitude_file), file.clone());
         file
     };
     let value = decoder.decode_point(
@@ -213,5 +220,15 @@ mod tests {
 
         assert_eq!(actual, bytes[11..28]);
         std::fs::remove_file(path).expect("remove test DEM file");
+    }
+
+    #[test]
+    fn resolves_dem_file_below_snapshot_root() {
+        let root = Path::new("/srv/weather/coverages/gfs/gfs_native_2026071600");
+
+        assert_eq!(
+            dem_file_path(root, 31),
+            root.join("copernicus_dem90/static/lat_31.om")
+        );
     }
 }

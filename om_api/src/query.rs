@@ -5098,9 +5098,15 @@ fn resolve_request_sampling(
 ) -> Result<RequestSampling> {
     let decoder =
         decoder.context("official OM decoder library is required for DEM and grid selection")?;
+    let dem_root = snapshot
+        .product("gfs013_surface")
+        .or_else(|| snapshot.product("gfs025"))
+        .or_else(|| snapshot.product("gfs_pressure_profile"))
+        .map(|product| product.product_root.clone())
+        .unwrap_or_else(|| snapshot.data_root.clone());
     let target = match requested_elevation {
         Some(value) => value,
-        None => read_dem90(decoder, latitude, longitude)?,
+        None => read_dem90(decoder, &dem_root, latitude, longitude)?,
     };
     let gfs013 = if snapshot.product("gfs013_surface").is_some() {
         Some(resolve_model_sampling(
