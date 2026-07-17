@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tower_http::trace::TraceLayer;
 
 #[derive(Clone)]
@@ -148,6 +149,28 @@ impl AppState {
         }
         Ok(())
     }
+
+    async fn refresh_periodically(self, refresh_interval: Duration) {
+        let mut ticker = tokio::time::interval(refresh_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let state = self.clone();
+            match tokio::task::spawn_blocking(move || state.refresh_if_changed()).await {
+                Ok(Ok(true)) => tracing::info!("periodically refreshed immutable OM API snapshot"),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => tracing::error!(
+                    error = %error,
+                    "periodic OM snapshot refresh failed; retaining previous snapshot"
+                ),
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "periodic OM snapshot refresh worker failed; retaining previous snapshot"
+                ),
+            }
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -159,17 +182,33 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-pub async fn serve(state: AppState, bind: SocketAddr) -> Result<()> {
+pub async fn serve(
+    state: AppState,
+    bind: SocketAddr,
+    snapshot_refresh_interval: Duration,
+) -> Result<()> {
     #[cfg(unix)]
     let refresh_task = {
         use tokio::signal::unix::{signal, SignalKind};
         let published = signal(SignalKind::hangup())?;
         tokio::spawn(state.clone().refresh_on_publish_signal(published))
     };
+    let periodic_refresh_task = if snapshot_refresh_interval.is_zero() {
+        None
+    } else {
+        Some(tokio::spawn(
+            state
+                .clone()
+                .refresh_periodically(snapshot_refresh_interval),
+        ))
+    };
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {}", bind))?;
     let result = axum::serve(listener, router(state)).await;
+    if let Some(task) = periodic_refresh_task {
+        task.abort();
+    }
     #[cfg(unix)]
     refresh_task.abort();
     result?;
@@ -260,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_keep_old_snapshot_until_explicit_publish_refresh() {
+    fn snapshot_reads_do_not_refresh_without_a_refresh_trigger() {
         let root = TempDir::new().unwrap();
         let state = AppState::new(root.path().to_path_buf(), None).unwrap();
         assert!(state.cache.read().unwrap().identity.gfs_ready.is_none());
@@ -285,9 +324,45 @@ mod tests {
         let _ = state.snapshot().unwrap();
         assert!(state.cache.read().unwrap().identity.gfs_ready.is_none());
 
-        // Only the publish event path installs the changed identity.
+        // A refresh trigger installs the changed identity.
         assert!(state.refresh_if_changed().unwrap());
         assert!(state.cache.read().unwrap().identity.gfs_ready.is_some());
         assert!(!state.refresh_if_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_installs_a_changed_snapshot() {
+        let root = TempDir::new().unwrap();
+        let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+        let marker = root
+            .path()
+            .join("groups/gfs/current/ready_for_processing.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(
+            marker,
+            br#"{
+                "status":"incomplete",
+                "runtime_format":"legacy",
+                "latest_complete_run":"2026071800",
+                "coverage_id":"",
+                "product_manifests":{}
+            }"#,
+        )
+        .unwrap();
+
+        let refresh_task = tokio::spawn(
+            state
+                .clone()
+                .refresh_periodically(Duration::from_millis(10)),
+        );
+        for _ in 0..50 {
+            if state.cache.read().unwrap().identity.gfs_ready.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        refresh_task.abort();
+
+        assert!(state.cache.read().unwrap().identity.gfs_ready.is_some());
     }
 }

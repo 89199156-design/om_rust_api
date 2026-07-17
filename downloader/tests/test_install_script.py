@@ -89,6 +89,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--source-ssh-key /tmp/id_ed25519", scripts["OM_GFS_SOURCE_SYNC"])
         self.assertIn("--source-known-hosts /tmp/known_hosts", scripts["OM_GFS_SOURCE_SYNC"])
         self.assertIn("--raw-root /tmp/raw", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("sudo -H -u ubuntu", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertIn("sudo -H -u ubuntu", scripts["OM_CAMS_SOURCE_SYNC"])
 
         sync_content = Path("scripts/sync_openmeteo_source_group.sh").read_text(
             encoding="utf-8"

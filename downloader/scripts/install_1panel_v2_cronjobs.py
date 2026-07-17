@@ -183,14 +183,22 @@ def source_sync_task_script(
         "--source-known-hosts", shell_path(source_known_hosts),
         "--cleanup-grace-seconds", "300",
     ]
+    command = " ".join(
+        [
+            "/usr/bin/env",
+            "bash",
+            shlex.quote(shell_path(APP_DIR / "scripts" / "sync_openmeteo_source_group.sh")),
+        ]
+        + [shlex.quote(argument) for argument in arguments]
+    )
     return "\n".join(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
-            "exec /usr/bin/env bash " + " ".join(
-                [shlex.quote(shell_path(APP_DIR / "scripts" / "sync_openmeteo_source_group.sh"))]
-                + [shlex.quote(argument) for argument in arguments]
-            ),
+            'if [ "$(id -u)" -eq 0 ]; then',
+            f"  exec sudo -H -u ubuntu {command}",
+            "fi",
+            f"exec {command}",
             "",
         ]
     )

@@ -32,7 +32,7 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
-            f"exec /usr/bin/env bash {APP_DIR}/scripts/run_scope.sh {scope}",
+            f"exec sudo -n -H -u ubuntu /usr/bin/env bash {APP_DIR}/scripts/run_scope.sh {scope}",
         ]
     )
     return {
