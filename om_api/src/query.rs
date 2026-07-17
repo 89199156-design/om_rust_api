@@ -5392,6 +5392,15 @@ fn grid_latitude_for_index(
             let global_lat_min = -dy * (1536.0_f32 - 1.0) / 2.0;
             return Ok(global_lat_min + global_y as f32 * dy);
         }
+        if let (Some(_full_ny), Some(y0)) = (grid.full_ny, grid.y0) {
+            // Preserve Open-Meteo's global-grid f32 arithmetic after a native
+            // regional crop. Computing from the regional f64 origin changes
+            // the shortest JSON representation (for example 16.800003 becomes
+            // 16.8) even though it selects the same cell.
+            let dy = grid.dy as f32;
+            let global_lat_min = (grid.lat_min - y0 as f64 * grid.dy) as f32;
+            return Ok(global_lat_min + (y0 + y) as f32 * dy);
+        }
         return Ok((grid.lat_min + y as f64 * grid.dy) as f32);
     }
     if array.dimensions.len() != 2 || y >= array.dimensions[0] {
@@ -6014,6 +6023,39 @@ mod tests {
         assert_eq!(
             grid_longitude_for_index(&array, None, x).unwrap(),
             106.600006
+        );
+    }
+
+    #[test]
+    fn native_cams_crop_preserves_official_global_float_coordinates() {
+        let array = ArrayMetadata {
+            data_type: 20,
+            compression: 4,
+            dimensions: vec![150, 180, 121],
+            chunks: vec![32, 32, 121],
+            lut_offset: None,
+            lut_size: None,
+            scale_factor: None,
+            add_offset: None,
+        };
+        let grid = crate::manifest::NativeGridMetadata {
+            nx: 180,
+            ny: 150,
+            lon_min: 69.20000000000002,
+            lat_min: -0.7999999999999972,
+            dx: 0.4,
+            dy: 0.4,
+            dt_seconds: 3600,
+            om_file_length: 217,
+            full_nx: Some(900),
+            full_ny: Some(451),
+            x0: Some(623),
+            y0: Some(223),
+        };
+
+        assert_eq!(
+            grid_latitude_for_index(&array, Some(&grid), 44).unwrap(),
+            16.800003
         );
     }
 
