@@ -2475,25 +2475,62 @@ fn read_variable_point_series(
     if !is_gfs_product(product) {
         return Ok(None);
     }
-    let values = read_variable_grid_series(
-        snapshot,
-        decoder,
-        variable,
-        times,
-        &[latitude],
-        &[longitude],
-    )?
-    .into_iter()
-    .map(|mut values| {
-        if values.len() != 1 {
-            bail!(
-                "point time-slab decode returned {} grid values",
-                values.len()
-            );
+    let latest_full_start = snapshot
+        .product_snapshots(product)
+        .into_iter()
+        .find(|candidate| gfs_snapshot_is_full(candidate))
+        .and_then(|candidate| {
+            candidate
+                .entries
+                .values()
+                .next()
+                .map(|entry| entry.valid_time_utc - Duration::hours(entry.forecast_hour))
+        })
+        .ok_or_else(|| anyhow!("GFS complete run is not available for {product}"))?;
+    let split = times.partition_point(|time| *time < latest_full_start);
+    let mut values = Vec::with_capacity(times.len());
+    // Hours before the latest complete run may be supplied by any of the
+    // retained short snapshots. Keep the established newest-covering-run
+    // selection for that small prefix instead of forcing an older full run.
+    for time in &times[..split] {
+        match read_variable_value(
+            snapshot,
+            Some(decoder),
+            variable,
+            *time,
+            latitude,
+            longitude,
+        ) {
+            Ok(value) => values.push(value),
+            Err(error) if error.to_string().contains("variable/time is not available") => {
+                values.push(f32::NAN)
+            }
+            Err(error) => return Err(error),
         }
-        Ok(values.remove(0))
-    })
-    .collect::<Result<Vec<_>>>()?;
+    }
+    if split < times.len() {
+        values.extend(
+            read_variable_grid_series(
+                snapshot,
+                decoder,
+                variable,
+                &times[split..],
+                &[latitude],
+                &[longitude],
+            )?
+            .into_iter()
+            .map(|mut values| {
+                if values.len() != 1 {
+                    bail!(
+                        "point time-slab decode returned {} grid values",
+                        values.len()
+                    );
+                }
+                Ok(values.remove(0))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        );
+    }
     Ok(Some(values))
 }
 
