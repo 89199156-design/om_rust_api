@@ -681,16 +681,38 @@ pub fn point_forecast(
         );
 
         for variable in variables {
-            let mut values = Vec::with_capacity(times.len());
-            for time in &times {
-                match read_variable_value(snapshot, decoder, variable, *time, latitude, longitude) {
-                    Ok(value) => values.push(value),
+            let fast_values = if let Some(decoder) = decoder {
+                match read_variable_point_series(
+                    snapshot, decoder, variable, &times, latitude, longitude,
+                ) {
+                    Ok(values) => Some(values),
                     Err(error) if error.to_string().contains("variable/time is not available") => {
-                        values.push(f32::NAN)
+                        None
                     }
                     Err(error) => return Err(error),
                 }
-            }
+            } else {
+                None
+            };
+            let values = if let Some(values) = fast_values {
+                values
+            } else {
+                let mut values = Vec::with_capacity(times.len());
+                for time in &times {
+                    match read_variable_value(
+                        snapshot, decoder, variable, *time, latitude, longitude,
+                    ) {
+                        Ok(value) => values.push(value),
+                        Err(error)
+                            if error.to_string().contains("variable/time is not available") =>
+                        {
+                            values.push(f32::NAN)
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                values
+            };
             hourly_units.insert(variable.clone(), unit_for_variable(variable).to_string());
             hourly.insert(variable.clone(), json_array_for_variable(variable, values));
         }
@@ -2059,6 +2081,109 @@ pub fn read_variable_grid_series(
             .map(|(left, right)| left.into_iter().zip(right).map(|(a, b)| op(a, b)).collect())
             .collect()
     };
+    if let Some((name, level_text)) = variable.rsplit_once('_') {
+        if level_text
+            .strip_suffix("hPa")
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some()
+        {
+            let raw = |prefix: &str| format!("{prefix}_{level_text}");
+            match name {
+                "wind_speed" | "windspeed" => {
+                    return Ok(combine2(
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("wind_u_component"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("wind_v_component"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        |u, v| (u * u + v * v).sqrt(),
+                    ));
+                }
+                "wind_direction" | "winddirection" => {
+                    return Ok(combine2(
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("wind_u_component"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("wind_v_component"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        wind_direction,
+                    ));
+                }
+                "dew_point" | "dewpoint" => {
+                    return Ok(combine2(
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("temperature"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        read_direct_grid_series(
+                            snapshot,
+                            decoder,
+                            &raw("relative_humidity"),
+                            times,
+                            latitudes,
+                            longitudes,
+                            true,
+                        )?,
+                        dew_point,
+                    ));
+                }
+                "cloudcover" => {
+                    return read_direct_grid_series(
+                        snapshot,
+                        decoder,
+                        &raw("cloud_cover"),
+                        times,
+                        latitudes,
+                        longitudes,
+                        true,
+                    );
+                }
+                "relativehumidity" => {
+                    return read_direct_grid_series(
+                        snapshot,
+                        decoder,
+                        &raw("relative_humidity"),
+                        times,
+                        latitudes,
+                        longitudes,
+                        true,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
     match variable {
         "dew_point_2m" | "dewpoint_2m" => Ok(combine2(
             read_direct_grid_series(
@@ -2100,8 +2225,11 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?;
-            let elevation =
-                read_gfs_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?;
+            let elevation = if let Some(sampling) = current_product_sampling("gfs013_surface") {
+                vec![surface_pressure_elevation(sampling); latitudes.len() * longitudes.len()]
+            } else {
+                read_gfs_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?
+            };
             Ok(temperature
                 .into_iter()
                 .zip(pressure)
@@ -2120,6 +2248,157 @@ pub fn read_variable_grid_series(
         "weather_code" | "weathercode" | "precip_phase" | "thunderstorm_code" => {
             read_weather_code_grid_series(snapshot, decoder, times, latitudes, longitudes)
         }
+        "apparent_temperature" => {
+            let temperature = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let humidity = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "relative_humidity_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let u = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let v = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let radiation = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            Ok(temperature
+                .into_iter()
+                .zip(humidity)
+                .zip(u)
+                .zip(v)
+                .zip(radiation)
+                .map(|((((temperature, humidity), u), v), radiation)| {
+                    temperature
+                        .into_iter()
+                        .zip(humidity)
+                        .zip(u)
+                        .zip(v)
+                        .zip(radiation)
+                        .map(|((((temperature, humidity), u), v), radiation)| {
+                            apparent_temperature(
+                                temperature,
+                                humidity,
+                                (u * u + v * v).sqrt(),
+                                Some(radiation),
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "rain" => {
+            let precipitation = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "precipitation",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let snowfall = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "snowfall_water_equivalent",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let showers = read_direct_grid_series(
+                snapshot, decoder, "showers", times, latitudes, longitudes, true,
+            )?;
+            Ok(precipitation
+                .into_iter()
+                .zip(snowfall)
+                .zip(showers)
+                .map(|((precipitation, snowfall), showers)| {
+                    precipitation
+                        .into_iter()
+                        .zip(snowfall)
+                        .zip(showers)
+                        .map(|((precipitation, snowfall), showers)| {
+                            (precipitation - snowfall - showers).max(0.0)
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "wind_speed_10m" | "windspeed_10m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            |u, v| (u * u + v * v).sqrt(),
+        )),
+        "wind_direction_10m" | "winddirection_10m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            wind_direction,
+        )),
         "snowfall" => Ok(read_direct_grid_series(
             snapshot,
             decoder,
@@ -2181,6 +2460,35 @@ pub fn read_variable_grid_series(
             snapshot, decoder, variable, times, latitudes, longitudes, true,
         ),
     }
+}
+
+fn read_variable_point_series(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+) -> Result<Vec<f32>> {
+    read_variable_grid_series(
+        snapshot,
+        decoder,
+        variable,
+        times,
+        &[latitude],
+        &[longitude],
+    )?
+    .into_iter()
+    .map(|mut values| {
+        if values.len() != 1 {
+            bail!(
+                "point time-slab decode returned {} grid values",
+                values.len()
+            );
+        }
+        Ok(values.remove(0))
+    })
+    .collect()
 }
 
 fn read_derived_air_quality(
@@ -3234,6 +3542,24 @@ fn read_direct_grid_series(
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
+    // Point requests resolve a potentially different nearest land/model cell
+    // for every product (for example GFS 0.13° surface versus 0.25° wind).
+    // The time-slab path must use that product-specific cell just like the
+    // single-value path in read_entry_value(). Regional/WebP requests have no
+    // thread-local sampling and continue to use their supplied output grid.
+    let sampled_latitudes;
+    let sampled_longitudes;
+    let (latitudes, longitudes) = if latitudes.len() == 1 && longitudes.len() == 1 {
+        if let Some(sampling) = current_product_sampling(product_name) {
+            sampled_latitudes = [sampling.latitude];
+            sampled_longitudes = [sampling.longitude];
+            (&sampled_latitudes[..], &sampled_longitudes[..])
+        } else {
+            (latitudes, longitudes)
+        }
+    } else {
+        (latitudes, longitudes)
+    };
     let products = snapshot.product_snapshots(product_name);
     if is_gfs_product(product_name) {
         let full_products = products
@@ -3311,6 +3637,15 @@ fn read_direct_grid_series(
                                 }
                             }
                         }
+                    }
+                }
+                // Native time-slab decoding bypasses read_entry_value(), so
+                // apply the same point-request elevation correction here.
+                // Regional/WebP calls have no request sampling and therefore
+                // remain byte-for-byte unchanged.
+                for frame in &mut values {
+                    for value in frame {
+                        *value = apply_elevation_correction(product_name, variable, *value);
                     }
                 }
                 return Ok(values);
