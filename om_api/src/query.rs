@@ -685,7 +685,7 @@ pub fn point_forecast(
                 match read_variable_point_series(
                     snapshot, decoder, variable, &times, latitude, longitude,
                 ) {
-                    Ok(values) => Some(values),
+                    Ok(values) => values,
                     Err(error) if error.to_string().contains("variable/time is not available") => {
                         None
                     }
@@ -2469,8 +2469,13 @@ fn read_variable_point_series(
     times: &[DateTime<Utc>],
     latitude: f64,
     longitude: f64,
-) -> Result<Vec<f32>> {
-    read_variable_grid_series(
+) -> Result<Option<Vec<f32>>> {
+    let seed = seed_variable_for_times(variable);
+    let (product, _) = product_for_variable(snapshot, &seed)?;
+    if !is_gfs_product(product) {
+        return Ok(None);
+    }
+    let values = read_variable_grid_series(
         snapshot,
         decoder,
         variable,
@@ -2488,7 +2493,8 @@ fn read_variable_point_series(
         }
         Ok(values.remove(0))
     })
-    .collect()
+    .collect::<Result<Vec<_>>>()?;
+    Ok(Some(values))
 }
 
 fn read_derived_air_quality(
