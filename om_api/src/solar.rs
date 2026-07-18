@@ -2,7 +2,7 @@ use crate::solar_lookup::{DECLINATION_BITS, EQUATION_OF_TIME_MINUTES_BITS};
 use chrono::{DateTime, Utc};
 use std::sync::OnceLock;
 
-const SOLAR_CONSTANT: f32 = 1367.7;
+pub const SOLAR_CONSTANT: f32 = 1367.7;
 // Swift's Float.pi is one ULP below Rust's f32::consts::PI. Open-Meteo's
 // solar helpers use the Swift value for every degree/radian conversion.
 const PI: f32 = f32::from_bits(0x4049_0fda);

@@ -1505,6 +1505,54 @@ async fn forecast_endpoint_interpolates_sparse_temperature_with_hermite() {
 }
 
 #[tokio::test]
+async fn forecast_endpoint_interpolates_sparse_uv_with_official_solar_method() {
+    let root = tempfile::tempdir().unwrap();
+    write_product_coverage_timed(
+        root.path(),
+        "gfs013_surface",
+        "gfs013_surface_sparse_uv",
+        vec![
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [5.0, 5.0, 5.0, 5.0],
+                valid_time_utc: "2026-07-08T12:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [6.0, 6.0, 6.0, 6.0],
+                valid_time_utc: "2026-07-08T15:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "uv_index_clear_sky",
+                values: [4.0, 4.0, 4.0, 4.0],
+                valid_time_utc: "2026-07-08T18:00:00Z",
+            },
+        ],
+        true,
+    );
+    write_group_ready(
+        root.path(),
+        "gfs",
+        &[("gfs013_surface", "gfs013_surface_sparse_uv")],
+    );
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+
+    let (status, body) = request_json(
+        app,
+        "/v1/forecast?latitude=90&longitude=-180&hourly=uv_index_clear_sky&start_hour=2026-07-08T12:00&end_hour=2026-07-08T18:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let values = body["hourly"]["uv_index_clear_sky"]
+        .as_array()
+        .expect("hourly UV series");
+    assert_eq!(values.len(), 7);
+    assert!(values.iter().all(Value::is_number));
+}
+
+#[tokio::test]
 async fn forecast_endpoint_uses_model_stride_for_hermite_padding() {
     let root = tempfile::tempdir().unwrap();
     write_product_coverage_timed(

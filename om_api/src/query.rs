@@ -4,7 +4,7 @@ use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialD
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
     backwards_direct_normal_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
-    extra_terrestrial_radiation_backwards, is_day,
+    extra_terrestrial_radiation_backwards, is_day, SOLAR_CONSTANT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
@@ -3743,6 +3743,16 @@ fn read_product_grid_with_rounding(
         InterpolationKind::Direct => {
             read_native_grid(product, decoder, raw_variable, time, latitudes, longitudes)
         }
+        InterpolationKind::SolarBackwardsAveraged { scalefactor } => read_solar_backwards_grid(
+            product,
+            decoder,
+            raw_variable,
+            time,
+            latitudes,
+            longitudes,
+            scalefactor,
+            round_values,
+        ),
         InterpolationKind::BackwardsSum { scalefactor }
         | InterpolationKind::Backwards { scalefactor } => {
             if native_times.is_empty()
@@ -4034,6 +4044,13 @@ fn read_exact_native_grid_series(
         }
         match interpolation {
             InterpolationKind::Direct => {}
+            InterpolationKind::SolarBackwardsAveraged { scalefactor } => {
+                if round_values {
+                    values
+                        .iter_mut()
+                        .for_each(|value| *value = round_to_scalefactor(*value, scalefactor));
+                }
+            }
             InterpolationKind::Linear { scalefactor }
             | InterpolationKind::Backwards { scalefactor } => {
                 if round_values {
@@ -4379,6 +4396,18 @@ fn read_product_value_with_rounding(
 ) -> Result<f32> {
     match interpolation_kind_for_variable(variable) {
         InterpolationKind::Direct => {}
+        InterpolationKind::SolarBackwardsAveraged { scalefactor } => {
+            return read_solar_backwards_value(
+                product,
+                decoder,
+                raw_variable,
+                time,
+                latitude,
+                longitude,
+                scalefactor,
+                round_values,
+            );
+        }
         InterpolationKind::BackwardsSum { scalefactor } => {
             return read_backwards_value(
                 product,
@@ -4489,6 +4518,371 @@ fn read_backwards_value(
         scalefactor,
         round_values,
     ))
+}
+
+fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) -> f32 {
+    (extra_terrestrial_radiation_backwards(time, 3600, latitude as f32, longitude as f32)
+        / SOLAR_CONSTANT)
+        .max(0.0)
+}
+
+fn solar_average_between(
+    start_exclusive: DateTime<Utc>,
+    end_inclusive: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> f32 {
+    let hours = (end_inclusive - start_exclusive).num_hours();
+    if hours <= 0 {
+        return solar_factor_backwards(end_inclusive, latitude, longitude);
+    }
+    (1..=hours)
+        .map(|hour| {
+            solar_factor_backwards(start_exclusive + Duration::hours(hour), latitude, longitude)
+        })
+        .sum::<f32>()
+        / hours as f32
+}
+
+fn solar_average_for_native_time(
+    native_times: &[DateTime<Utc>],
+    index: usize,
+    latitude: f64,
+    longitude: f64,
+) -> f32 {
+    if index == 0 || native_times[index] - native_times[index - 1] <= Duration::hours(1) {
+        return solar_factor_backwards(native_times[index], latitude, longitude);
+    }
+    solar_average_between(
+        native_times[index - 1],
+        native_times[index],
+        latitude,
+        longitude,
+    )
+}
+
+fn solar_interpolation_segment(
+    native_times: &[DateTime<Utc>],
+    time: DateTime<Utc>,
+) -> Option<(usize, usize, f32)> {
+    if native_times.is_empty()
+        || time < native_times[0]
+        || time > *native_times.last().expect("checked not empty")
+    {
+        return None;
+    }
+    match native_times.binary_search(&time) {
+        Ok(index)
+            if index > 0 && native_times[index] - native_times[index - 1] > Duration::hours(1) =>
+        {
+            Some((index - 1, index, 1.0))
+        }
+        Ok(index) => Some((index, index, 0.0)),
+        Err(next) if next > 0 && next < native_times.len() => {
+            let left = next - 1;
+            let seconds = (native_times[next] - native_times[left]).num_seconds();
+            if seconds <= 0 {
+                return None;
+            }
+            Some((
+                left,
+                next,
+                (time - native_times[left]).num_seconds() as f32 / seconds as f32,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solar_backwards_sample(
+    native_times: &[DateTime<Utc>],
+    left: usize,
+    right: usize,
+    fraction: f32,
+    raw_a: Option<f32>,
+    raw_b: f32,
+    raw_c: f32,
+    raw_d: Option<f32>,
+    latitude: f64,
+    longitude: f64,
+    scalefactor: f32,
+    round_values: bool,
+) -> f32 {
+    if left == right {
+        return maybe_round_to_scalefactor(raw_b, scalefactor, round_values);
+    }
+    // The source value at C is a backwards average covering every missing
+    // hourly step after B. This mirrors Open-Meteo's
+    // interpolateInplaceSolarBackwards(missingValuesAreBackwardsAveraged: true).
+    if !raw_b.is_finite() || !raw_c.is_finite() {
+        return f32::NAN;
+    }
+    let time_b = native_times[left];
+    let time_c = native_times[right];
+    let stride = time_c - time_b;
+    let time_a = time_b - stride;
+    let time_d = time_c + stride;
+    let index_a = native_times.binary_search(&time_a).ok();
+    let index_d = native_times.binary_search(&time_d).ok();
+
+    let solar_b = solar_factor_backwards(time_b, latitude, longitude);
+    let solar_target = solar_factor_backwards(
+        time_b + Duration::seconds((stride.num_seconds() as f32 * fraction).round() as i64),
+        latitude,
+        longitude,
+    );
+    let solar_average_b = solar_average_for_native_time(native_times, left, latitude, longitude);
+    let solar_average_c = solar_average_between(time_b, time_c, latitude, longitude);
+    let radiation_limit = SOLAR_CONSTANT * 0.95;
+    let radiation_minimum = 5.0 / SOLAR_CONSTANT;
+
+    let bounded_kt = |value: f32, solar: f32| {
+        if !value.is_finite() || solar <= radiation_minimum {
+            f32::NAN
+        } else {
+            (value / solar).min(radiation_limit)
+        }
+    };
+
+    let mut kt_c = bounded_kt(raw_c, solar_average_c);
+    let mut kt_b = if solar_b <= radiation_minimum {
+        kt_c
+    } else {
+        bounded_kt(raw_b, solar_average_b)
+    };
+    let mut kt_a = match (index_a, raw_a) {
+        (Some(index), Some(value)) if value.is_finite() => {
+            let solar_a = solar_factor_backwards(time_a, latitude, longitude);
+            if solar_a <= radiation_minimum {
+                kt_b
+            } else {
+                bounded_kt(
+                    value,
+                    solar_average_for_native_time(native_times, index, latitude, longitude),
+                )
+            }
+        }
+        _ => kt_b,
+    };
+    let kt_d = match (index_d, raw_d) {
+        (Some(index), Some(value)) if value.is_finite() => bounded_kt(
+            value,
+            solar_average_for_native_time(native_times, index, latitude, longitude),
+        ),
+        _ => kt_c,
+    };
+    let mut kt_d = kt_d;
+
+    if kt_c.is_nan() && kt_b > 0.0 {
+        kt_c = kt_b;
+    }
+    if kt_c.is_nan() && kt_a > 0.0 {
+        kt_b = kt_a;
+        kt_c = kt_a;
+    }
+    if kt_c.is_nan() && kt_d > 0.0 {
+        kt_a = kt_d;
+        kt_b = kt_d;
+        kt_c = kt_d;
+    }
+    if kt_d.is_nan() {
+        kt_d = kt_c;
+    }
+
+    let coeff_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
+    let coeff_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
+    let coeff_c = -kt_a / 2.0 + kt_c / 2.0;
+    let kt = coeff_a * fraction * fraction * fraction
+        + coeff_b * fraction * fraction
+        + coeff_c * fraction
+        + kt_b;
+    let value = if kt < 0.0 && raw_b >= 0.0 && raw_c >= 0.0 {
+        (kt_b * (1.0 - fraction) + kt_c * fraction) * solar_target
+    } else if kt.is_finite() {
+        kt.max(0.0) * solar_target
+    } else {
+        0.0
+    };
+    maybe_round_to_scalefactor(value, scalefactor, round_values)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_solar_backwards_value(
+    product: &ProductSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+    scalefactor: f32,
+    round_values: bool,
+) -> Result<f32> {
+    let native_times = native_times_for_variable(product, raw_variable);
+    let Some((left, right, fraction)) = solar_interpolation_segment(&native_times, time) else {
+        return Ok(f32::NAN);
+    };
+    let (latitude, longitude) = current_product_sampling(&product.product)
+        .map(|sampling| (sampling.latitude, sampling.longitude))
+        .unwrap_or((latitude, longitude));
+    let raw_b = read_native_value(
+        product,
+        decoder,
+        raw_variable,
+        native_times[left],
+        latitude,
+        longitude,
+    )?;
+    if left == right {
+        return Ok(maybe_round_to_scalefactor(raw_b, scalefactor, round_values));
+    }
+    let raw_c = read_native_value(
+        product,
+        decoder,
+        raw_variable,
+        native_times[right],
+        latitude,
+        longitude,
+    )?;
+    let stride = native_times[right] - native_times[left];
+    let index_a = native_times
+        .binary_search(&(native_times[left] - stride))
+        .ok();
+    let index_d = native_times
+        .binary_search(&(native_times[right] + stride))
+        .ok();
+    let raw_a = index_a
+        .map(|index| {
+            read_native_value(
+                product,
+                decoder,
+                raw_variable,
+                native_times[index],
+                latitude,
+                longitude,
+            )
+        })
+        .transpose()?;
+    let raw_d = index_d
+        .map(|index| {
+            read_native_value(
+                product,
+                decoder,
+                raw_variable,
+                native_times[index],
+                latitude,
+                longitude,
+            )
+        })
+        .transpose()?;
+    Ok(solar_backwards_sample(
+        &native_times,
+        left,
+        right,
+        fraction,
+        raw_a,
+        raw_b,
+        raw_c,
+        raw_d,
+        latitude,
+        longitude,
+        scalefactor,
+        round_values,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_solar_backwards_grid(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+    scalefactor: f32,
+    round_values: bool,
+) -> Result<Vec<f32>> {
+    let native_times = native_times_for_variable(product, raw_variable);
+    let Some((left, right, fraction)) = solar_interpolation_segment(&native_times, time) else {
+        return Ok(vec![f32::NAN; latitudes.len() * longitudes.len()]);
+    };
+    let raw_b = read_native_grid(
+        product,
+        decoder,
+        raw_variable,
+        native_times[left],
+        latitudes,
+        longitudes,
+    )?;
+    if left == right {
+        return Ok(raw_b
+            .into_iter()
+            .map(|value| maybe_round_to_scalefactor(value, scalefactor, round_values))
+            .collect());
+    }
+    let raw_c = read_native_grid(
+        product,
+        decoder,
+        raw_variable,
+        native_times[right],
+        latitudes,
+        longitudes,
+    )?;
+    let stride = native_times[right] - native_times[left];
+    let index_a = native_times
+        .binary_search(&(native_times[left] - stride))
+        .ok();
+    let index_d = native_times
+        .binary_search(&(native_times[right] + stride))
+        .ok();
+    let raw_a = index_a
+        .map(|index| {
+            read_native_grid(
+                product,
+                decoder,
+                raw_variable,
+                native_times[index],
+                latitudes,
+                longitudes,
+            )
+        })
+        .transpose()?;
+    let raw_d = index_d
+        .map(|index| {
+            read_native_grid(
+                product,
+                decoder,
+                raw_variable,
+                native_times[index],
+                latitudes,
+                longitudes,
+            )
+        })
+        .transpose()?;
+    let width = longitudes.len();
+    Ok(raw_b
+        .into_iter()
+        .zip(raw_c)
+        .enumerate()
+        .map(|(index, (raw_b, raw_c))| {
+            let latitude = latitudes[index / width];
+            let longitude = longitudes[index % width];
+            solar_backwards_sample(
+                &native_times,
+                left,
+                right,
+                fraction,
+                raw_a.as_ref().map(|values| values[index]),
+                raw_b,
+                raw_c,
+                raw_d.as_ref().map(|values| values[index]),
+                latitude,
+                longitude,
+                scalefactor,
+                round_values,
+            )
+        })
+        .collect())
 }
 
 fn read_linear_value(
@@ -4721,6 +5115,9 @@ fn maybe_round_to_scalefactor(value: f32, scalefactor: f32, round_values: bool) 
 #[derive(Debug, Clone, Copy)]
 enum InterpolationKind {
     Direct,
+    SolarBackwardsAveraged {
+        scalefactor: f32,
+    },
     Linear {
         scalefactor: f32,
     },
@@ -4746,6 +5143,12 @@ fn interpolation_kind_for_variable(variable: &str) -> InterpolationKind {
     match variable {
         "precipitation" | "showers" | "snowfall_water_equivalent" => {
             InterpolationKind::BackwardsSum { scalefactor: 10.0 }
+        }
+        "shortwave_radiation" | "diffuse_radiation" => {
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 }
+        }
+        "uv_index" | "uv_index_clear_sky" => {
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 20.0 }
         }
         "categorical_freezing_rain" | "frozen_precipitation_percent" => {
             InterpolationKind::Backwards { scalefactor: 1.0 }
@@ -4806,6 +5209,10 @@ fn interpolation_kind_for_variable(variable: &str) -> InterpolationKind {
         "boundary_layer_height" => InterpolationKind::Hermite {
             scalefactor: 0.2,
             bounds: Some((0.0, 10e9)),
+        },
+        "sensible_heat_flux" | "latent_heat_flux" => InterpolationKind::Hermite {
+            scalefactor: 0.144,
+            bounds: None,
         },
         "soil_moisture_0_to_10cm"
         | "soil_moisture_10_to_40cm"
@@ -5985,6 +6392,25 @@ mod tests {
             hj633_2026_iaqi(0.7, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
             18.0
         );
+    }
+
+    #[test]
+    fn gfs_flux_variables_follow_official_interpolation_metadata() {
+        assert!(matches!(
+            interpolation_kind_for_variable("uv_index_clear_sky"),
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 20.0 }
+        ));
+        assert!(matches!(
+            interpolation_kind_for_variable("shortwave_radiation"),
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 }
+        ));
+        assert!(matches!(
+            interpolation_kind_for_variable("latent_heat_flux"),
+            InterpolationKind::Hermite {
+                scalefactor: 0.144,
+                bounds: None
+            }
+        ));
     }
 
     #[test]
