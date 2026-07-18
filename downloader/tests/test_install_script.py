@@ -71,8 +71,8 @@ class InstallScriptTests(unittest.TestCase):
             [
                 "*/10 * * * *",
                 "5,15,25,35,45,55 * * * *",
-                "*/5 * * * *",
-                "*/5 * * * *",
+                "2-59/5 * * * *",
+                "2-59/5 * * * *",
             ],
         )
         scripts = {name: script for name, _spec, script in tasks}
@@ -102,6 +102,10 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--partial-dir=.rsync-partial", sync_content)
         self.assertIn("--source-ssh-key", sync_content)
         self.assertIn("--source-known-hosts", sync_content)
+        self.assertIn("source_reconciliation_running", sync_content)
+        self.assertIn("source publication changed during synchronization", sync_content)
+        self.assertIn("manifest_status=0", sync_content)
+        self.assertIn('if [ "$manifest_status" -eq 23 ]', sync_content)
 
 
 if __name__ == "__main__":

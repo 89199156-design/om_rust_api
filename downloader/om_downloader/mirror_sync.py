@@ -887,6 +887,9 @@ def prune_expired_group_releases(
             continue
         retained_runs.add(run)
         retained_releases.append(release)
+    for release_path, _ in expired_releases:
+        release_path.unlink()
+
     referenced = _referenced_group_coverages(
         group,
         [payload for _, payload in retained_releases],
@@ -909,9 +912,6 @@ def prune_expired_group_releases(
                 ) from exc
             shutil.rmtree(coverage_path)
             removed.append(str(coverage_path))
-
-    for release_path, _ in expired_releases:
-        release_path.unlink()
     return removed
 
 

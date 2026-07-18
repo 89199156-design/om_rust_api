@@ -233,7 +233,7 @@ def api_source_sync_tasks(
         ),
         (
             "OM_GFS_SOURCE_SYNC",
-            "*/5 * * * *",
+            "2-59/5 * * * *",
             source_sync_task_script(
                 group="gfs",
                 source_host=source_host,
@@ -245,7 +245,7 @@ def api_source_sync_tasks(
         ),
         (
             "OM_CAMS_SOURCE_SYNC",
-            "*/5 * * * *",
+            "2-59/5 * * * *",
             source_sync_task_script(
                 group="cams",
                 source_host=source_host,

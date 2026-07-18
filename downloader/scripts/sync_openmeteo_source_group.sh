@@ -68,6 +68,45 @@ trap cleanup EXIT
 
 SSH_RSH="$(printf 'ssh -i %q -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%q' "$SOURCE_SSH_KEY" "$SOURCE_KNOWN_HOSTS")"
 
+source_reconciliation_running() {
+  local lock_path
+  lock_path="$(readlink -m "$SOURCE_ROOT/../locks/$GROUP"_reconcile.lock)"
+  ssh -i "$SOURCE_SSH_KEY" \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$SOURCE_KNOWN_HOSTS" \
+    "$SOURCE_HOST" /usr/bin/python3 - "$lock_path" <<'PY'
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    payload = path.read_text(encoding="utf-8")
+    modified_at = path.stat().st_mtime
+except FileNotFoundError:
+    raise SystemExit(1)
+
+match = re.search(r"(?:^|\s)pid=(\d+)(?:\s|$)", payload)
+if match:
+    try:
+        os.kill(int(match.group(1)), 0)
+    except ProcessLookupError:
+        raise SystemExit(1)
+    except PermissionError:
+        pass
+    raise SystemExit(0)
+raise SystemExit(0 if time.time() - modified_at < 30 else 1)
+PY
+}
+
+skip_source_change() {
+  printf '{"group":"%s","status":"skipped","reason":"source publication changed during synchronization; retry on next schedule"}\n' "$GROUP"
+  exit 0
+}
+
 pull_remote_file() {
   local relative_path="$1"
   case "$relative_path" in
@@ -176,6 +215,7 @@ PY
 pull_target_manifests() {
   local selected_path="$1"
   local manifest_list="$2"
+  local status=0
 
   /usr/bin/python3 - "$STAGE_ROOT" "$GROUP" "$selected_path" >"$manifest_list" <<'PY'
 import json
@@ -202,8 +242,12 @@ PY
 
   while IFS= read -r relative_path; do
     [ -n "$relative_path" ] || continue
-    pull_remote_file "$relative_path"
+    pull_remote_file "$relative_path" || status=$?
+    if [ "$status" -ne 0 ]; then
+      break
+    fi
   done <"$manifest_list"
+  return "$status"
 }
 
 prepare_missing_payloads() {
@@ -292,10 +336,24 @@ SELECTED_PATH="$WORK_ROOT/selected.txt"
 MANIFEST_LIST="$WORK_ROOT/manifests.txt"
 PAYLOAD_LIST="$WORK_ROOT/payloads.txt"
 
+if source_reconciliation_running; then
+  printf '{"group":"%s","status":"skipped","reason":"source reconciliation is running"}\n' "$GROUP"
+  exit 0
+fi
 if ! select_target_releases "$SELECTED_PATH"; then
   exit 0
 fi
-pull_target_manifests "$SELECTED_PATH" "$MANIFEST_LIST"
+if source_reconciliation_running; then
+  printf '{"group":"%s","status":"skipped","reason":"source reconciliation started during synchronization"}\n' "$GROUP"
+  exit 0
+fi
+manifest_status=0
+pull_target_manifests "$SELECTED_PATH" "$MANIFEST_LIST" || manifest_status=$?
+if [ "$manifest_status" -eq 23 ]; then
+  skip_source_change
+elif [ "$manifest_status" -ne 0 ]; then
+  exit "$manifest_status"
+fi
 prepare_missing_payloads "$SELECTED_PATH" "$PAYLOAD_LIST"
 
 if [ -s "$PAYLOAD_LIST" ]; then
