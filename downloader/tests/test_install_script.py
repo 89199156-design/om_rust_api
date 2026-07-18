@@ -105,7 +105,9 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("source_reconciliation_running", sync_content)
         self.assertIn("source publication changed during synchronization", sync_content)
         self.assertIn("manifest_status=0", sync_content)
+        self.assertIn("payload_status=0", sync_content)
         self.assertIn('if [ "$manifest_status" -eq 23 ]', sync_content)
+        self.assertIn('if [ "$payload_status" -eq 23 ]', sync_content)
 
 
 if __name__ == "__main__":

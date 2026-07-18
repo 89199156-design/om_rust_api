@@ -356,10 +356,16 @@ elif [ "$manifest_status" -ne 0 ]; then
 fi
 prepare_missing_payloads "$SELECTED_PATH" "$PAYLOAD_LIST"
 
+payload_status=0
 if [ -s "$PAYLOAD_LIST" ]; then
   rsync -a --whole-file --partial --partial-dir=.rsync-partial --timeout=180 \
     --files-from="$PAYLOAD_LIST" -e "$SSH_RSH" \
-    "$SOURCE_HOST:$SOURCE_ROOT/" "$STAGE_ROOT/"
+    "$SOURCE_HOST:$SOURCE_ROOT/" "$STAGE_ROOT/" || payload_status=$?
+fi
+if [ "$payload_status" -eq 23 ]; then
+  skip_source_change
+elif [ "$payload_status" -ne 0 ]; then
+  exit "$payload_status"
 fi
 
 cd "$APP_DIR"
