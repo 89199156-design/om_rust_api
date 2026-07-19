@@ -85,7 +85,10 @@ def infer_state(line: str, *, default_stage: str) -> tuple[str, str | None, bool
     else:
         stage_text = default_stage
     run_match = RUN_PATTERN.search(line)
-    skipped = any(marker in lowered for marker in (" skip", "skipped", "already running"))
+    skipped = any(
+        marker in lowered
+        for marker in (" skip", "skipped", "already running", "not_ready", "not ready")
+    )
     return stage_text, run_match.group(1) if run_match else None, skipped
 
 
