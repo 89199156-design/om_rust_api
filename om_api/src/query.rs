@@ -5750,6 +5750,39 @@ fn grid_index_for_lat_lon(
         {
             bail!("native OM array dimensions do not match grid contract");
         }
+        // A regional OM bundle keeps only a rectangular subset, but its cell
+        // selection must remain bit-for-bit identical to the original global
+        // Open-Meteo grid.  Calculating from `lon_min` is not equivalent at a
+        // half-cell boundary: for example `(75.0 - 69.2) / 0.4` is represented
+        // just below 14.5, whereas the full CAMS grid selects global cell 638
+        // from `(75.0 + 180.0) / 0.4`.  Preserve the full-grid f32 arithmetic
+        // whenever the producer recorded its origin indices.
+        if let (Some(full_nx), Some(full_ny), Some(x0), Some(y0)) =
+            (grid.full_nx, grid.full_ny, grid.x0, grid.y0)
+        {
+            let dx = 360.0_f32 / full_nx as f32;
+            let mut lon = longitude as f32;
+            while lon < -180.0 {
+                lon += 360.0;
+            }
+            while lon >= 180.0 {
+                lon -= 360.0;
+            }
+            let global_x = ((lon + 180.0_f32) / dx).round() as i64;
+            let (global_lat_min, dy) = if full_ny == 1536 {
+                let dy = 0.11714935_f32;
+                (-dy * (full_ny as f32 - 1.0) / 2.0, dy)
+            } else {
+                (-90.0_f32, 180.0_f32 / (full_ny as f32 - 1.0))
+            };
+            let global_y = (((latitude as f32) - global_lat_min) / dy).round() as i64;
+            let x = global_x - x0 as i64;
+            let y = global_y - y0 as i64;
+            if y < 0 || y >= grid.ny as i64 || x < 0 || x >= grid.nx as i64 {
+                bail!("point is outside native regional grid");
+            }
+            return Ok((y as u64, x as u64));
+        }
         let x = ((longitude - grid.lon_min) / grid.dx).round() as i64;
         let y = ((latitude - grid.lat_min) / grid.dy).round() as i64;
         if y < 0 || y >= grid.ny as i64 || x < 0 || x >= grid.nx as i64 {
@@ -6482,6 +6515,13 @@ mod tests {
         assert_eq!(
             grid_latitude_for_index(&array, Some(&grid), 44).unwrap(),
             16.800003
+        );
+        // At 75°E the regional origin calculation lies infinitesimally below
+        // a half-cell.  It must nevertheless select the same global CAMS cell
+        // as Shanghai's uncropped 900-column source grid.
+        assert_eq!(
+            grid_index_for_lat_lon(&array, Some(&grid), 16.8, 75.0).unwrap(),
+            (44, 15)
         );
     }
 
