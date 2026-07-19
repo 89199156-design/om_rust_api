@@ -670,29 +670,20 @@ def _log_download_stage(
     variable_plan_workers: int = 0,
     reused_existing: bool = False,
 ) -> None:
+    stage_text = {
+        "planning": "开始分析下载范围",
+        "manifest": "完成文件并生成清单",
+        "reused": "复用已有完整文件",
+    }.get(stage, stage)
+    product_text = {
+        "gfs013_surface": "GFS 0.13°地面层",
+        "gfs025": "GFS 0.25°地面层",
+        "gfs_pressure_profile": "GFS 气压层",
+        "cams_global": "CAMS 全球空气质量",
+        "cams_global_greenhouse_gases": "CAMS 温室气体",
+    }.get(product.name, product.name)
     print(
-        json.dumps(
-            {
-                "stage": stage,
-                "product": product.name,
-                "coverage_id": coverage_id,
-                "planned_entries": planned_entries,
-                "planned_ranges": planned_ranges,
-                "downloaded_ranges": downloaded_ranges,
-                "written_bytes": written_bytes,
-                "elapsed_seconds": 0.0,
-                "average_mib_s": 0.0,
-                "current_mib_s": 0.0,
-                "active_workers": active_workers,
-                "range_workers": range_workers,
-                "planning_workers": planning_workers,
-                "variable_plan_workers": variable_plan_workers,
-                "queue_size": 0,
-                "pending_futures": 0,
-                "reused_existing": reused_existing,
-            },
-            ensure_ascii=False,
-        ),
+        f"阶段：{stage_text}｜产品：{product_text}｜批次：{coverage_id}",
         file=sys.stderr,
         flush=True,
     )
@@ -1026,7 +1017,7 @@ def _download_openmeteo_product(
                 progress_context={
                     "product": product.name,
                     "coverage_id": coverage_id,
-                    "progress_interval_seconds": 10,
+                    "progress_interval_seconds": 60,
                     "range_workers": range_workers,
                     "planning_workers": planning_workers,
                     "variable_plan_workers": variable_plan_workers,
@@ -1815,7 +1806,14 @@ def _reconcile_cams_complete_runs(
             return result
         lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
         if lines:
-            download_results.append(json.loads(lines[-1]))
+            download_result = json.loads(lines[-1])
+            download_results.append(download_result)
+            if (
+                download_result.get("status") == "skipped"
+                and download_result.get("reason") == "group already running"
+            ):
+                print(json.dumps(download_result, ensure_ascii=False))
+                return 0
 
     all_available = _available_group_releases(api_root, "cams")
     available = {
@@ -1926,7 +1924,14 @@ def _reconcile_gfs_retention_window(
             return result
         lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
         if lines:
-            download_results.append(json.loads(lines[-1]))
+            download_result = json.loads(lines[-1])
+            download_results.append(download_result)
+            if (
+                download_result.get("status") == "skipped"
+                and download_result.get("reason") == "group already running"
+            ):
+                print(json.dumps(download_result, ensure_ascii=False))
+                return 0
         retain_results.append(
             retain_group_release_from_mirror("gfs", source_root, api_root)
         )

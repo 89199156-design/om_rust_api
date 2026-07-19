@@ -5,8 +5,10 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -499,6 +501,75 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         self.assertTrue(prune.call_args_list[0].kwargs["preserve_current"])
         self.assertTrue(prune.call_args_list[1].kwargs["preserve_current"])
 
+    def test_gfs_reconcile_reports_busy_group_without_false_incomplete_error(self):
+        products = [
+            SimpleNamespace(name=name)
+            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+        ]
+        run = "2026071500"
+        target_plans = [
+            (
+                run,
+                {
+                    product.name: (
+                        None,
+                        [],
+                        SimpleNamespace(latest_complete_run=run),
+                    )
+                    for product in products
+                },
+            )
+        ]
+
+        def fake_download(*_args, **_kwargs):
+            print(
+                json.dumps(
+                    {
+                        "group": "gfs",
+                        "status": "skipped",
+                        "reason": "group already running",
+                    }
+                )
+            )
+            return 0
+
+        args = SimpleNamespace(
+            config="models.json",
+            output="/tmp/gfs-reconcile-busy-test",
+            publish_openmeteo_group_to="/tmp/gfs-reconcile-busy-api-test",
+            openmeteo_bucket_url="https://example.invalid",
+        )
+        stdout = StringIO()
+        with (
+            patch.object(
+                cli_module,
+                "load_models",
+                return_value=SimpleNamespace(products={product.name: product for product in products}),
+            ),
+            patch.object(
+                cli_module,
+                "_discover_recent_gfs_retention_plans",
+                return_value=target_plans,
+            ),
+            patch.object(cli_module, "_matching_group_releases", return_value={}),
+            patch.object(cli_module, "_download_openmeteo_group_release", side_effect=fake_download),
+            patch.object(cli_module, "retain_group_release_from_mirror") as retain,
+            patch.object(cli_module, "prune_expired_group_releases", return_value=[]),
+            redirect_stdout(stdout),
+        ):
+            result = cli_module._reconcile_gfs_retention_window(args, SimpleNamespace())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "group": "gfs",
+                "status": "skipped",
+                "reason": "group already running",
+            },
+        )
+        retain.assert_not_called()
+
     def test_cams_reconcile_downloads_missing_runs_before_activation_and_prune(self):
         products = [
             SimpleNamespace(name=name)
@@ -586,6 +657,73 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             [("prune", None), ("download", runs[0]), ("activate", runs[0]), ("prune", None)],
         )
         self.assertEqual(prune.call_count, 2)
+
+    def test_cams_reconcile_reports_busy_group_without_false_incomplete_error(self):
+        products = [
+            SimpleNamespace(name=name)
+            for name in ("cams_global", "cams_global_greenhouse_gases")
+        ]
+        run = "2026071500"
+        target_plans = [
+            (
+                run,
+                {
+                    product.name: (
+                        None,
+                        [],
+                        SimpleNamespace(latest_complete_run=run),
+                    )
+                    for product in products
+                },
+            )
+        ]
+
+        def fake_download(*_args, **_kwargs):
+            print(
+                json.dumps(
+                    {
+                        "group": "cams",
+                        "status": "skipped",
+                        "reason": "group already running",
+                    }
+                )
+            )
+            return 0
+
+        args = SimpleNamespace(
+            config="models.json",
+            publish_openmeteo_group_to="/tmp/cams-reconcile-busy-api-test",
+            openmeteo_bucket_url="https://example.invalid",
+            retain_complete_releases=cli_module.CAMS_COMPLETE_RUN_RETENTION,
+        )
+        stdout = StringIO()
+        with (
+            patch.object(
+                cli_module,
+                "load_models",
+                return_value=SimpleNamespace(products={product.name: product for product in products}),
+            ),
+            patch.object(
+                cli_module,
+                "_discover_recent_complete_cams_ranked_plans",
+                return_value=target_plans,
+            ),
+            patch.object(cli_module, "_available_group_releases", return_value={}),
+            patch.object(cli_module, "_download_openmeteo_group_release", side_effect=fake_download),
+            patch.object(cli_module, "prune_expired_group_releases", return_value=[]),
+            redirect_stdout(stdout),
+        ):
+            result = cli_module._reconcile_cams_complete_runs(args, SimpleNamespace())
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "group": "cams",
+                "status": "skipped",
+                "reason": "group already running",
+            },
+        )
 
     def test_cams_group_manifest_accepts_independent_product_runs(self):
         with tempfile.TemporaryDirectory() as tmp:

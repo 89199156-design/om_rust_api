@@ -21,6 +21,8 @@ APP_DIR = Path("/opt/1panel/apps/weather_om_downloader")
 NATIVE_LIB = APP_DIR / "native" / "libom_turbopfor.so"
 CONFIG = APP_DIR / "config" / "models.json"
 PYTHON = Path("/usr/bin/python3")
+PROGRESS_REPORTER = APP_DIR / "scripts" / "task_progress_reporter.py"
+LOG_DIR = APP_DIR / "data" / "logs"
 PRODUCTS = (
     "gfs013_surface",
     "gfs025",
@@ -120,11 +122,9 @@ def download_group_script(
                     "PY",
                     "}",
                     'if [ "$(source_sync_status)" = "Enable" ]; then',
-                    "  printf '%s\\n' '{\"status\":\"skipped\",\"reason\":\"upstream source sync task enabled; direct download skipped\",\"group\":\""
-                    + group
-                    + "\",\"source_sync_task\":\""
-                    + source_sync_task
-                    + "\"}'",
+                    "  printf '%s\\n' '跳过｜任务："
+                    + group.upper()
+                    + " 下载｜原因：上游同步任务已启用'",
                     "  exit 0",
                     "fi",
                 ]
@@ -136,10 +136,21 @@ def download_group_script(
             f"  export OM_TURBOPFOR_LIB={shell_path(NATIVE_LIB)}",
             f"  {command}",
             "}",
+            "run_reported_download() {",
+            "  (",
+            "    trap 'task_rc=$?; trap - EXIT; printf \"\\036WEATHER_TASK_RC=%s\\n\" \"$task_rc\"; exit \"$task_rc\"' EXIT",
+            "    run_download",
+            "  ) 2>&1 | "
+            f"{shell_path(PYTHON)} {shell_path(PROGRESS_REPORTER)} "
+            f"--task {shlex.quote(group.upper() + ' 下载')} "
+            f"--watch-root {shell_path(APP_DIR / 'data')} "
+            "--watch-root /data/om_raw "
+            f"--log-file {shell_path(LOG_DIR / ('om_' + group + '_download.log'))}",
+            "}",
             'if [ "$(id -u)" -eq 0 ]; then',
-            '  exec sudo -H -u ubuntu bash -lc "$(declare -f run_download); run_download"',
+            '  exec sudo -H -u ubuntu bash -lc "$(declare -f run_download run_reported_download); run_reported_download"',
             "fi",
-            "run_download",
+            "run_reported_download",
             "",
         ]
     )

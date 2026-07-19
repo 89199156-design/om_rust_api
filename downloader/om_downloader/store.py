@@ -244,31 +244,33 @@ def _progress_log(context: dict | None, payload: dict, *, force: bool = False) -
     context["_last_progress_bytes"] = written_bytes
     context["_last_progress_remote_bytes"] = remote_downloaded_bytes
     context["_last_progress_time"] = now
-    log_payload = {
-        "stage": payload.get("stage"),
-        "product": context.get("product"),
-        "coverage_id": context.get("coverage_id"),
-        "planned_entries": int(payload.get("planned_entries", 0)),
-        "planned_ranges": int(payload.get("planned_ranges", 0)),
-        "downloaded_ranges": int(payload.get("downloaded_ranges", 0)),
-        "planned_http_ranges": int(payload.get("planned_http_ranges", payload.get("planned_ranges", 0))),
-        "downloaded_http_ranges": int(payload.get("downloaded_http_ranges", payload.get("downloaded_ranges", 0))),
-        "written_bytes": written_bytes,
-        "remote_downloaded_bytes": remote_downloaded_bytes,
-        "elapsed_seconds": round(elapsed, 3),
-        "average_mib_s": round(written_bytes / elapsed / 1024 / 1024, 3),
-        "current_mib_s": round(current_mib_s, 3),
-        "remote_average_mib_s": round(remote_downloaded_bytes / elapsed / 1024 / 1024, 3),
-        "remote_current_mib_s": round(remote_current_mib_s, 3),
-        "active_workers": int(payload.get("active_workers", 0)),
-        "range_workers": int(payload.get("range_workers", context.get("range_workers", 0) or 0)),
-        "planning_workers": int(context.get("planning_workers", 0) or 0),
-        "variable_plan_workers": int(context.get("variable_plan_workers", 0) or 0),
-        "queue_size": int(payload.get("queue_size", 0)),
-        "pending_futures": int(payload.get("pending_futures", 0)),
-        "reused_existing": bool(payload.get("reused_existing", False)),
-    }
-    print(json.dumps(log_payload, ensure_ascii=False), file=sys.stderr, flush=True)
+    stage_text = {
+        "planning": "分析下载范围",
+        "downloading": "下载文件",
+        "writing": "写入 OM 文件",
+    }.get(str(payload.get("stage") or ""), str(payload.get("stage") or "处理中"))
+    product_text = {
+        "gfs013_surface": "GFS 0.13°地面层",
+        "gfs025": "GFS 0.25°地面层",
+        "gfs_pressure_profile": "GFS 气压层",
+        "cams_global": "CAMS 全球空气质量",
+        "cams_global_greenhouse_gases": "CAMS 温室气体",
+    }.get(str(context.get("product") or ""), str(context.get("product") or "未知产品"))
+    interval_growth = max(remote_downloaded_bytes - last_remote_bytes, 0)
+    print(
+        "｜".join(
+            [
+                f"阶段：{stage_text}",
+                f"产品：{product_text}",
+                f"批次：{context.get('coverage_id') or '-'}",
+                f"近一分钟增长：{interval_growth / 1024 / 1024:.1f} MiB",
+                f"速度：{remote_current_mib_s:.2f} MiB/s",
+                f"累计下载：{remote_downloaded_bytes / 1024 / 1024:.1f} MiB",
+            ]
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
     return now
 
 

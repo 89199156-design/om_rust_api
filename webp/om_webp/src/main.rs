@@ -429,7 +429,16 @@ fn main() -> Result<()> {
     };
 
     let started = Instant::now();
+    let mut last_progress_at = Instant::now();
+    let mut last_progress_bytes = 0_u64;
+    let mut written_bytes = 0_u64;
     let batch = start.timestamp();
+    println!(
+        "开始｜阶段：生成 WebP｜类型：{}｜批次：{}｜总帧：{}",
+        args.scope.group().to_uppercase(),
+        ready.latest_complete_run,
+        times.len()
+    );
     for layer in &selected {
         fs::create_dir_all(product_staging.join(layer.name))?;
     }
@@ -438,7 +447,6 @@ fn main() -> Result<()> {
     }
     let total_invalid = std::sync::atomic::AtomicUsize::new(0);
     for (block_index, block_times) in times.chunks(args.series_block_hours).enumerate() {
-        let block_started = Instant::now();
         let rendered = pool
             .install(|| render_series_block(&snapshot, &decoder, &grid, &selected, block_times))?;
         for (offset, layers) in rendered.into_iter().enumerate() {
@@ -446,15 +454,7 @@ fn main() -> Result<()> {
             let time = block_times[offset];
             let stem = format!("{}_{}", time.timestamp(), batch);
             for layer in layers {
-                if layer.invalid_points > 0 {
-                    println!(
-                        "[om-webp-layer] scope={} frame={} layer={} invalid_points={}",
-                        args.scope.group(),
-                        frame_index + 1,
-                        layer.layer_name,
-                        layer.invalid_points
-                    );
-                }
+                written_bytes += layer.bytes.len() as u64;
                 fs::write(
                     product_staging
                         .join(layer.layer_name)
@@ -463,14 +463,25 @@ fn main() -> Result<()> {
                 )?;
                 total_invalid.fetch_add(layer.invalid_points, std::sync::atomic::Ordering::Relaxed);
             }
-            println!(
-                "[om-webp] scope={} frame={}/{} valid_time={} block_elapsed_ms={}",
-                args.scope.group(),
-                frame_index + 1,
-                times.len(),
-                time.to_rfc3339(),
-                block_started.elapsed().as_millis()
-            );
+            let progress_elapsed = last_progress_at.elapsed();
+            if progress_elapsed.as_secs() >= 60 {
+                let growth_bytes = written_bytes.saturating_sub(last_progress_bytes);
+                let speed_mib_s = growth_bytes as f64
+                    / progress_elapsed.as_secs_f64().max(0.001)
+                    / 1024.0
+                    / 1024.0;
+                println!(
+                    "进度｜阶段：生成 WebP｜类型：{}｜批次：{}｜帧：{}/{}｜近一分钟增长：{:.1} MiB｜速度：{:.2} MiB/s",
+                    args.scope.group().to_uppercase(),
+                    ready.latest_complete_run,
+                    frame_index + 1,
+                    times.len(),
+                    growth_bytes as f64 / 1024.0 / 1024.0,
+                    speed_mib_s
+                );
+                last_progress_at = Instant::now();
+                last_progress_bytes = written_bytes;
+            }
         }
     }
 
@@ -491,6 +502,11 @@ fn main() -> Result<()> {
             latest_ready.release_id
         );
     }
+    println!(
+        "阶段：发布 WebP｜类型：{}｜批次：{}",
+        args.scope.group().to_uppercase(),
+        ready.latest_complete_run
+    );
     fs::create_dir_all(
         release_root
             .parent()

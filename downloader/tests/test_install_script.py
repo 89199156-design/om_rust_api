@@ -79,9 +79,12 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("SOURCE_SYNC_TASK=OM_GFS_SOURCE_SYNC", scripts["OM_GFS_DOWNLOAD"])
         self.assertIn("SOURCE_SYNC_TASK=OM_CAMS_SOURCE_SYNC", scripts["OM_CAMS_DOWNLOAD"])
         self.assertIn(
-            "upstream source sync task enabled; direct download skipped",
+            "上游同步任务已启用",
             scripts["OM_GFS_DOWNLOAD"],
         )
+        self.assertIn("task_progress_reporter.py", scripts["OM_GFS_DOWNLOAD"])
+        self.assertIn("--task 'GFS 下载'", scripts["OM_GFS_DOWNLOAD"])
+        self.assertIn("--task 'CAMS 下载'", scripts["OM_CAMS_DOWNLOAD"])
         self.assertIn("--group gfs", scripts["OM_GFS_SOURCE_SYNC"])
         self.assertIn("--group cams", scripts["OM_CAMS_SOURCE_SYNC"])
         self.assertIn("--source-host ubuntu@example.com", scripts["OM_GFS_SOURCE_SYNC"])
