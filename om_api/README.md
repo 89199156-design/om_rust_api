@@ -126,7 +126,7 @@ Chinese AQI:
   it never combines partial download payloads. A day is omitted until its
   full required window is present.
 
-DEM and land-cell selection:
+DEM and grid-cell selection:
 
 - Point requests without an explicit `elevation` read Copernicus DEM90 from
   `OM_DEM_ROOT` before selecting model cells and applying elevation correction.
@@ -137,9 +137,13 @@ DEM and land-cell selection:
   verifies the product-region contract: non-empty
   `copernicus_dem90/static/lat_0.om` through `lat_58.om` (59 files). Missing or
   empty chunks stop installation without restarting the existing service.
-- The current service only supports `cell_selection=nearest`.
-- `cell_selection=land` is intentionally rejected until DEM/static grid
-  selection data is wired in.
+- `cell_selection` accepts `land` (the default), `sea`, and `nearest`. With the
+  official OM decoder loaded, all three modes use the product's compatible
+  static surface-elevation grid to resolve model sampling.
+- Explicit `cell_selection=land` and `cell_selection=sea` requests fail closed
+  when the official decoder or required static grid-selection data is
+  unavailable. An explicit `elevation` skips the DEM90 lookup, but it does not
+  remove the decoder/static-grid requirement for those selection modes.
 - When DEM is needed, first copy the Singapore production DEM/static grid data
   that belongs to the recorded Open-Meteo baseline.
 - If that DEM package is not suitable for the Rust service format, resolution,
