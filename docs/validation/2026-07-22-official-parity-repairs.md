@@ -85,8 +85,32 @@ also incorrect because it discarded a finite pre-recovery C at evening edges.
 
 The repair mirrors the official assignment point and ordering. The paired
 regressions cover both sides of the boundary:
-`sparse_solar_interpolation_keeps_official_nan_d_at_night` and
-`sparse_solar_interpolation_copies_finite_pre_recovery_c_to_nighttime_d`.
+`sparse_solar_full_series_keeps_official_nan_d_at_night` and
+`sparse_solar_full_series_copies_finite_pre_recovery_c_to_nighttime_d`.
+
+## GFS sparse solar interpolation across successive intervals
+
+The next strict Shanghai mismatch was point 4
+(`9.899124,137.8125`) at `2026-07-31T01:00Z`: official
+`apparent_temperature=32.1`, former clone `31.2`. Temperature, humidity and
+wind inputs were identical. Official `sunshine_duration=3600` and
+`uv_index=5.6`, while the clone returned zero for both, isolating the mismatch
+to the solar source series.
+
+The former sparse reader evaluated every requested hour from four raw source
+frames. That is not equivalent to the official implementation. The official
+function walks the complete hourly array from left to right, fills each missing
+interval, and then deaverages C in place. That processed C becomes A or B for a
+later interval. The difference is material at sunrise and sunset even when the
+same four raw frames are visible around the requested hour.
+
+The repair ports that complete sequential operation, including the 12-hour
+lookahead, clearness-index recovery order, negative-Hermite fallback, and
+in-place C deaveraging. Dense hourly products bypass the sparse path. The
+regression `sparse_solar_full_series_reuses_deaveraged_values_sequentially`
+proves that a processed C is reused by the next interval; the paired nighttime
+regression preserves the earlier boundary behavior. No coordinate, timestamp,
+API value, or test-only alignment is encoded.
 
 ## Verification contract
 

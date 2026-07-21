@@ -3619,7 +3619,7 @@ fn read_direct_grid_series(
             .take(2)
             .collect::<Vec<_>>();
         if let Some(first) = full_products.first() {
-            if let Some(mut values) = read_exact_native_grid_series(
+            if let Some(mut values) = read_gfs_product_grid_series(
                 first,
                 decoder,
                 variable,
@@ -3634,7 +3634,7 @@ fn read_direct_grid_series(
                     .any(|frame| frame.iter().any(|value| value.is_nan()))
                 {
                     if let Some(previous) = full_products.get(1) {
-                        if let Some(fallback_frames) = read_exact_native_grid_series(
+                        if let Some(fallback_frames) = read_gfs_product_grid_series(
                             previous,
                             decoder,
                             variable,
@@ -4122,6 +4122,46 @@ fn read_exact_native_grid_series(
         }
     }
     Ok(Some(output))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_product_grid_series(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    variable: &str,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if let InterpolationKind::SolarBackwardsAveraged { scalefactor } =
+        interpolation_kind_for_variable(variable)
+    {
+        if let Some(values) = read_sparse_solar_grid_series(
+            product,
+            decoder,
+            variable,
+            raw_variable,
+            times,
+            latitudes,
+            longitudes,
+            scalefactor,
+            round_values,
+        )? {
+            return Ok(Some(values));
+        }
+    }
+    read_exact_native_grid_series(
+        product,
+        decoder,
+        variable,
+        raw_variable,
+        times,
+        latitudes,
+        longitudes,
+        round_values,
+    )
 }
 
 fn read_native_entry_grid_time_range(
@@ -4631,189 +4671,228 @@ fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) ->
         .max(0.0)
 }
 
-fn solar_average_between(
-    start_exclusive: DateTime<Utc>,
-    end_inclusive: DateTime<Utc>,
+/// Port of Open-Meteo's `interpolateInplaceSolarBackwards` for one hourly
+/// location series. The source algorithm is deliberately sequential: after a
+/// sparse interval is filled, its C value is deaveraged in place and becomes
+/// the already-processed A/B input of later intervals. A pointwise four-frame
+/// calculation cannot reproduce sunrise and sunset boundaries.
+fn interpolate_solar_backwards_in_place(
+    values: &mut [f32],
+    start: DateTime<Utc>,
     latitude: f64,
     longitude: f64,
-) -> f32 {
-    let hours = (end_inclusive - start_exclusive).num_hours();
-    if hours <= 0 {
-        return solar_factor_backwards(end_inclusive, latitude, longitude);
+) {
+    if values.is_empty() || !values.iter().any(|value| value.is_nan()) {
+        return;
     }
-    (1..=hours)
-        .map(|hour| {
-            solar_factor_backwards(start_exclusive + Duration::hours(hour), latitude, longitude)
+
+    let mut first_valid = values.len();
+    for (time_index, value) in values.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if first_valid == values.len() {
+            first_valid = time_index;
+            continue;
+        }
+        first_valid = first_valid.saturating_sub(time_index - first_valid - 1);
+        break;
+    }
+    if first_valid >= values.len() {
+        return;
+    }
+
+    let solar = (0..values.len())
+        .map(|index| {
+            solar_factor_backwards(start + Duration::hours(index as i64), latitude, longitude)
         })
-        .sum::<f32>()
-        / hours as f32
+        .collect::<Vec<_>>();
+    let radiation_limit = SOLAR_CONSTANT * 0.95;
+    let radiation_minimum = 5.0 / SOLAR_CONSTANT;
+    let official_max_zero = |value: f32| if value.is_nan() { 0.0 } else { value.max(0.0) };
+
+    for missing in first_valid..values.len() {
+        if !values[missing].is_nan() {
+            continue;
+        }
+        // Official input ranges contain a valid padding value before the first
+        // interpolated hour. Avoid an invalid B index for malformed standalone
+        // data while preserving the production path.
+        if missing == 0 {
+            break;
+        }
+        let pos_b = missing - 1;
+        let search_end = (missing + 14).min(values.len());
+        let Some(pos_c) = ((missing + 1)..search_end).find(|index| !values[*index].is_nan()) else {
+            break;
+        };
+        let raw_b = values[pos_b];
+        let raw_c = values[pos_c];
+        let width = pos_c - pos_b;
+        let pos_a = pos_b.checked_sub(width);
+        let pos_d = pos_c
+            .checked_add(width)
+            .filter(|index| *index < values.len());
+        let four_point = pos_a
+            .zip(pos_d)
+            .filter(|(a, d)| !values[*a].is_nan() && !values[*d].is_nan());
+
+        let solar_b = solar[pos_b];
+        let solar_c = solar[pos_c];
+        let solar_average_c = solar[(pos_b + 1)..=pos_c].iter().sum::<f32>() / width as f32;
+        let mut kt_c = if solar_average_c <= radiation_minimum {
+            f32::NAN
+        } else {
+            (raw_c / solar_average_c).min(radiation_limit)
+        };
+        let mut kt_b = if solar_b <= radiation_minimum || raw_b.is_nan() {
+            kt_c
+        } else {
+            (raw_b / solar_b).min(radiation_limit)
+        };
+
+        // ktD must be assigned from the pre-recovery ktC. This is the exact
+        // ordering in the official Swift implementation.
+        let (mut kt_a, kt_d) = if let Some((pos_a, pos_d)) = four_point {
+            let kt_a = if solar[pos_a] <= radiation_minimum {
+                kt_b
+            } else {
+                (values[pos_a] / solar[pos_a]).min(radiation_limit)
+            };
+            let solar_average_d = solar[(pos_c + 1)..=pos_d].iter().sum::<f32>() / width as f32;
+            let kt_d = if solar_average_d <= radiation_minimum {
+                kt_c
+            } else {
+                (values[pos_d] / solar_average_d).min(radiation_limit)
+            };
+            (kt_a, kt_d)
+        } else {
+            (kt_b, kt_c)
+        };
+
+        if kt_c.is_nan() && kt_b > 0.0 {
+            kt_c = kt_b;
+        }
+        if kt_c.is_nan() && kt_a > 0.0 {
+            kt_b = kt_a;
+            kt_c = kt_a;
+        }
+        if kt_c.is_nan() && kt_d > 0.0 {
+            kt_a = kt_d;
+            kt_b = kt_d;
+            kt_c = kt_d;
+        }
+
+        let coefficient_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
+        let coefficient_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
+        let coefficient_c = -kt_a / 2.0 + kt_c / 2.0;
+        for target in missing..pos_c {
+            let fraction = (target - pos_b) as f32 / width as f32;
+            let kt = coefficient_a * fraction * fraction * fraction
+                + coefficient_b * fraction * fraction
+                + coefficient_c * fraction
+                + kt_b;
+            values[target] = if kt < 0.0 && raw_b >= 0.0 && raw_c >= 0.0 {
+                (kt_b * (1.0 - fraction) + kt_c * fraction) * solar[target]
+            } else {
+                official_max_zero(kt) * solar[target]
+            };
+        }
+        values[pos_c] = official_max_zero(kt_c) * solar_c;
+    }
 }
 
-fn solar_average_for_native_time(
-    native_times: &[DateTime<Utc>],
-    index: usize,
-    latitude: f64,
-    longitude: f64,
-) -> f32 {
-    if index == 0 || native_times[index] - native_times[index - 1] <= Duration::hours(1) {
-        return solar_factor_backwards(native_times[index], latitude, longitude);
-    }
-    solar_average_between(
-        native_times[index - 1],
-        native_times[index],
-        latitude,
-        longitude,
-    )
-}
-
-fn solar_interpolation_segment(
-    native_times: &[DateTime<Utc>],
-    time: DateTime<Utc>,
-) -> Option<(usize, usize, f32)> {
-    if native_times.is_empty()
-        || time < native_times[0]
-        || time > *native_times.last().expect("checked not empty")
-    {
-        return None;
-    }
-    match native_times.binary_search(&time) {
-        Ok(index)
-            if index > 0 && native_times[index] - native_times[index - 1] > Duration::hours(1) =>
-        {
-            Some((index - 1, index, 1.0))
-        }
-        Ok(index) => Some((index, index, 0.0)),
-        Err(next) if next > 0 && next < native_times.len() => {
-            let left = next - 1;
-            let seconds = (native_times[next] - native_times[left]).num_seconds();
-            if seconds <= 0 {
-                return None;
-            }
-            Some((
-                left,
-                next,
-                (time - native_times[left]).num_seconds() as f32 / seconds as f32,
-            ))
-        }
-        _ => None,
-    }
+fn sparse_solar_first_missing_hour(native_times: &[DateTime<Utc>]) -> Option<DateTime<Utc>> {
+    native_times.windows(2).find_map(|pair| {
+        (pair[1] - pair[0] > Duration::hours(1)).then_some(pair[0] + Duration::hours(1))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn solar_backwards_sample(
-    native_times: &[DateTime<Utc>],
-    left: usize,
-    right: usize,
-    fraction: f32,
-    raw_a: Option<f32>,
-    raw_b: f32,
-    raw_c: f32,
-    raw_d: Option<f32>,
-    latitude: f64,
-    longitude: f64,
+fn read_sparse_solar_grid_series(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    variable: &str,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
     scalefactor: f32,
     round_values: bool,
-) -> f32 {
-    if left == right {
-        return maybe_round_to_scalefactor(raw_b, scalefactor, round_values);
-    }
-    // The source value at C is a backwards average covering every missing
-    // hourly step after B. This mirrors Open-Meteo's
-    // interpolateInplaceSolarBackwards(missingValuesAreBackwardsAveraged: true).
-    if !raw_b.is_finite() || !raw_c.is_finite() {
-        return f32::NAN;
-    }
-    let time_b = native_times[left];
-    let time_c = native_times[right];
-    let stride = time_c - time_b;
-    let time_a = time_b - stride;
-    let time_d = time_c + stride;
-    let index_a = native_times.binary_search(&time_a).ok();
-    let index_d = native_times.binary_search(&time_d).ok();
-
-    let solar_b = solar_factor_backwards(time_b, latitude, longitude);
-    let solar_target = solar_factor_backwards(
-        time_b + Duration::seconds((stride.num_seconds() as f32 * fraction).round() as i64),
-        latitude,
-        longitude,
-    );
-    let solar_average_b = solar_average_for_native_time(native_times, left, latitude, longitude);
-    let solar_average_c = solar_average_between(time_b, time_c, latitude, longitude);
-    let radiation_limit = SOLAR_CONSTANT * 0.95;
-    let radiation_minimum = 5.0 / SOLAR_CONSTANT;
-
-    let bounded_kt = |value: f32, solar: f32| {
-        if !value.is_finite() || solar <= radiation_minimum {
-            f32::NAN
-        } else {
-            (value / solar).min(radiation_limit)
-        }
+) -> Result<Option<Vec<Vec<f32>>>> {
+    let native_times = native_times_for_variable(product, raw_variable);
+    let Some(first_missing) = sparse_solar_first_missing_hour(&native_times) else {
+        return Ok(None);
     };
-
-    let mut kt_c = bounded_kt(raw_c, solar_average_c);
-    let mut kt_b = if solar_b <= radiation_minimum {
-        kt_c
+    if !times.iter().any(|time| *time >= first_missing) {
+        return Ok(None);
+    }
+    let Some(first_native) = native_times.first().copied() else {
+        return Ok(None);
+    };
+    let last_native = *native_times.last().expect("checked non-empty native times");
+    let raw_frames = if let Some(frames) = read_exact_native_grid_series(
+        product,
+        decoder,
+        variable,
+        raw_variable,
+        &native_times,
+        latitudes,
+        longitudes,
+        false,
+    )? {
+        frames
     } else {
-        bounded_kt(raw_b, solar_average_b)
+        native_times
+            .iter()
+            .map(|time| {
+                read_native_grid(product, decoder, raw_variable, *time, latitudes, longitudes)
+            })
+            .collect::<Result<Vec<_>>>()?
     };
-    let mut kt_a = match (index_a, raw_a) {
-        (Some(index), Some(value)) if value.is_finite() => {
-            let solar_a = solar_factor_backwards(time_a, latitude, longitude);
-            if solar_a <= radiation_minimum {
-                kt_b
-            } else {
-                bounded_kt(
-                    value,
-                    solar_average_for_native_time(native_times, index, latitude, longitude),
-                )
-            }
+    let grid_len = latitudes.len() * longitudes.len();
+    let expanded_len = usize::try_from((last_native - first_native).num_hours() + 1)?;
+    let mut expanded = vec![vec![f32::NAN; grid_len]; expanded_len];
+    for (native_time, frame) in native_times.iter().zip(raw_frames) {
+        let elapsed = (*native_time - first_native).num_seconds();
+        if elapsed < 0 || elapsed % 3600 != 0 || frame.len() != grid_len {
+            bail!("sparse solar native series is not aligned to the hourly grid");
         }
-        _ => kt_b,
-    };
-    let kt_d = match (index_d, raw_d) {
-        (Some(index), Some(value)) if value.is_finite() => {
-            let solar_average_d =
-                solar_average_for_native_time(native_times, index, latitude, longitude);
-            // Open-Meteo assigns the current (pre-recovery) ktC here when D
-            // is below the solar minimum. This ordering matters: ktC may be
-            // recovered from B/A below, while ktD must retain the earlier
-            // NaN at the nighttime boundary.
-            if solar_average_d <= radiation_minimum {
-                kt_c
-            } else {
-                (value / solar_average_d).min(radiation_limit)
-            }
-        }
-        _ => kt_c,
-    };
+        expanded[usize::try_from(elapsed / 3600)?] = frame;
+    }
 
-    if kt_c.is_nan() && kt_b > 0.0 {
-        kt_c = kt_b;
+    let width = longitudes.len();
+    for point in 0..grid_len {
+        let mut point_values = expanded
+            .iter()
+            .map(|frame| frame[point])
+            .collect::<Vec<_>>();
+        interpolate_solar_backwards_in_place(
+            &mut point_values,
+            first_native,
+            latitudes[point / width],
+            longitudes[point % width],
+        );
+        for (frame, value) in expanded.iter_mut().zip(point_values) {
+            frame[point] = value;
+        }
     }
-    if kt_c.is_nan() && kt_a > 0.0 {
-        kt_b = kt_a;
-        kt_c = kt_a;
-    }
-    if kt_c.is_nan() && kt_d > 0.0 {
-        kt_a = kt_d;
-        kt_b = kt_d;
-        kt_c = kt_d;
-    }
-    let coeff_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
-    let coeff_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
-    let coeff_c = -kt_a / 2.0 + kt_c / 2.0;
-    let kt = coeff_a * fraction * fraction * fraction
-        + coeff_b * fraction * fraction
-        + coeff_c * fraction
-        + kt_b;
-    let value = if kt < 0.0 && raw_b >= 0.0 && raw_c >= 0.0 {
-        (kt_b * (1.0 - fraction) + kt_c * fraction) * solar_target
-    } else if kt.is_finite() {
-        kt.max(0.0) * solar_target
-    } else {
-        0.0
-    };
-    maybe_round_to_scalefactor(value, scalefactor, round_values)
+
+    Ok(Some(
+        times
+            .iter()
+            .map(|time| {
+                let elapsed = (*time - first_native).num_seconds();
+                if elapsed < 0 || elapsed % 3600 != 0 || *time > last_native {
+                    return vec![f32::NAN; grid_len];
+                }
+                expanded[usize::try_from(elapsed / 3600).expect("checked non-negative hour")]
+                    .iter()
+                    .map(|value| maybe_round_to_scalefactor(*value, scalefactor, round_values))
+                    .collect()
+            })
+            .collect(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4828,76 +4907,54 @@ fn read_solar_backwards_value(
     round_values: bool,
 ) -> Result<f32> {
     let native_times = native_times_for_variable(product, raw_variable);
-    let Some((left, right, fraction)) = solar_interpolation_segment(&native_times, time) else {
-        return Ok(f32::NAN);
-    };
     let (latitude, longitude) = current_product_sampling(&product.product)
         .map(|sampling| (sampling.latitude, sampling.longitude))
         .unwrap_or((latitude, longitude));
-    let raw_b = read_native_value(
-        product,
-        decoder,
-        raw_variable,
-        native_times[left],
-        latitude,
-        longitude,
-    )?;
-    if left == right {
-        return Ok(maybe_round_to_scalefactor(raw_b, scalefactor, round_values));
+    if sparse_solar_first_missing_hour(&native_times).is_some_and(|first| time >= first) {
+        let first_native = *native_times
+            .first()
+            .context("sparse solar series is empty")?;
+        let last_native = *native_times
+            .last()
+            .context("sparse solar series is empty")?;
+        if time < first_native
+            || time > last_native
+            || (time - first_native).num_seconds() % 3600 != 0
+        {
+            return Ok(f32::NAN);
+        }
+        let mut expanded =
+            vec![f32::NAN; usize::try_from((last_native - first_native).num_hours() + 1)?];
+        for native_time in &native_times {
+            let index = usize::try_from((*native_time - first_native).num_hours())?;
+            expanded[index] = read_native_value(
+                product,
+                decoder,
+                raw_variable,
+                *native_time,
+                latitude,
+                longitude,
+            )?;
+        }
+        interpolate_solar_backwards_in_place(&mut expanded, first_native, latitude, longitude);
+        return Ok(maybe_round_to_scalefactor(
+            expanded[usize::try_from((time - first_native).num_hours())?],
+            scalefactor,
+            round_values,
+        ));
     }
-    let raw_c = read_native_value(
+    let Ok(index) = native_times.binary_search(&time) else {
+        return Ok(f32::NAN);
+    };
+    let value = read_native_value(
         product,
         decoder,
         raw_variable,
-        native_times[right],
+        native_times[index],
         latitude,
         longitude,
     )?;
-    let stride = native_times[right] - native_times[left];
-    let index_a = native_times
-        .binary_search(&(native_times[left] - stride))
-        .ok();
-    let index_d = native_times
-        .binary_search(&(native_times[right] + stride))
-        .ok();
-    let raw_a = index_a
-        .map(|index| {
-            read_native_value(
-                product,
-                decoder,
-                raw_variable,
-                native_times[index],
-                latitude,
-                longitude,
-            )
-        })
-        .transpose()?;
-    let raw_d = index_d
-        .map(|index| {
-            read_native_value(
-                product,
-                decoder,
-                raw_variable,
-                native_times[index],
-                latitude,
-                longitude,
-            )
-        })
-        .transpose()?;
-    Ok(solar_backwards_sample(
-        &native_times,
-        left,
-        right,
-        fraction,
-        raw_a,
-        raw_b,
-        raw_c,
-        raw_d,
-        latitude,
-        longitude,
-        scalefactor,
-        round_values,
-    ))
+    Ok(maybe_round_to_scalefactor(value, scalefactor, round_values))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4912,85 +4969,33 @@ fn read_solar_backwards_grid(
     round_values: bool,
 ) -> Result<Vec<f32>> {
     let native_times = native_times_for_variable(product, raw_variable);
-    let Some((left, right, fraction)) = solar_interpolation_segment(&native_times, time) else {
+    if let Some(mut frames) = read_sparse_solar_grid_series(
+        product,
+        decoder,
+        raw_variable,
+        raw_variable,
+        &[time],
+        latitudes,
+        longitudes,
+        scalefactor,
+        round_values,
+    )? {
+        return Ok(frames.remove(0));
+    }
+    let Ok(index) = native_times.binary_search(&time) else {
         return Ok(vec![f32::NAN; latitudes.len() * longitudes.len()]);
     };
-    let raw_b = read_native_grid(
+    let values = read_native_grid(
         product,
         decoder,
         raw_variable,
-        native_times[left],
+        native_times[index],
         latitudes,
         longitudes,
     )?;
-    if left == right {
-        return Ok(raw_b
-            .into_iter()
-            .map(|value| maybe_round_to_scalefactor(value, scalefactor, round_values))
-            .collect());
-    }
-    let raw_c = read_native_grid(
-        product,
-        decoder,
-        raw_variable,
-        native_times[right],
-        latitudes,
-        longitudes,
-    )?;
-    let stride = native_times[right] - native_times[left];
-    let index_a = native_times
-        .binary_search(&(native_times[left] - stride))
-        .ok();
-    let index_d = native_times
-        .binary_search(&(native_times[right] + stride))
-        .ok();
-    let raw_a = index_a
-        .map(|index| {
-            read_native_grid(
-                product,
-                decoder,
-                raw_variable,
-                native_times[index],
-                latitudes,
-                longitudes,
-            )
-        })
-        .transpose()?;
-    let raw_d = index_d
-        .map(|index| {
-            read_native_grid(
-                product,
-                decoder,
-                raw_variable,
-                native_times[index],
-                latitudes,
-                longitudes,
-            )
-        })
-        .transpose()?;
-    let width = longitudes.len();
-    Ok(raw_b
+    Ok(values
         .into_iter()
-        .zip(raw_c)
-        .enumerate()
-        .map(|(index, (raw_b, raw_c))| {
-            let latitude = latitudes[index / width];
-            let longitude = longitudes[index % width];
-            solar_backwards_sample(
-                &native_times,
-                left,
-                right,
-                fraction,
-                raw_a.as_ref().map(|values| values[index]),
-                raw_b,
-                raw_c,
-                raw_d.as_ref().map(|values| values[index]),
-                latitude,
-                longitude,
-                scalefactor,
-                round_values,
-            )
-        })
+        .map(|value| maybe_round_to_scalefactor(value, scalefactor, round_values))
         .collect())
 }
 
@@ -6721,50 +6726,54 @@ mod tests {
     }
 
     #[test]
-    fn sparse_solar_interpolation_keeps_official_nan_d_at_night() {
+    fn sparse_solar_full_series_keeps_official_nan_d_at_night() {
         let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
-        let native_times = (0..4)
-            .map(|index| start + Duration::hours(index * 3))
-            .collect::<Vec<_>>();
-        let value = solar_backwards_sample(
-            &native_times,
-            1,
-            2,
-            1.0 / 3.0,
-            Some(100.0),
-            100.0,
-            0.0,
-            Some(0.0),
-            50.315_66,
-            107.929_69,
-            20.0,
-            true,
-        );
-        assert_eq!(value, 0.0);
+        let mut values = vec![f32::NAN; 10];
+        values[0] = 100.0;
+        values[3] = 100.0;
+        values[6] = 0.0;
+        values[9] = 0.0;
+
+        interpolate_solar_backwards_in_place(&mut values, start, 50.315_66, 107.929_69);
+
+        assert_eq!(values[4], 0.0);
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 
     #[test]
-    fn sparse_solar_interpolation_copies_finite_pre_recovery_c_to_nighttime_d() {
+    fn sparse_solar_full_series_copies_finite_pre_recovery_c_to_nighttime_d() {
         let start = Utc.with_ymd_and_hms(2026, 7, 26, 6, 0, 0).unwrap();
-        let native_times = (0..4)
-            .map(|index| start + Duration::hours(index * 3))
-            .collect::<Vec<_>>();
-        let value = solar_backwards_sample(
-            &native_times,
-            1,
-            2,
-            1.0 / 3.0,
-            Some(100.0),
-            100.0,
-            100.0,
-            Some(0.0),
-            6.853_241,
-            132.656_25,
-            20.0,
-            true,
-        );
-        assert!(value.is_finite());
-        assert!(value > 0.0);
+        let mut values = vec![f32::NAN; 10];
+        values[0] = 100.0;
+        values[3] = 100.0;
+        values[6] = 100.0;
+        values[9] = 0.0;
+
+        interpolate_solar_backwards_in_place(&mut values, start, 6.853_241, 132.656_25);
+
+        assert!(values[4].is_finite());
+        assert!(values[4] > 0.0);
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn sparse_solar_full_series_reuses_deaveraged_values_sequentially() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 30, 18, 0, 0).unwrap();
+        let mut values = vec![f32::NAN; 13];
+        for index in [0, 3, 6, 9, 12] {
+            values[index] = 100.0;
+        }
+        let raw_b = values[6];
+
+        interpolate_solar_backwards_in_place(&mut values, start, 9.899_124, 137.812_5);
+
+        // 00 UTC is C of the preceding interval and B of the interval that
+        // contains 01 UTC. Official processing deaverages it before the later
+        // interval is evaluated.
+        assert_ne!(values[6], raw_b);
+        assert!(values[7].is_finite());
+        assert!(values[7] > 0.0);
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 
     #[test]
