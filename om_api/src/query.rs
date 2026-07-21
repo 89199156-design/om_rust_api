@@ -5376,20 +5376,6 @@ fn read_optional_direct(
     }
 }
 
-fn read_optional_direct_unrounded(
-    snapshot: &OmDataSnapshot,
-    decoder: Option<&OfficialDecoder>,
-    variable: &str,
-    time: DateTime<Utc>,
-    latitude: f64,
-    longitude: f64,
-) -> Result<Option<f32>> {
-    match read_direct_unrounded(snapshot, decoder, variable, time, latitude, longitude) {
-        Ok(value) => Ok(Some(value)),
-        Err(_) => Ok(None),
-    }
-}
-
 fn product_for_variable(
     snapshot: &OmDataSnapshot,
     variable: &str,
@@ -6813,7 +6799,7 @@ fn entry_range_reader(product: &ProductSnapshot, entry: &BundleEntry) -> Result<
     })
 }
 
-fn read_optional_direct_grid_series_unrounded(
+fn read_optional_direct_grid_series_rounded(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     variable: &str,
@@ -6822,7 +6808,7 @@ fn read_optional_direct_grid_series_unrounded(
     longitudes: &[f64],
 ) -> Result<Option<Vec<Vec<f32>>>> {
     match read_direct_grid_series(
-        snapshot, decoder, variable, times, latitudes, longitudes, false,
+        snapshot, decoder, variable, times, latitudes, longitudes, true,
     ) {
         Ok(values) => Ok(Some(values)),
         Err(_) => Ok(None),
@@ -6864,12 +6850,12 @@ fn read_weather_code_grid_series(
         true,
     )?;
     let showers = read_direct_grid_series(
-        snapshot, decoder, "showers", times, latitudes, longitudes, false,
+        snapshot, decoder, "showers", times, latitudes, longitudes, true,
     )?;
-    let cape = read_optional_direct_grid_series_unrounded(
+    let cape = read_optional_direct_grid_series_rounded(
         snapshot, decoder, "cape", times, latitudes, longitudes,
     )?;
-    let gusts = read_optional_direct_grid_series_unrounded(
+    let gusts = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "wind_gusts_10m",
@@ -6877,7 +6863,7 @@ fn read_weather_code_grid_series(
         latitudes,
         longitudes,
     )?;
-    let visibility = read_optional_direct_grid_series_unrounded(
+    let visibility = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "visibility",
@@ -6885,7 +6871,7 @@ fn read_weather_code_grid_series(
         latitudes,
         longitudes,
     )?;
-    let freezing_rain = read_optional_direct_grid_series_unrounded(
+    let freezing_rain = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "categorical_freezing_rain",
@@ -6893,7 +6879,7 @@ fn read_weather_code_grid_series(
         latitudes,
         longitudes,
     )?;
-    let lifted_index = read_optional_direct_grid_series_unrounded(
+    let lifted_index = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "lifted_index",
@@ -6901,7 +6887,7 @@ fn read_weather_code_grid_series(
         latitudes,
         longitudes,
     )?;
-    let cin = read_optional_direct_grid_series_unrounded(
+    let cin = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "convective_inhibition",
@@ -6909,7 +6895,7 @@ fn read_weather_code_grid_series(
         latitudes,
         longitudes,
     )?;
-    let pbl = read_optional_direct_grid_series_unrounded(
+    let pbl = read_optional_direct_grid_series_rounded(
         snapshot,
         decoder,
         "boundary_layer_height",
@@ -6978,7 +6964,7 @@ fn read_weather_code_grid_series(
     Ok(output)
 }
 
-fn read_optional_direct_grid_unrounded(
+fn read_optional_direct_grid_rounded(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     variable: &str,
@@ -6987,7 +6973,7 @@ fn read_optional_direct_grid_unrounded(
     longitudes: &[f64],
 ) -> Result<Option<Vec<f32>>> {
     match read_direct_grid(
-        snapshot, decoder, variable, time, latitudes, longitudes, false,
+        snapshot, decoder, variable, time, latitudes, longitudes, true,
     ) {
         Ok(values) => Ok(Some(values)),
         Err(_) => Ok(None),
@@ -7029,12 +7015,11 @@ fn read_weather_code_grid(
         true,
     )?;
     let showers = read_direct_grid(
-        snapshot, decoder, "showers", time, latitudes, longitudes, false,
+        snapshot, decoder, "showers", time, latitudes, longitudes, true,
     )?;
-    let cape = read_optional_direct_grid_unrounded(
-        snapshot, decoder, "cape", time, latitudes, longitudes,
-    )?;
-    let gusts = read_optional_direct_grid_unrounded(
+    let cape =
+        read_optional_direct_grid_rounded(snapshot, decoder, "cape", time, latitudes, longitudes)?;
+    let gusts = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "wind_gusts_10m",
@@ -7042,7 +7027,7 @@ fn read_weather_code_grid(
         latitudes,
         longitudes,
     )?;
-    let visibility = read_optional_direct_grid_unrounded(
+    let visibility = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "visibility",
@@ -7050,7 +7035,7 @@ fn read_weather_code_grid(
         latitudes,
         longitudes,
     )?;
-    let freezing_rain = read_optional_direct_grid_unrounded(
+    let freezing_rain = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "categorical_freezing_rain",
@@ -7058,7 +7043,7 @@ fn read_weather_code_grid(
         latitudes,
         longitudes,
     )?;
-    let lifted_index = read_optional_direct_grid_unrounded(
+    let lifted_index = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "lifted_index",
@@ -7066,7 +7051,7 @@ fn read_weather_code_grid(
         latitudes,
         longitudes,
     )?;
-    let cin = read_optional_direct_grid_unrounded(
+    let cin = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "convective_inhibition",
@@ -7074,7 +7059,7 @@ fn read_weather_code_grid(
         latitudes,
         longitudes,
     )?;
-    let pbl = read_optional_direct_grid_unrounded(
+    let pbl = read_optional_direct_grid_rounded(
         snapshot,
         decoder,
         "boundary_layer_height",
@@ -7157,10 +7142,9 @@ fn read_weather_code(
         latitude,
         longitude,
     )? * 0.7;
-    let showers = read_direct_unrounded(snapshot, decoder, "showers", time, latitude, longitude)?;
-    let cape =
-        read_optional_direct_unrounded(snapshot, decoder, "cape", time, latitude, longitude)?;
-    let gusts = read_optional_direct_unrounded(
+    let showers = read_direct(snapshot, decoder, "showers", time, latitude, longitude)?;
+    let cape = read_optional_direct(snapshot, decoder, "cape", time, latitude, longitude)?;
+    let gusts = read_optional_direct(
         snapshot,
         decoder,
         "wind_gusts_10m",
@@ -7169,8 +7153,8 @@ fn read_weather_code(
         longitude,
     )?;
     let visibility =
-        read_optional_direct_unrounded(snapshot, decoder, "visibility", time, latitude, longitude)?;
-    let freezing_rain = read_optional_direct_unrounded(
+        read_optional_direct(snapshot, decoder, "visibility", time, latitude, longitude)?;
+    let freezing_rain = read_optional_direct(
         snapshot,
         decoder,
         "categorical_freezing_rain",
@@ -7178,15 +7162,9 @@ fn read_weather_code(
         latitude,
         longitude,
     )?;
-    let lifted_index = read_optional_direct_unrounded(
-        snapshot,
-        decoder,
-        "lifted_index",
-        time,
-        latitude,
-        longitude,
-    )?;
-    let cin = read_optional_direct_unrounded(
+    let lifted_index =
+        read_optional_direct(snapshot, decoder, "lifted_index", time, latitude, longitude)?;
+    let cin = read_optional_direct(
         snapshot,
         decoder,
         "convective_inhibition",
@@ -7194,7 +7172,7 @@ fn read_weather_code(
         latitude,
         longitude,
     )?;
-    let pbl = read_optional_direct_unrounded(
+    let pbl = read_optional_direct(
         snapshot,
         decoder,
         "boundary_layer_height",

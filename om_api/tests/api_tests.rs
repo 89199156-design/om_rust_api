@@ -1473,7 +1473,7 @@ async fn forecast_endpoint_hides_radiation_and_internal_wind_components() {
 }
 
 #[tokio::test]
-async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipitation() {
+async fn forecast_endpoint_rounds_weather_code_inputs_before_deriving() {
     let root = tempfile::tempdir().unwrap();
     let gfs013 = write_product(
         root.path(),
@@ -1485,15 +1485,19 @@ async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipi
             },
             TestEntry {
                 variable: "precipitation",
-                values: [0.49, 0.0, 0.0, 0.0],
+                values: [1.5, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "showers",
-                values: [0.49, 0.0, 0.0, 0.0],
+                values: [1.266_666_7, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "snowfall_water_equivalent",
                 values: [0.0, 0.0, 0.0, 0.0],
+            },
+            TestEntry {
+                variable: "boundary_layer_height",
+                values: [300.0, 0.0, 0.0, 0.0],
             },
         ],
     );
@@ -1503,27 +1507,23 @@ async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipi
         vec![
             TestEntry {
                 variable: "wind_gusts_10m",
-                values: [11.0, 0.0, 0.0, 0.0],
+                values: [5.04, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "cape",
-                values: [2500.0, 0.0, 0.0, 0.0],
+                values: [1746.0, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "lifted_index",
-                values: [-6.0, 0.0, 0.0, 0.0],
+                values: [0.04, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "convective_inhibition",
-                values: [0.0, 0.0, 0.0, 0.0],
-            },
-            TestEntry {
-                variable: "boundary_layer_height",
-                values: [900.0, 0.0, 0.0, 0.0],
+                values: [49.2, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "visibility",
-                values: [24140.0, 0.0, 0.0, 0.0],
+                values: [9066.67, 0.0, 0.0, 0.0],
             },
             TestEntry {
                 variable: "categorical_freezing_rain",
@@ -1546,9 +1546,9 @@ async fn forecast_endpoint_derives_reference_weather_code_from_unrounded_precipi
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["hourly"]["precipitation"][0], 0.5);
-    assert_eq!(body["hourly"]["showers"][0], 0.5);
-    assert_eq!(body["hourly"]["weather_code"][0], 96);
+    assert_eq!(body["hourly"]["precipitation"][0], 1.5);
+    assert_eq!(body["hourly"]["showers"][0], 1.3);
+    assert_eq!(body["hourly"]["weather_code"][0], 95);
 }
 
 #[tokio::test]
