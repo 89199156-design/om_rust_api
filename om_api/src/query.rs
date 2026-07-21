@@ -4344,16 +4344,12 @@ fn read_cams_mixed_carbon_monoxide(
     let mut low = Vec::with_capacity(4);
     for offset in 0..=3 {
         let sample_time = time + Duration::hours(offset);
-        high.push(read_product_history_value_with_rounding(
+        high.push(read_cams_greenhouse_carbon_monoxide_for_mixer(
             snapshot,
             decoder,
-            "cams_global_greenhouse_gases",
-            "carbon_monoxide",
-            "carbon_monoxide",
             sample_time,
             latitude,
             longitude,
-            false,
         )?);
         low.push(read_product_history_value_with_rounding(
             snapshot,
@@ -4387,6 +4383,56 @@ fn read_cams_mixed_carbon_monoxide(
             / 4.0;
     }
     Ok(maybe_round_to_scalefactor(high[0], 1.0, round_values))
+}
+
+fn read_cams_greenhouse_carbon_monoxide_for_mixer(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<f32> {
+    let product = snapshot.require_product("cams_global_greenhouse_gases")?;
+    let native_times = native_times_for_variable(&product, "carbon_monoxide");
+    let Some(first) = native_times.first().copied() else {
+        return Ok(f32::NAN);
+    };
+    let Some(last) = native_times.last().copied() else {
+        return Ok(f32::NAN);
+    };
+    if time < first {
+        return Ok(f32::NAN);
+    }
+    let cadence = native_times
+        .windows(2)
+        .next()
+        .map(|pair| pair[1] - pair[0])
+        .unwrap_or_else(|| Duration::hours(3));
+    if time > last {
+        if time < last + cadence {
+            return read_product_value_with_rounding(
+                &product,
+                decoder,
+                "carbon_monoxide",
+                "carbon_monoxide",
+                last,
+                latitude,
+                longitude,
+                false,
+            );
+        }
+        return Ok(f32::NAN);
+    }
+    read_product_value_with_rounding(
+        &product,
+        decoder,
+        "carbon_monoxide",
+        "carbon_monoxide",
+        time,
+        latitude,
+        longitude,
+        false,
+    )
 }
 
 fn product_covers_time(product: &ProductSnapshot, raw_variable: &str, time: DateTime<Utc>) -> bool {
