@@ -1067,19 +1067,24 @@ fn daily_weather_value(
     };
     let complete = values.iter().all(|value| value.is_finite());
     let value = match aggregation {
-        DailyWeatherAggregation::Max(_) => finite_extreme(true),
-        DailyWeatherAggregation::Min(_) => finite_extreme(false),
+        // Open-Meteo does not publish regular daily aggregates for a partial
+        // local day. `precipitation_hours` is the sole exception: it counts
+        // the available hourly frames so callers can see partial coverage.
+        DailyWeatherAggregation::Max(_) if complete => finite_extreme(true),
+        DailyWeatherAggregation::Min(_) if complete => finite_extreme(false),
         DailyWeatherAggregation::Mean(_) if complete => {
             values.iter().sum::<f32>() / values.len() as f32
         }
         DailyWeatherAggregation::Sum(_) if complete => values.iter().sum(),
-        DailyWeatherAggregation::PrecipitationHours(_) if complete => values
+        DailyWeatherAggregation::PrecipitationHours(_) => values
             .iter()
+            .filter(|value| value.is_finite())
             .map(|value| if *value > 0.001 { 1.0 } else { 0.0 })
             .sum(),
-        DailyWeatherAggregation::Mean(_)
-        | DailyWeatherAggregation::Sum(_)
-        | DailyWeatherAggregation::PrecipitationHours(_) => f32::NAN,
+        DailyWeatherAggregation::Max(_)
+        | DailyWeatherAggregation::Min(_)
+        | DailyWeatherAggregation::Mean(_)
+        | DailyWeatherAggregation::Sum(_) => f32::NAN,
         DailyWeatherAggregation::DominantWindDirection => unreachable!("handled above"),
     };
     Ok(value)
