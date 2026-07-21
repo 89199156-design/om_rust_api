@@ -104,10 +104,10 @@ GET /v1/forecast?latitude=31.23&longitude=121.47&daily=temperature_2m_max,temper
   `Meteorology.apparentTemperature` at the frozen upstream commit above.
   Max/min ignore unavailable hours; mean, sum, radiation sum, precipitation
   hours, and dominant direction require a complete natural day.
-- Sparse GFS solar fields use the frozen upstream
-  `solar_backwards_averaged` interpolation, including the upstream
-  point-versus-backwards-average clearness-factor rules at three-hour source
-  boundaries. The API does not substitute a custom estimate.
+- GFS omits hour 0 for solar radiation. Until the frozen upstream
+  `solar_backwards_averaged` interpolation is ported and validated,
+  `shortwave_radiation_sum` can be `null` for a day containing that gap.
+  The API does not substitute a custom estimate.
 - `timezone=auto`, sunrise/sunset/daylight calculations, and daily variables
   without an exactly equivalent local input are rejected instead of
   approximated.

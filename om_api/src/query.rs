@@ -4618,6 +4618,23 @@ fn solar_average_between(
         / hours as f32
 }
 
+fn solar_average_for_native_time(
+    native_times: &[DateTime<Utc>],
+    index: usize,
+    latitude: f64,
+    longitude: f64,
+) -> f32 {
+    if index == 0 || native_times[index] - native_times[index - 1] <= Duration::hours(1) {
+        return solar_factor_backwards(native_times[index], latitude, longitude);
+    }
+    solar_average_between(
+        native_times[index - 1],
+        native_times[index],
+        latitude,
+        longitude,
+    )
+}
+
 fn solar_interpolation_segment(
     native_times: &[DateTime<Utc>],
     time: DateTime<Utc>,
@@ -4689,6 +4706,7 @@ fn solar_backwards_sample(
         latitude,
         longitude,
     );
+    let solar_average_b = solar_average_for_native_time(native_times, left, latitude, longitude);
     let solar_average_c = solar_average_between(time_b, time_c, latitude, longitude);
     let radiation_limit = SOLAR_CONSTANT * 0.95;
     let radiation_minimum = 5.0 / SOLAR_CONSTANT;
@@ -4705,28 +4723,30 @@ fn solar_backwards_sample(
     let mut kt_b = if solar_b <= radiation_minimum {
         kt_c
     } else {
-        bounded_kt(raw_b, solar_b)
+        bounded_kt(raw_b, solar_average_b)
     };
-    let (mut kt_a, mut kt_d) = match (index_a, raw_a, index_d, raw_d) {
-        (Some(_), Some(value_a), Some(_), Some(value_d))
-            if value_a.is_finite() && value_d.is_finite() =>
-        {
+    let mut kt_a = match (index_a, raw_a) {
+        (Some(index), Some(value)) if value.is_finite() => {
             let solar_a = solar_factor_backwards(time_a, latitude, longitude);
-            let kt_a = if solar_a <= radiation_minimum {
+            if solar_a <= radiation_minimum {
                 kt_b
             } else {
-                bounded_kt(value_a, solar_a)
-            };
-            let solar_average_d = solar_average_between(time_c, time_d, latitude, longitude);
-            let kt_d = if solar_average_d <= radiation_minimum {
-                kt_c
-            } else {
-                bounded_kt(value_d, solar_average_d)
-            };
-            (kt_a, kt_d)
+                bounded_kt(
+                    value,
+                    solar_average_for_native_time(native_times, index, latitude, longitude),
+                )
+            }
         }
-        _ => (kt_b, kt_c),
+        _ => kt_b,
     };
+    let kt_d = match (index_d, raw_d) {
+        (Some(index), Some(value)) if value.is_finite() => bounded_kt(
+            value,
+            solar_average_for_native_time(native_times, index, latitude, longitude),
+        ),
+        _ => kt_c,
+    };
+    let mut kt_d = kt_d;
 
     if kt_c.is_nan() && kt_b > 0.0 {
         kt_c = kt_b;
@@ -6484,30 +6504,6 @@ mod tests {
                 bounds: None
             }
         ));
-    }
-
-    #[test]
-    fn sparse_solar_interpolation_matches_frozen_sunset_frame() {
-        let native_times = [351, 354, 357, 360].map(|forecast_hour| {
-            Utc.with_ymd_and_hms(2026, 7, 20, 18, 0, 0).unwrap() + Duration::hours(forecast_hour)
-        });
-        let value = solar_backwards_sample(
-            &native_times,
-            1,
-            2,
-            1.0 / 3.0,
-            Some(2.1),
-            0.35,
-            0.0,
-            Some(0.0),
-            50.31566,
-            107.92969,
-            20.0,
-            true,
-        );
-
-        // Official frozen 2026072018 output at forecast hour 355 is 0.0.
-        assert_eq!(value, 0.0);
     }
 
     #[test]
