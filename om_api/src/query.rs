@@ -4771,10 +4771,19 @@ fn solar_backwards_sample(
         _ => kt_b,
     };
     let kt_d = match (index_d, raw_d) {
-        (Some(index), Some(value)) if value.is_finite() => bounded_kt(
-            value,
-            solar_average_for_native_time(native_times, index, latitude, longitude),
-        ),
+        (Some(index), Some(value)) if value.is_finite() => {
+            let solar_average_d =
+                solar_average_for_native_time(native_times, index, latitude, longitude);
+            // Open-Meteo assigns the current (pre-recovery) ktC here when D
+            // is below the solar minimum. This ordering matters: ktC may be
+            // recovered from B/A below, while ktD must retain the earlier
+            // NaN at the nighttime boundary.
+            if solar_average_d <= radiation_minimum {
+                kt_c
+            } else {
+                (value / solar_average_d).min(radiation_limit)
+            }
+        }
         _ => kt_c,
     };
 
@@ -4790,12 +4799,6 @@ fn solar_backwards_sample(
         kt_b = kt_d;
         kt_c = kt_d;
     }
-    // Match interpolateInplaceSolarBackwards exactly. If the D clearness
-    // factor is unavailable at night, it remains NaN. Swift.max(0, NaN)
-    // subsequently produces zero for the missing nighttime frames; replacing
-    // D with the preceding daytime factor incorrectly leaks radiation past
-    // sunset.
-
     let coeff_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
     let coeff_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
     let coeff_c = -kt_a / 2.0 + kt_c / 2.0;
@@ -6738,6 +6741,30 @@ mod tests {
             true,
         );
         assert_eq!(value, 0.0);
+    }
+
+    #[test]
+    fn sparse_solar_interpolation_copies_finite_pre_recovery_c_to_nighttime_d() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 26, 6, 0, 0).unwrap();
+        let native_times = (0..4)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let value = solar_backwards_sample(
+            &native_times,
+            1,
+            2,
+            1.0 / 3.0,
+            Some(100.0),
+            100.0,
+            100.0,
+            Some(0.0),
+            6.853_241,
+            132.656_25,
+            20.0,
+            true,
+        );
+        assert!(value.is_finite());
+        assert!(value > 0.0);
     }
 
     #[test]

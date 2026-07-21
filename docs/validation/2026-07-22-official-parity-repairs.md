@@ -75,15 +75,18 @@ returned `151.75` and `0.05`.
 The official sparse path is `interpolateInplaceSolarBackwards` in:
 <https://github.com/open-meteo/open-meteo/blob/b743cbc9a7fab3f8f7dda85968fb770eee48b9ec/Sources/App/Helper/InterpolationInplace.swift>.
 
-When the future D clearness factor is unavailable at night, the official code
-leaves `ktD` as NaN. The resulting Hermite value is NaN and Swift's
-`max(0, NaN)` produces zero. The clone added a non-official fallback that
-replaced D with the preceding daytime C factor, leaking radiation past sunset.
+The official code assigns `ktD = ktC` immediately when the future D solar
+average is below the minimum. That assignment happens before the later B/A
+recovery of a missing `ktC`. If C is already finite, D receives that finite
+value; if C is NaN at the nighttime boundary, D remains NaN even when C is
+subsequently recovered. The clone instead recovered C first and then copied it
+to a missing D, leaking radiation past sunset. Removing the late copy alone was
+also incorrect because it discarded a finite pre-recovery C at evening edges.
 
-The repair removes only that fallback and retains the official in-place NaN
-semantics. The regression first returned `3.5` with the old behavior and now
-returns exactly `0`:
-`sparse_solar_interpolation_keeps_official_nan_d_at_night`.
+The repair mirrors the official assignment point and ordering. The paired
+regressions cover both sides of the boundary:
+`sparse_solar_interpolation_keeps_official_nan_d_at_night` and
+`sparse_solar_interpolation_copies_finite_pre_recovery_c_to_nighttime_d`.
 
 ## Verification contract
 
