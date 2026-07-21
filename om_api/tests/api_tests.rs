@@ -670,6 +670,117 @@ async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
 }
 
 #[tokio::test]
+async fn cams_co_history_rounds_each_source_before_mixing() {
+    let root = tempfile::tempdir().unwrap();
+    let global = "cams_global_2026072012_120h";
+    let current_ghg = "cams_global_greenhouse_gases_2026072100";
+    let previous_ghg = "cams_global_greenhouse_gases_2026072000";
+
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global",
+        global,
+        vec![
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-20T09:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-20T12:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-20T15:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-20T18:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global_greenhouse_gases",
+        previous_ghg,
+        vec![
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [94.0; 4],
+                valid_time_utc: "2026-07-20T09:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [91.0; 4],
+                valid_time_utc: "2026-07-20T12:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [91.0; 4],
+                valid_time_utc: "2026-07-20T15:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [92.0; 4],
+                valid_time_utc: "2026-07-20T18:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global_greenhouse_gases",
+        current_ghg,
+        vec![
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [91.0; 4],
+                valid_time_utc: "2026-07-20T15:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [92.0; 4],
+                valid_time_utc: "2026-07-20T18:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [93.0; 4],
+                valid_time_utc: "2026-07-20T21:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_release(
+        root.path(),
+        "cams",
+        "2026072000",
+        &[("cams_global_greenhouse_gases", previous_ghg)],
+    );
+    write_group_ready(
+        root.path(),
+        "cams",
+        &[
+            ("cams_global", global),
+            ("cams_global_greenhouse_gases", current_ghg),
+        ],
+    );
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-20T13:00&end_hour=2026-07-20T13:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["carbon_monoxide"], serde_json::json!([91.0]));
+}
+
+#[tokio::test]
 async fn cams_global_hermite_uses_c_when_second_lookahead_is_missing() {
     let root = tempfile::tempdir().unwrap();
     let coverage_id = "cams_global_hermite_edge";
