@@ -282,11 +282,16 @@ fn validate_run_time_axis(
     meta: &NativeRunMeta,
     max_forecast_hour: i64,
 ) -> Result<()> {
-    let expected = expected_forecast_hours(runtime_domain, max_forecast_hour)
+    let expected_source = expected_forecast_hours(runtime_domain, max_forecast_hour)
         .into_iter()
         .map(|hour| meta.reference_time + Duration::hours(hour))
         .collect::<Vec<_>>();
-    if meta.valid_times != expected {
+    let is_dense_gfs = runtime_domain.starts_with("ncep_gfs")
+        && meta.valid_times
+            == (0..=max_forecast_hour)
+                .map(|hour| meta.reference_time + Duration::hours(hour))
+                .collect::<Vec<_>>();
+    if meta.valid_times != expected_source && !is_dense_gfs {
         bail!(
             "native run time axis does not match {} 0...{}h contract",
             runtime_domain,
@@ -730,6 +735,23 @@ mod tests {
             native_time_indices("ncep_gfs013", &meta, 209).unwrap(),
             (0..209).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn maps_dense_interpolated_gfs_384_hour_schedule() {
+        let reference_time = "2026-07-12T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let meta = NativeRunMeta {
+            reference_time,
+            variables: vec!["temperature_2m".to_string()],
+            valid_times: (0..=384)
+                .map(|hour| reference_time + Duration::hours(hour))
+                .collect(),
+        };
+        assert_eq!(
+            native_time_indices("ncep_gfs013", &meta, 385).unwrap(),
+            (0..385).collect::<Vec<_>>()
+        );
+        validate_run_time_axis("ncep_gfs013", &meta, 384).unwrap();
     }
 
     #[test]
