@@ -13,8 +13,14 @@ GFS025_STATIC_URL="${OM_GFS025_STATIC_URL:-https://openmeteo.s3.amazonaws.com/da
 GFS025_STATIC_SHA256="${OM_GFS025_STATIC_SHA256:-fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d}"
 GFS025_STATIC_PATH="$DATA_ROOT/static/ncep_gfs025/HSURF.om"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+BUILD_TARGET_DIR="${OM_API_CARGO_TARGET_DIR:-$APP_ROOT/target}"
+if [[ "$BUILD_TARGET_DIR" != /* ]]; then
+  echo "OM_API_CARGO_TARGET_DIR must be an absolute path: $BUILD_TARGET_DIR" >&2
+  exit 2
+fi
+BUILD_BINARY="$BUILD_TARGET_DIR/release/om-api"
 BIN_DIR="$INSTALL_DIR/bin"
 NATIVE_DIR="$INSTALL_DIR/native"
 ENV_FILE="$INSTALL_DIR/${SERVICE_NAME}.env"
@@ -147,8 +153,14 @@ else
   echo "reusing=$NATIVE_DIR/libomfileformat.so"
 fi
 
-cargo build --release --manifest-path "$APP_ROOT/om_api/Cargo.toml"
-install -m 0755 "$APP_ROOT/om_api/target/release/om-api" "$BIN_DIR/om-api"
+cargo build --release --bin om-api \
+  --manifest-path "$APP_ROOT/om_api/Cargo.toml" \
+  --target-dir "$BUILD_TARGET_DIR"
+if [ ! -f "$BUILD_BINARY" ]; then
+  echo "cargo build completed but om-api binary is missing: $BUILD_BINARY" >&2
+  exit 1
+fi
+install -m 0755 -- "$BUILD_BINARY" "$BIN_DIR/om-api"
 
 cat > "$ENV_FILE" <<EOF
 OM_DATA_ROOT=$DATA_ROOT

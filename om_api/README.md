@@ -28,6 +28,12 @@ Implementation rule:
 The service uses official Open-Meteo OM decoder functions when `OM_OMFILE_LIB`
 points to a shared library exporting the `om-file-format` C symbols.
 
+`scripts/install_om_api.sh` builds the `om-api` workspace member with the
+explicit absolute target directory `<repository>/target`, then installs the
+binary from `<repository>/target/release/om-api`. An alternate build cache may
+be selected with an absolute `OM_API_CARGO_TARGET_DIR`; relative values are
+rejected so the build and install phases cannot resolve different artifacts.
+
 Build that decoder on Ubuntu:
 
 ```bash
