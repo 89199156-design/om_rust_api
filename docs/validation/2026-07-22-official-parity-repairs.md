@@ -65,6 +65,26 @@ changed.
 Regression:
 `point_weather_code_uses_land_selected_surface_model_latitude`.
 
+## GFS sparse solar interpolation at night
+
+Shanghai then differed at point 3 (`50.31566,107.92969`) at
+`2026-08-04T13:00Z`: official and the dense native production path returned
+`sunshine_duration=0` and `uv_index=0`, while the sparse range-bundle path
+returned `151.75` and `0.05`.
+
+The official sparse path is `interpolateInplaceSolarBackwards` in:
+<https://github.com/open-meteo/open-meteo/blob/b743cbc9a7fab3f8f7dda85968fb770eee48b9ec/Sources/App/Helper/InterpolationInplace.swift>.
+
+When the future D clearness factor is unavailable at night, the official code
+leaves `ktD` as NaN. The resulting Hermite value is NaN and Swift's
+`max(0, NaN)` produces zero. The clone added a non-official fallback that
+replaced D with the preceding daytime C factor, leaking radiation past sunset.
+
+The repair removes only that fallback and retains the official in-place NaN
+semantics. The regression first returned `3.5` with the old behavior and now
+returns exactly `0`:
+`sparse_solar_interpolation_keeps_official_nan_d_at_night`.
+
 ## Verification contract
 
 Both repairs require complete Rust tests, production build tests, direct replay

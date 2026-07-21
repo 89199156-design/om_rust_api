@@ -4777,7 +4777,6 @@ fn solar_backwards_sample(
         ),
         _ => kt_c,
     };
-    let mut kt_d = kt_d;
 
     if kt_c.is_nan() && kt_b > 0.0 {
         kt_c = kt_b;
@@ -4791,9 +4790,11 @@ fn solar_backwards_sample(
         kt_b = kt_d;
         kt_c = kt_d;
     }
-    if kt_d.is_nan() {
-        kt_d = kt_c;
-    }
+    // Match interpolateInplaceSolarBackwards exactly. If the D clearness
+    // factor is unavailable at night, it remains NaN. Swift.max(0, NaN)
+    // subsequently produces zero for the missing nighttime frames; replacing
+    // D with the preceding daytime factor incorrectly leaks radiation past
+    // sunset.
 
     let coeff_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
     let coeff_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
@@ -6714,6 +6715,29 @@ mod tests {
         };
         assert_eq!(calculate(selected_latitude), Some(81.0));
         assert_eq!(calculate(13.765_053), Some(95.0));
+    }
+
+    #[test]
+    fn sparse_solar_interpolation_keeps_official_nan_d_at_night() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
+        let native_times = (0..4)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let value = solar_backwards_sample(
+            &native_times,
+            1,
+            2,
+            1.0 / 3.0,
+            Some(100.0),
+            100.0,
+            0.0,
+            Some(0.0),
+            50.315_66,
+            107.929_69,
+            20.0,
+            true,
+        );
+        assert_eq!(value, 0.0);
     }
 
     #[test]
