@@ -6854,17 +6854,6 @@ fn read_weather_code_grid_series(
 
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
     let products = snapshot.product_snapshots(product_name);
-    let exact_cloud_times = times
-        .iter()
-        .map(|time| {
-            products.iter().any(|product| {
-                product.entries.contains_key(&EntryKey {
-                    variable: raw_variable.clone(),
-                    valid_time_utc: *time,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
     let entry = times
         .iter()
         .find_map(|time| {
@@ -6891,10 +6880,6 @@ fn read_weather_code_grid_series(
     let width = longitudes.len();
     let mut output = Vec::with_capacity(times.len());
     for time_index in 0..times.len() {
-        if !exact_cloud_times[time_index] {
-            output.push(vec![f32::NAN; cloudcover[time_index].len()]);
-            continue;
-        }
         let mut values = Vec::with_capacity(cloudcover[time_index].len());
         for index in 0..cloudcover[time_index].len() {
             let optional = |series: &Option<Vec<Vec<f32>>>| {
