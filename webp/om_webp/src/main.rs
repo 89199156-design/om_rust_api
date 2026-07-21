@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use clap::{Parser, ValueEnum};
-use fs2::FileExt;
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 use om_api::official::OfficialDecoder;
@@ -10,7 +9,7 @@ use om_api::snapshot::OmDataSnapshot;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -383,17 +382,6 @@ fn main() -> Result<()> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .build()?;
-    let lock_root = args.output_root.join("locks");
-    fs::create_dir_all(&lock_root)?;
-    let lock = File::create(lock_root.join(format!("{}.lock", args.scope.group())))?;
-    if lock.try_lock_exclusive().is_err() {
-        println!(
-            "{{\"status\":\"skipped\",\"reason\":\"renderer already running\",\"scope\":\"{}\"}}",
-            args.scope.group()
-        );
-        return Ok(());
-    }
-
     let ready = load_group_ready(&args.data_root, args.scope)?;
     let current_marker = args
         .output_root

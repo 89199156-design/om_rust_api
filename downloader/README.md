@@ -47,7 +47,7 @@ Install Silicon Valley 1Panel v2 plan tasks:
 cd /opt/1panel/apps/weather_om_downloader && sudo /usr/bin/python3 scripts/install_1panel_v2_cronjobs.py --role silicon-valley && sudo 1pctl restart agent
 ```
 
-This creates the panel-visible tasks `OM_GFS_DOWNLOAD` and `OM_CAMS_DOWNLOAD`, both on a 10-minute probe interval. It writes 1Panel v2 task rows to `/opt/1panel/db/agent.db`, not system `cron`.
+This creates the panel-visible tasks `OM_GFS_DOWNLOAD` and `OM_CAMS_DOWNLOAD` on staggered 1Panel schedules. It writes 1Panel v2 task rows to `/opt/1panel/db/agent.db`, not system `cron`.
 
 Silicon Valley 1Panel download commands:
 
@@ -58,7 +58,7 @@ cd /opt/1panel/apps/weather_om_downloader && OM_TURBOPFOR_LIB=/opt/1panel/apps/w
 
 If the 1Panel installer script is not used, create these as two separate 1Panel plan tasks. Do not put them in system `cron` or `systemd timer`.
 Production 1Panel commands should use `--download-workers 6` but should not set `--range-io-size-max` for the OM main channel. Workers parallelise metadata/LUT planning and Range reads; they do not split output into small files. Each product writes one cropped coverage bundle, and artificial 4 MiB splitting would reintroduce excessive HTTP Range overhead.
-The group download command creates `data/locks/<group>.lock`. If the next 10-minute probe fires before the previous group run has finished, it exits cleanly with `status=skipped` and does not start a duplicate download.
+The 1Panel scripts query `/opt/1panel/db/agent.db` before downloading. If the peer GFS/CAMS task is already executing, the new invocation exits successfully without entering download logic. The production group commands do not create filesystem task locks.
 `gfs` is complete only when `gfs013_surface`, `gfs025`, and `gfs_pressure_profile` all publish the same `latest_complete_run`; `cams` is complete independently from `cams_global`.
 Range bundle downloads are restart-tolerant: each `.omranges` write is promoted atomically from a temporary file, and an existing complete bundle with the expected byte count is reused on rerun.
 Download run summaries are written under `data/logs/om_run_summary-YYYY-MM-DD*.jsonl`. The file records both group runs and product runs, including status, run id, coverage id, file count, entry count, bytes, downloaded bytes, reuse status, start time, finish time, and duration. Application JSONL logs are daily files, split when a file would exceed 4 MiB, and retained for 45 days. 1Panel task report logs are controlled separately by the panel task `retain_copies` setting.

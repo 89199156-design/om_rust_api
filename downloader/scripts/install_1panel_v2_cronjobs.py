@@ -83,6 +83,7 @@ def download_group_script(
     publish_root: Path | None = None,
     source_sync_task: str | None = None,
 ) -> str:
+    current_task = "OM_GFS_DOWNLOAD" if group == "gfs" else "OM_CAMS_DOWNLOAD"
     publish_args = []
     if publish_root is not None:
         publish_args = [f"--publish-openmeteo-group-to {shell_path(publish_root)} "]
@@ -108,6 +109,18 @@ def download_group_script(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
+            f"TASK_STATE=$({shell_path(PYTHON)} {shell_path(APP_DIR / 'scripts' / 'check_1panel_download_tasks.py')} --database {shell_path(AGENT_DB)} --current-task {current_task})",
+            'case "$TASK_STATE" in',
+            "  run\\|*) printf '%s\\n' \"检查｜任务："
+            + group.upper()
+            + " 下载｜状态：允许执行｜${TASK_STATE#run|}\" ;;",
+            "  skip\\|*) printf '%s\\n' \"跳过｜任务："
+            + group.upper()
+            + " 下载｜原因：${TASK_STATE#skip|}\"; exit 0 ;;",
+            "  *) printf '%s\\n' \"失败｜任务："
+            + group.upper()
+            + " 下载｜原因：未知任务状态 $TASK_STATE\" >&2; exit 2 ;;",
+            "esac",
             *(
                 [
                     f"AGENT_DB={shell_path(AGENT_DB)}",
@@ -158,17 +171,17 @@ def download_group_script(
 
 def downloader_tasks() -> list[tuple[str, str, str]]:
     return [
-        ("OM_GFS_DOWNLOAD", "*/10 * * * *", download_group_script("gfs")),
-        ("OM_CAMS_DOWNLOAD", "*/10 * * * *", download_group_script("cams")),
+        ("OM_GFS_DOWNLOAD", "0,20,40 * * * *", download_group_script("gfs")),
+        ("OM_CAMS_DOWNLOAD", "10,30,50 * * * *", download_group_script("cams")),
     ]
 
 
 def api_publisher_tasks(*, raw_root: Path) -> list[tuple[str, str, str]]:
     return [
-        ("OM_GFS_DOWNLOAD", "*/10 * * * *", download_group_script("gfs", publish_root=raw_root)),
+        ("OM_GFS_DOWNLOAD", "0,20,40 * * * *", download_group_script("gfs", publish_root=raw_root)),
         (
             "OM_CAMS_DOWNLOAD",
-            "5,15,25,35,45,55 * * * *",
+            "10,30,50 * * * *",
             download_group_script("cams", publish_root=raw_root),
         ),
     ]

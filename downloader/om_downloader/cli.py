@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from copy import copy
 from io import StringIO
 from itertools import chain
@@ -1182,9 +1182,10 @@ def _download_openmeteo_group_release(
     group_started_monotonic = time.monotonic()
     runs_by_product: dict[str, str] | None = None
     try:
-        with file_lock(output_root / "locks" / "openmeteo_download.lock"), file_lock(
-            output_root / "locks" / f"{group_name}.lock"
-        ):
+        # 1Panel serializes each row, and the two production rows query
+        # agent.db before entering this command.  Group downloads therefore do
+        # not create filesystem locks that can survive service stop/start.
+        with nullcontext():
             products = [config.products[name] for name in product_names]
             plan_by_product = plan_by_product_override or {
                 product.name: _build_product_plan(
@@ -1380,29 +1381,6 @@ def _download_openmeteo_group_release(
                 )
             )
             return 0
-    except RuntimeError as exc:
-        if "already running" not in str(exc):
-            raise
-        _append_group_run_summary(
-            output_root,
-            group_name=group_name,
-            status="skipped",
-            reason="group already running",
-            product_runs=runs_by_product,
-            started_at_utc=group_started_at_utc,
-            started_monotonic=group_started_monotonic,
-        )
-        print(
-            json.dumps(
-                {
-                    "group": group_name,
-                    "status": "skipped",
-                    "reason": "group already running",
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 0
     except Exception as exc:
         _append_group_run_summary(
             output_root,
@@ -1996,48 +1974,14 @@ def _reconcile_gfs_retention_window(
 
 def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.download_openmeteo_group == "gfs":
-        output_root = Path(args.output)
-        try:
-            with file_lock(output_root / "locks" / "gfs_reconcile.lock"):
-                return _reconcile_gfs_retention_window(args, parser)
-        except RuntimeError as exc:
-            if "already running" not in str(exc):
-                raise
-            print(
-                json.dumps(
-                    {
-                        "group": "gfs",
-                        "status": "skipped",
-                        "reason": "GFS reconciliation already running",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-            return 0
+        return _reconcile_gfs_retention_window(args, parser)
     if args.download_openmeteo_group != "cams":
         return _download_openmeteo_group_release(args, parser)
     effective_args = args
     if not args.publish_openmeteo_group_to:
         effective_args = copy(args)
         effective_args.publish_openmeteo_group_to = str(Path(args.output) / "published")
-    output_root = Path(args.output)
-    try:
-        with file_lock(output_root / "locks" / "cams_reconcile.lock"):
-            return _reconcile_cams_complete_runs(effective_args, parser)
-    except RuntimeError as exc:
-        if "already running" not in str(exc):
-            raise
-        print(
-            json.dumps(
-                {
-                    "group": "cams",
-                    "status": "skipped",
-                    "reason": "CAMS reconciliation already running",
-                },
-                ensure_ascii=False,
-            )
-        )
-        return 0
+    return _reconcile_cams_complete_runs(effective_args, parser)
 
 
 def _catalog_as_json(catalog: OpenMeteoSpatialCatalog, *, bucket_url: str) -> dict[str, Any]:

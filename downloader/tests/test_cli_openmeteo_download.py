@@ -1651,7 +1651,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             self.assertFalse(stale_product_file.exists())
             self.assertTrue((output / "published" / "gfs025" / "latest.json").exists())
 
-    def test_cli_group_lock_skips_duplicate_probe_without_error(self):
+    def test_cli_group_download_ignores_obsolete_lock_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "models.json"
@@ -1686,8 +1686,8 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
 
             payload = json.loads(result.stdout)
 
-        self.assertEqual(payload["status"], "skipped")
-        self.assertEqual(payload["reason"], "GFS reconciliation already running")
+        self.assertEqual(payload["status"], "complete")
+        self.assertNotEqual(payload.get("reason"), "GFS reconciliation already running")
 
 
 if __name__ == "__main__":

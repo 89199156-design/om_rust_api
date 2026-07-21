@@ -30,9 +30,11 @@ uses every available CPU and is reserved for isolated/offline rendering.
 /usr/bin/env bash /opt/1panel/apps/weather_om_webp/scripts/run_scope.sh cams
 ```
 
-The native 1Panel jobs `OM_GFS_WEBP_BUILD` and `OM_CAMS_WEBP_BUILD` run every
-five minutes. They compare the source `release_id` with the local completion
-marker, so unchanged releases exit immediately without loading the OM snapshot.
+The native 1Panel jobs `OM_GFS_WEBP_BUILD` and `OM_CAMS_WEBP_BUILD` are
+scheduled only by 1Panel. Their panel scripts query `agent.db` before starting;
+an older active instance exits successfully. They compare the source
+`release_id` with the local completion marker, so unchanged releases also exit
+immediately without loading the OM snapshot.
 
 ## Verification
 

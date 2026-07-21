@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import shutil
 import sqlite3
 from pathlib import Path
 
@@ -28,10 +27,17 @@ def ensure_group(cur: sqlite3.Cursor, timestamp: str) -> int:
 
 
 def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, object]:
+    spec = "5,25,45 * * * *" if scope == "gfs" else "15,35,55 * * * *"
     script = "\n".join(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
+            f"TASK_STATE=$(/usr/bin/python3 {APP_DIR}/scripts/check_1panel_webp_task.py --database {AGENT_DB} --current-task {name})",
+            'case "$TASK_STATE" in',
+            f"  run\\|*) printf '%s\\n' \"检查｜任务：{scope.upper()} WebP｜状态：允许执行｜${{TASK_STATE#run|}}\" ;;",
+            f"  skip\\|*) printf '%s\\n' \"跳过｜任务：{scope.upper()} WebP｜原因：${{TASK_STATE#skip|}}\"; exit 0 ;;",
+            f"  *) printf '%s\\n' \"失败｜任务：{scope.upper()} WebP｜原因：未知任务状态 $TASK_STATE\" >&2; exit 2 ;;",
+            "esac",
             f"exec sudo -n -H -u ubuntu /usr/bin/env bash {APP_DIR}/scripts/run_scope.sh {scope}",
         ]
     )
@@ -40,7 +46,7 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
         "name": name,
         "type": "shell",
         "spec_custom": 0,
-        "spec": "*/5 * * * *",
+        "spec": spec,
         "executor": "bash",
         "command": "",
         "container_name": "",
@@ -75,10 +81,6 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
 def main() -> int:
     if not AGENT_DB.exists():
         raise FileNotFoundError(AGENT_DB)
-    backup = AGENT_DB.with_name(
-        f"agent.db.backup_om_webp_{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}"
-    )
-    shutil.copy2(AGENT_DB, backup)
     timestamp = now_text()
     con = sqlite3.connect(AGENT_DB)
     try:
@@ -103,7 +105,6 @@ def main() -> int:
                 cur.execute(f"insert into cronjobs ({names}) values ({placeholders})", payload)
                 print(f"CREATED={name}")
         con.commit()
-        print(f"AGENT_DB_BACKUP={backup}")
     finally:
         con.close()
     return 0

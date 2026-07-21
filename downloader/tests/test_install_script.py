@@ -3,6 +3,7 @@ import unittest
 
 from scripts.install_1panel_v2_cronjobs import (
     REMOVED_PLACEHOLDER_TASKS,
+    api_publisher_tasks,
     api_source_sync_tasks,
 )
 
@@ -39,6 +40,19 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--object-fetch-mode auto", content)
         self.assertIn("--object-range-max-bytes 8388608", content)
         self.assertNotIn("--range-io-size-max 4194304", content)
+
+        publisher_tasks = api_publisher_tasks(raw_root=Path("/tmp/raw"))
+        self.assertEqual(
+            [(name, spec) for name, spec, _script in publisher_tasks],
+            [
+                ("OM_GFS_DOWNLOAD", "0,20,40 * * * *"),
+                ("OM_CAMS_DOWNLOAD", "10,30,50 * * * *"),
+            ],
+        )
+        for name, _spec, script in publisher_tasks:
+            self.assertIn("check_1panel_download_tasks.py", script)
+            self.assertIn(f"--current-task {name}", script)
+            self.assertNotIn("flock", script)
 
         removed_names = (
             "OM_BUILD_GFS013_SURFACE",
