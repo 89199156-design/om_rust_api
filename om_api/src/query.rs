@@ -4404,7 +4404,17 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
         return Ok(f32::NAN);
     };
     if time < first {
-        return Ok(f32::NAN);
+        return read_product_history_value_with_rounding(
+            snapshot,
+            decoder,
+            "cams_global_greenhouse_gases",
+            "carbon_monoxide",
+            "carbon_monoxide",
+            time,
+            latitude,
+            longitude,
+            false,
+        );
     }
     let cadence = native_times
         .windows(2)
