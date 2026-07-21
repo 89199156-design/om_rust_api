@@ -3,7 +3,9 @@ use crate::query::{forecast_for_query, route_forecast, PointQuery, RouteQuery};
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::middleware;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -16,6 +18,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tower_http::trace::TraceLayer;
+
+const SOURCE_REPOSITORY: &str = "https://github.com/89199156-design/om_weather_server";
+const SOURCE_LICENSE: &str = "AGPL-3.0-or-later";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -175,11 +180,34 @@ impl AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(source_offer))
         .route("/v1/forecast", get(forecast))
         .route("/v1/air-quality", get(air_quality))
         .route("/v1/route", post(route))
         .with_state(state)
+        .layer(middleware::map_response(source_offer_headers))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn source_offer() -> Json<serde_json::Value> {
+    Json(json!({
+        "license": SOURCE_LICENSE,
+        "source_code": SOURCE_REPOSITORY,
+        "notice": "Corresponding Source for this network service is available at source_code."
+    }))
+}
+
+async fn source_offer_headers(mut response: Response) -> Response {
+    let link = format!("<{SOURCE_REPOSITORY}>; rel=\"source\"");
+    response.headers_mut().insert(
+        header::LINK,
+        HeaderValue::from_str(&link).expect("static source repository URL is a valid Link header"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-source-code"),
+        HeaderValue::from_static(SOURCE_REPOSITORY),
+    );
+    response
 }
 
 pub async fn serve(
@@ -280,7 +308,31 @@ impl axum::response::IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
     use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn source_offer_is_present_on_root_and_api_errors() {
+        let root = TempDir::new().unwrap();
+        let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
+        for uri in ["/", "/v1/forecast"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(header::LINK).unwrap(),
+                &HeaderValue::from_str(&format!("<{SOURCE_REPOSITORY}>; rel=\"source\"")).unwrap()
+            );
+            assert_eq!(
+                response.headers().get("x-source-code").unwrap(),
+                SOURCE_REPOSITORY
+            );
+        }
+    }
 
     #[test]
     fn snapshot_identity_accepts_product_name_list() {
