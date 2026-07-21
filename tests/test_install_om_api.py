@@ -13,6 +13,7 @@ INSTALL_SCRIPT = REPOSITORY_ROOT / "scripts" / "install_om_api.sh"
 POSIX_DEPLOY_TESTS_AVAILABLE = os.name == "posix" and all(
     shutil.which(command) is not None for command in ("bash", "id", "install")
 )
+REQUIRED_DEM_LATITUDES = range(0, 59)
 
 
 class InstallOmApiTests(unittest.TestCase):
@@ -130,6 +131,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             fake_bin = test_root / "fake-bin"
             install_root = test_root / "install"
             data_root = test_root / "data"
+            dem_root = test_root / "dem"
             for directory in (
                 script_dir,
                 manifest_dir,
@@ -149,6 +151,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             )
             (nginx_dir / "om_client_api.conf").write_text("", encoding="utf-8")
             (install_root / "native" / "libomfileformat.so").write_bytes(b"decoder")
+            self._write_dem_chunks(dem_root)
 
             static_source = test_root / "HSURF.om"
             static_source.write_bytes(b"official-static-elevation")
@@ -239,6 +242,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     "REAL_ID": str(real_id),
                     "REAL_INSTALL": str(real_install),
                     "OM_DATA_ROOT": str(data_root),
+                    "OM_API_DEM_ROOT": str(dem_root),
                     "OM_GFS013_STATIC_URL": static_source.resolve().as_uri(),
                     "OM_GFS013_STATIC_SHA256": static_sha256,
                     "OM_GFS025_STATIC_URL": static_source.resolve().as_uri(),
@@ -282,7 +286,52 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 (install_root / "bin" / "om-api").read_text(encoding="utf-8"),
                 "workspace-target-binary\n",
             )
+            service_environment = (
+                install_root / "weather-om-api-test.env"
+            ).read_text(encoding="utf-8")
+            self.assertIn(f"OM_DEM_ROOT={dem_root}\n", service_environment)
+            self.assertNotIn("OM_API_DEM_ROOT=", service_environment)
             self.assertFalse((manifest_dir / "target").exists())
+
+    @unittest.skipUnless(
+        POSIX_DEPLOY_TESTS_AVAILABLE,
+        "requires a POSIX deployment shell with id and install",
+    )
+    def test_installer_fails_closed_when_a_required_dem_chunk_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            test_root = Path(temporary_directory)
+            data_root = test_root / "data"
+            dem_root = test_root / "dem"
+            install_root = test_root / "install"
+            data_root.mkdir()
+            self._write_dem_chunks(dem_root, missing_latitude=31)
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "OM_DATA_ROOT": str(data_root),
+                    "OM_API_DEM_ROOT": str(dem_root),
+                    "OM_API_CARGO_TARGET_DIR": str(test_root / "target"),
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(INSTALL_SCRIPT), str(install_root)],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            missing_chunk = (
+                dem_root / "copernicus_dem90" / "static" / "lat_31.om"
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                f"required Copernicus DEM90 chunk is missing or empty: {missing_chunk}",
+                result.stderr,
+            )
+            self.assertFalse(install_root.exists())
 
     @unittest.skipUnless(
         POSIX_DEPLOY_TESTS_AVAILABLE,
@@ -310,6 +359,14 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
     def _write_executable(path: Path, content: str) -> None:
         path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
         path.chmod(0o755)
+
+    @staticmethod
+    def _write_dem_chunks(root: Path, missing_latitude: int | None = None) -> None:
+        static_directory = root / "copernicus_dem90" / "static"
+        static_directory.mkdir(parents=True)
+        for latitude in REQUIRED_DEM_LATITUDES:
+            if latitude != missing_latitude:
+                (static_directory / f"lat_{latitude}.om").write_bytes(b"OM")
 
 
 if __name__ == "__main__":

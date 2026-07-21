@@ -128,6 +128,15 @@ Chinese AQI:
 
 DEM and land-cell selection:
 
+- Point requests without an explicit `elevation` read Copernicus DEM90 from
+  `OM_DEM_ROOT` before selecting model cells and applying elevation correction.
+- `scripts/install_om_api.sh` accepts the deployment input
+  `OM_API_DEM_ROOT` (default `/data/om_static`), requires an absolute path, and
+  writes the resolved value to the service environment as `OM_DEM_ROOT`.
+- Before downloading assets, building, or changing the service, the installer
+  verifies the product-region contract: non-empty
+  `copernicus_dem90/static/lat_0.om` through `lat_58.om` (59 files). Missing or
+  empty chunks stop installation without restarting the existing service.
 - The current service only supports `cell_selection=nearest`.
 - `cell_selection=land` is intentionally rejected until DEM/static grid
   selection data is wired in.

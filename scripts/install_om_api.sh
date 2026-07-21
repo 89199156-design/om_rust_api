@@ -6,6 +6,9 @@ DATA_ROOT="${OM_DATA_ROOT:-/data/om_raw}"
 BIND_ADDR="${OM_API_BIND:-127.0.0.1:8088}"
 SERVICE_NAME="${OM_API_SERVICE_NAME:-weather-om-api}"
 INSTALL_OWNER="${OM_API_USER:-ubuntu}"
+API_DEM_ROOT="${OM_API_DEM_ROOT:-/data/om_static}"
+DEM_LATITUDE_CHUNK_MIN=0
+DEM_LATITUDE_CHUNK_MAX=58
 GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
 GFS013_STATIC_SHA256="${OM_GFS013_STATIC_SHA256:-203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0}"
 GFS013_STATIC_PATH="$DATA_ROOT/static/ncep_gfs013/HSURF.om"
@@ -21,10 +24,34 @@ if [[ "$BUILD_TARGET_DIR" != /* ]]; then
   exit 2
 fi
 BUILD_BINARY="$BUILD_TARGET_DIR/release/om-api"
+if [[ "$API_DEM_ROOT" != /* ]]; then
+  echo "OM_API_DEM_ROOT must be an absolute path: $API_DEM_ROOT" >&2
+  exit 2
+fi
+DEM_STATIC_DIR="$API_DEM_ROOT/copernicus_dem90/static"
 BIN_DIR="$INSTALL_DIR/bin"
 NATIVE_DIR="$INSTALL_DIR/native"
 ENV_FILE="$INSTALL_DIR/${SERVICE_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+validate_required_dem_chunks() {
+  if [ ! -d "$DEM_STATIC_DIR" ]; then
+    echo "Copernicus DEM90 static directory does not exist: $DEM_STATIC_DIR" >&2
+    exit 1
+  fi
+
+  local latitude
+  local chunk_path
+  for ((latitude = DEM_LATITUDE_CHUNK_MIN; latitude <= DEM_LATITUDE_CHUNK_MAX; latitude++)); do
+    chunk_path="$DEM_STATIC_DIR/lat_${latitude}.om"
+    if [ ! -f "$chunk_path" ] || [ ! -s "$chunk_path" ]; then
+      echo "required Copernicus DEM90 chunk is missing or empty: $chunk_path" >&2
+      exit 1
+    fi
+  done
+}
+
+validate_required_dem_chunks
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo is required. Install Rust first, for example with rustup." >&2
@@ -164,6 +191,7 @@ install -m 0755 -- "$BUILD_BINARY" "$BIN_DIR/om-api"
 
 cat > "$ENV_FILE" <<EOF
 OM_DATA_ROOT=$DATA_ROOT
+OM_DEM_ROOT=$API_DEM_ROOT
 OM_API_BIND=$BIND_ADDR
 OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
 OM_SNAPSHOT_REFRESH_SECONDS=30
