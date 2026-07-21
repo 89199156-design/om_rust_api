@@ -9,6 +9,9 @@ INSTALL_OWNER="${OM_API_USER:-ubuntu}"
 GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
 GFS013_STATIC_SHA256="${OM_GFS013_STATIC_SHA256:-203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0}"
 GFS013_STATIC_PATH="$DATA_ROOT/static/ncep_gfs013/HSURF.om"
+GFS025_STATIC_URL="${OM_GFS025_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs025/static/HSURF.om}"
+GFS025_STATIC_SHA256="${OM_GFS025_STATIC_SHA256:-fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d}"
+GFS025_STATIC_PATH="$DATA_ROOT/static/ncep_gfs025/HSURF.om"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -49,22 +52,94 @@ fi
 
 mkdir -p "$BIN_DIR" "$NATIVE_DIR"
 
-if [ ! -f "$GFS013_STATIC_PATH" ] || [ "$(sha256sum "$GFS013_STATIC_PATH" | awk '{print $1}')" != "$GFS013_STATIC_SHA256" ]; then
-  static_tmp="$(mktemp)"
-  trap 'rm -f "$static_tmp"' EXIT
+run_privileged() {
+  if [ -n "$SUDO" ]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
+}
+
+install_verified_static_asset() (
+  set -euo pipefail
+
+  if [ "$#" -ne 4 ]; then
+    echo "usage: install_verified_static_asset LABEL URL SHA256 TARGET" >&2
+    exit 2
+  fi
+
+  local label="$1"
+  local source_url="$2"
+  local expected_sha256="$3"
+  local target_path="$4"
+  local target_dir
+  local download_tmp=""
+  local staged_path=""
+  local actual_sha256=""
+  local remove_invalid_target=0
+
+  if [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "official $label static elevation SHA-256 is invalid: $expected_sha256" >&2
+    exit 2
+  fi
+
+  cleanup() {
+    set +e
+    if [ -n "$download_tmp" ]; then
+      rm -f -- "$download_tmp"
+    fi
+    if [ -n "$staged_path" ]; then
+      run_privileged rm -f -- "$staged_path"
+    fi
+    if [ "$remove_invalid_target" -eq 1 ]; then
+      run_privileged rm -f -- "$target_path"
+    fi
+  }
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  if [ -f "$target_path" ]; then
+    actual_sha256="$(run_privileged sha256sum -- "$target_path" | awk '{print $1}')"
+    if [ "$actual_sha256" = "$expected_sha256" ]; then
+      printf 'verified=%s\n' "$target_path"
+      exit 0
+    fi
+    remove_invalid_target=1
+  fi
+
+  target_dir="$(dirname -- "$target_path")"
+  run_privileged install -d -m 0755 "$target_dir"
+  download_tmp="$(mktemp)"
   curl --fail --location --silent --show-error --retry 4 \
     --connect-timeout 15 --max-time 180 \
-    --output "$static_tmp" "$GFS013_STATIC_URL"
-  actual_static_sha256="$(sha256sum "$static_tmp" | awk '{print $1}')"
-  if [ "$actual_static_sha256" != "$GFS013_STATIC_SHA256" ]; then
-    echo "official GFS013 static elevation checksum mismatch: $actual_static_sha256" >&2
+    --output "$download_tmp" "$source_url"
+
+  actual_sha256="$(sha256sum -- "$download_tmp" | awk '{print $1}')"
+  if [ "$actual_sha256" != "$expected_sha256" ]; then
+    echo "official $label static elevation checksum mismatch: $actual_sha256" >&2
     exit 1
   fi
-  $SUDO install -d -m 0755 "$(dirname "$GFS013_STATIC_PATH")"
-  $SUDO install -m 0644 "$static_tmp" "$GFS013_STATIC_PATH"
-  rm -f "$static_tmp"
-  trap - EXIT
-fi
+
+  staged_path="$(run_privileged mktemp "${target_path}.tmp.XXXXXX")"
+  run_privileged install -m 0644 "$download_tmp" "$staged_path"
+  actual_sha256="$(run_privileged sha256sum -- "$staged_path" | awk '{print $1}')"
+  if [ "$actual_sha256" != "$expected_sha256" ]; then
+    echo "staged $label static elevation checksum mismatch: $actual_sha256" >&2
+    exit 1
+  fi
+
+  run_privileged mv -f -- "$staged_path" "$target_path"
+  staged_path=""
+  remove_invalid_target=0
+  printf 'installed=%s\n' "$target_path"
+)
+
+install_verified_static_asset \
+  "GFS013" "$GFS013_STATIC_URL" "$GFS013_STATIC_SHA256" "$GFS013_STATIC_PATH"
+install_verified_static_asset \
+  "GFS025" "$GFS025_STATIC_URL" "$GFS025_STATIC_SHA256" "$GFS025_STATIC_PATH"
 
 if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] || [ ! -f "$NATIVE_DIR/libomfileformat.so" ]; then
   bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" "$NATIVE_DIR"

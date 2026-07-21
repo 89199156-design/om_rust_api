@@ -40,10 +40,22 @@ If an exact approved `om-file-format` source checkout is available, pass it with
 the Singapore/Open-Meteo baseline instead of silently mixing source versions.
 
 GFS model coordinates, model elevation, and `surface_pressure` require the
-official static file `ncep_gfs013/static/HSURF.om`. The installer downloads the
-baseline-pinned object to
-`/data/om_raw/static/ncep_gfs013/HSURF.om`, verifies its SHA-256 checksum, and
-the API rejects GFS requests if the file is missing or has an unexpected size.
+official `ncep_gfs013/static/HSURF.om` and
+`ncep_gfs025/static/HSURF.om` files. `scripts/install_om_api.sh` downloads the
+baseline-pinned objects from the official Open-Meteo bucket, verifies their
+SHA-256 checksums, stages them beside their final paths, and publishes each with
+an atomic rename. A failed download or checksum never publishes a partial file;
+an already-present file is reused only when its checksum matches.
+
+Pinned production assets:
+
+- `ncep_gfs013/static/HSURF.om`: 1,455,544 bytes, SHA-256
+  `203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0`
+- `ncep_gfs025/static/HSURF.om`: 408,440 bytes, SHA-256
+  `fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d`
+
+They are installed under `/data/om_raw/static/<model>/HSURF.om`. The API rejects
+requests that require a missing or structurally invalid static elevation file.
 
 Example:
 
