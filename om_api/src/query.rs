@@ -6854,15 +6854,18 @@ fn read_weather_code_grid_series(
 
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
     let products = snapshot.product_snapshots(product_name);
-    let entry = times
+    // The GFS data cadence becomes three-hourly after f120. The values above
+    // are still interpolated to hourly frames, so derive the invariant grid
+    // coordinates from any cloud-cover entry rather than requiring a raw
+    // frame at a requested interpolated hour.
+    let entry = products
         .iter()
-        .find_map(|time| {
-            products.iter().find_map(|product| {
-                product.entries.get(&EntryKey {
-                    variable: raw_variable.clone(),
-                    valid_time_utc: *time,
-                })
-            })
+        .find_map(|product| {
+            product
+                .entries
+                .iter()
+                .find(|(key, _)| key.variable == raw_variable)
+                .map(|(_, entry)| entry)
         })
         .context("weather-code series has no cloud-cover grid entry")?;
     let model_latitudes = latitudes
