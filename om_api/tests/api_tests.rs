@@ -475,6 +475,85 @@ async fn cams_nan_fallback_uses_previous_retained_run() {
     assert_eq!(body["hourly"]["pm10"], serde_json::json!([2808.9]));
 }
 
+#[tokio::test]
+async fn cams_nan_fallback_stops_after_previous_retained_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "cams_global_2026070800_120h";
+    let previous = "cams_global_2026070712_120h";
+    let third = "cams_global_2026070700_120h";
+    for (coverage, value) in [(current, f32::NAN), (previous, f32::NAN), (third, 30.0)] {
+        write_product_coverage(
+            root.path(),
+            "cams_global",
+            coverage,
+            vec![TestEntry {
+                variable: "pm10",
+                values: [value, value, value, value],
+            }],
+            false,
+        );
+    }
+    write_group_release(root.path(), "cams", "2026070700", &[("cams_global", third)]);
+    write_group_release(
+        root.path(),
+        "cams",
+        "2026070712",
+        &[("cams_global", previous)],
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["pm10"], serde_json::json!([null]));
+}
+
+#[tokio::test]
+async fn cams_latest_tail_does_not_fall_back_to_third_retained_run() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "cams_global_2026070800_120h";
+    let previous = "cams_global_2026070712_120h";
+    let third = "cams_global_2026070700_120h";
+    for (coverage, value, valid_time) in [
+        (current, f32::NAN, "2026-07-08T12:00:00Z"),
+        (previous, 20.0, "2026-07-08T00:00:00Z"),
+        (third, 30.0, "2026-07-08T12:00:00Z"),
+    ] {
+        write_product_coverage_timed(
+            root.path(),
+            "cams_global",
+            coverage,
+            vec![TimedTestEntry {
+                variable: "pm10",
+                values: [value, value, value, value],
+                valid_time_utc: valid_time,
+            }],
+            false,
+        );
+    }
+    write_group_release(root.path(), "cams", "2026070700", &[("cams_global", third)]);
+    write_group_release(
+        root.path(),
+        "cams",
+        "2026070712",
+        &[("cams_global", previous)],
+    );
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T12:00&end_hour=2026-07-08T12:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["pm10"], serde_json::json!([null]));
+}
+
 fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for value in values {

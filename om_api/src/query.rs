@@ -3506,10 +3506,12 @@ fn read_direct_grid(
         }
     }
     if is_cams_product(product_name) {
-        let covering_products = products
-            .iter()
+        let covering_products = newest_and_previous_products(&products)
+            // CAMS fallback is deliberately limited to the newest and the
+            // immediately previous retained run. Filter for time coverage
+            // only after applying that limit, otherwise a historical query
+            // could silently promote the third retained run to a fallback.
             .filter(|product| product_covers_time(product, &raw_variable, time))
-            .take(2)
             .collect::<Vec<_>>();
         if let Some(first) = covering_products.first() {
             let mut values = read_product_grid_with_rounding(
@@ -3716,6 +3718,12 @@ fn is_gfs_product(product_name: &str) -> bool {
 
 fn is_cams_product(product_name: &str) -> bool {
     matches!(product_name, "cams_global" | "cams_global_greenhouse_gases")
+}
+
+fn newest_and_previous_products(
+    products: &[Arc<ProductSnapshot>],
+) -> impl Iterator<Item = &Arc<ProductSnapshot>> {
+    products.iter().take(2)
 }
 
 fn gfs_snapshot_is_full(product: &ProductSnapshot) -> bool {
@@ -4265,7 +4273,7 @@ fn read_product_history_value_with_rounding(
     if is_cams_product(product_name) {
         let mut fallback = f32::NAN;
         let mut found_coverage = false;
-        for product in products.iter().take(2) {
+        for product in newest_and_previous_products(&products) {
             if !product_covers_time(product, raw_variable, time) {
                 continue;
             }
