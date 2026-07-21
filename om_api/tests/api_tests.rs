@@ -882,6 +882,101 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
 }
 
 #[tokio::test]
+async fn cams_carbon_monoxide_hermite_extrapolates_greenhouse_tail_before_mixing() {
+    let root = tempfile::tempdir().unwrap();
+    let global_coverage = "cams_global_co_hermite_tail_mixer";
+    let greenhouse_coverage = "cams_global_greenhouse_gases_co_hermite_tail_mixer";
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global",
+        global_coverage,
+        vec![
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [333.0; 4],
+                valid_time_utc: "2026-07-24T21:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [340.0; 4],
+                valid_time_utc: "2026-07-25T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [202.0; 4],
+                valid_time_utc: "2026-07-25T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [168.0; 4],
+                valid_time_utc: "2026-07-25T06:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [333.0; 4],
+                valid_time_utc: "2026-07-24T21:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [340.0; 4],
+                valid_time_utc: "2026-07-25T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [202.0; 4],
+                valid_time_utc: "2026-07-25T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "ozone",
+                values: [168.0; 4],
+                valid_time_utc: "2026-07-25T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_product_coverage_timed(
+        root.path(),
+        "cams_global_greenhouse_gases",
+        greenhouse_coverage,
+        vec![
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [145.0; 4],
+                valid_time_utc: "2026-07-24T21:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "carbon_monoxide",
+                values: [136.0; 4],
+                valid_time_utc: "2026-07-25T00:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_ready(
+        root.path(),
+        "cams",
+        &[
+            ("cams_global", global_coverage),
+            ("cams_global_greenhouse_gases", greenhouse_coverage),
+        ],
+    );
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    for (hour, expected) in [(0, 187.0), (1, 218.0), (2, 218.5), (3, 202.0)] {
+        let url = format!(
+            "/v1/air-quality?latitude=-90&longitude=-180&hourly=ozone,carbon_monoxide&start_hour=2026-07-25T{hour:02}:00&end_hour=2026-07-25T{hour:02}:00"
+        );
+        let (status, body) = request_json(router(state.clone()), &url).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["hourly"]["carbon_monoxide"],
+            serde_json::json!([expected]),
+            "hour {hour:02}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn chinese_daily_aqi_uses_hj663_08_to_24_o3_windows() {
     let root = tempfile::tempdir().unwrap();
     let historical_global = "cams_global_2026070700_120h";

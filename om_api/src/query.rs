@@ -4425,16 +4425,47 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
         .unwrap_or_else(|| Duration::hours(3));
     if time > last {
         if time < last + cadence {
-            return read_product_value_with_rounding(
+            // GenericReader expands the source range by Hermite's padding.
+            // Immediately after the final stored greenhouse frame, the
+            // unavailable C and D samples are therefore present as NaN and
+            // Interpolation.interpolateHermite replaces both with B.  Do not
+            // clamp these two hourly samples to B: the preceding A sample
+            // still changes the Hermite curve before it settles at B.
+            let b = read_native_value(
                 &product,
                 decoder,
-                "carbon_monoxide",
                 "carbon_monoxide",
                 last,
                 latitude,
                 longitude,
-                true,
-            );
+            )?;
+            if !b.is_finite() {
+                return Ok(f32::NAN);
+            }
+            let a_time = last - cadence;
+            let a = match read_native_value_if_present(
+                &product,
+                decoder,
+                "carbon_monoxide",
+                &native_times,
+                a_time,
+                latitude,
+                longitude,
+            )? {
+                Some(value) if value.is_finite() => value,
+                _ => b,
+            };
+            let fraction = (time - last).num_seconds() as f32 / cadence.num_seconds() as f32;
+            let c = b;
+            let d = b;
+            let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+            let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+            let coeff_c = -a / 2.0 + c / 2.0;
+            let h = coeff_a * fraction * fraction * fraction
+                + coeff_b * fraction * fraction
+                + coeff_c * fraction
+                + b;
+            return Ok(round_to_scalefactor(h, 1.0).max(0.0));
         }
         return Ok(f32::NAN);
     }
@@ -6639,6 +6670,53 @@ mod tests {
     }
 
     #[test]
+    fn point_weather_code_uses_land_selected_surface_model_latitude() {
+        let sampling = RequestSampling {
+            gfs013: Some(ModelSampling {
+                latitude: 13.647_903,
+                longitude: 123.164_06,
+                model_elevation: 0.0,
+                target_elevation: 0.0,
+            }),
+            gfs025: Some(ModelSampling {
+                latitude: 13.75,
+                longitude: 123.25,
+                model_elevation: 0.0,
+                target_elevation: 0.0,
+            }),
+            response_elevation: 0.0,
+        };
+        let selected_latitude = with_request_sampling(sampling, || {
+            Ok(
+                point_weather_code_model_latitudes(&[13.765_053], &[123.164_06])
+                    .expect("point sampling")
+                    .remove(0),
+            )
+        })
+        .unwrap();
+
+        let calculate = |latitude| {
+            weather_code(
+                100.0,
+                4.1,
+                Some(4.1),
+                0.0,
+                Some(2.0),
+                Some(930.0),
+                Some(-2.6),
+                Some(23.0),
+                Some(15.0),
+                Some(3720.0),
+                Some(0.0),
+                3600,
+                latitude,
+            )
+        };
+        assert_eq!(calculate(selected_latitude), Some(81.0));
+        assert_eq!(calculate(13.765_053), Some(95.0));
+    }
+
+    #[test]
     fn surface_pressure_matches_openmeteo_formula() {
         assert_eq!(surface_pressure(20.0, 1013.25, f32::NAN), 1013.25);
         assert!((surface_pressure(20.0, 1013.25, 1000.0) - 902.9).abs() < 0.2);
@@ -6815,6 +6893,13 @@ fn read_optional_direct_grid_series_rounded(
     }
 }
 
+fn point_weather_code_model_latitudes(latitudes: &[f64], longitudes: &[f64]) -> Option<Vec<f32>> {
+    if latitudes.len() != 1 || longitudes.len() != 1 {
+        return None;
+    }
+    current_product_sampling("gfs013_surface").map(|sampling| vec![sampling.latitude as f32])
+}
+
 fn read_weather_code_grid_series(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
@@ -6920,18 +7005,26 @@ fn read_weather_code_grid_series(
                 .map(|(_, entry)| entry)
         })
         .context("weather-code series has no cloud-cover grid entry")?;
-    let model_latitudes = latitudes
-        .iter()
-        .map(|latitude| {
-            let (y, _) = grid_index_for_lat_lon(
-                &entry.array,
-                entry.native_grid.as_ref(),
-                *latitude,
-                longitudes[0],
-            )?;
-            grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // The point time-slab path replaces each product's coordinates with the
+    // cell selected by cell_selection. WeatherCode must receive that same
+    // GFS013 model latitude; using the original request latitude can cross the
+    // strict thunderstorm-probability threshold even though every input value
+    // came from the selected model cell.
+    let model_latitudes = match point_weather_code_model_latitudes(latitudes, longitudes) {
+        Some(values) => values,
+        None => latitudes
+            .iter()
+            .map(|latitude| {
+                let (y, _) = grid_index_for_lat_lon(
+                    &entry.array,
+                    entry.native_grid.as_ref(),
+                    *latitude,
+                    longitudes[0],
+                )?;
+                grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
     let width = longitudes.len();
     let mut output = Vec::with_capacity(times.len());
     for time_index in 0..times.len() {
@@ -7078,18 +7171,21 @@ fn read_weather_code_grid(
             })
         })
         .with_context(|| format!("variable/time is not available: cloud_cover {}", time))?;
-    let model_latitudes = latitudes
-        .iter()
-        .map(|latitude| {
-            let (y, _) = grid_index_for_lat_lon(
-                &entry.array,
-                entry.native_grid.as_ref(),
-                *latitude,
-                longitudes[0],
-            )?;
-            grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let model_latitudes = match point_weather_code_model_latitudes(latitudes, longitudes) {
+        Some(values) => values,
+        None => latitudes
+            .iter()
+            .map(|latitude| {
+                let (y, _) = grid_index_for_lat_lon(
+                    &entry.array,
+                    entry.native_grid.as_ref(),
+                    *latitude,
+                    longitudes[0],
+                )?;
+                grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
     let width = longitudes.len();
     let mut values = Vec::with_capacity(cloudcover.len());
     for index in 0..cloudcover.len() {
