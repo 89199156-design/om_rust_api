@@ -4382,7 +4382,10 @@ fn read_cams_mixed_carbon_monoxide(
             + high[index] * steps_since_nan as f32)
             / 4.0;
     }
-    Ok(maybe_round_to_scalefactor(high[0], 1.0, round_values))
+    // Carbon monoxide is serialized with one decimal. Do not quantize the
+    // blended transition before JSON serialization (e.g. 102.75 -> 102.8).
+    let _ = round_values;
+    Ok(high[0])
 }
 
 fn read_cams_greenhouse_carbon_monoxide_for_mixer(
