@@ -450,6 +450,9 @@ pub fn build_gfs_coverage(
         .map(|source| source.run.clone())
         .collect::<Vec<_>>();
     let staging = coverage_parent.join(format!(".incoming_{}", options.coverage_id));
+    if !path_is_real_directory(&staging, "native staging")? {
+        adopt_compatible_staging(&coverage_parent, &staging, &identity)?;
+    }
     let identity_path = staging.join("build_identity.json");
     if path_is_real_directory(&staging, "native staging")? {
         if !identity_path.is_file() {
@@ -835,6 +838,108 @@ fn build_identity(options: &GfsBuildOptions, sources: &[LegacySourceRun]) -> Val
             "ncep_gfs025": grid_marker(&gfs025_contract())
         }
     })
+}
+
+fn resume_identity(value: &Value) -> Option<Value> {
+    let mut object = value.as_object()?.clone();
+    object.remove("coverage_id")?;
+    object.remove("producer_revision")?;
+    Some(Value::Object(object))
+}
+
+fn adopt_compatible_staging(
+    coverage_parent: &Path,
+    requested_staging: &Path,
+    requested_identity: &Value,
+) -> Result<bool> {
+    if path_is_real_directory(requested_staging, "requested native staging")? {
+        return Ok(false);
+    }
+    let requested_resume = resume_identity(requested_identity)
+        .context("requested native staging identity is incomplete")?;
+    let mut compatible = Vec::new();
+    for entry in fs::read_dir(coverage_parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == requested_staging {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Some(directory_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(coverage_id) = directory_name.strip_prefix(".incoming_") else {
+            continue;
+        };
+        let identity_path = path.join("build_identity.json");
+        if !identity_path.is_file() {
+            continue;
+        }
+        let identity: Value = match serde_json::from_slice(&fs::read(&identity_path)?) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if identity.get("lifecycle_manager").and_then(Value::as_str)
+            != Some(NATIVE_LIFECYCLE_MANAGER)
+            || identity.get("algorithm").and_then(Value::as_str)
+                != Some(GFS_MATERIALIZATION_REVISION)
+            || identity.get("coverage_id").and_then(Value::as_str) != Some(coverage_id)
+        {
+            continue;
+        }
+        let (Some(latest_run), Some(producer_revision)) = (
+            identity.get("latest_run").and_then(Value::as_str),
+            identity.get("producer_revision").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if default_gfs_coverage_id(latest_run, producer_revision)
+            .ok()
+            .as_deref()
+            != Some(coverage_id)
+            || resume_identity(&identity).as_ref() != Some(&requested_resume)
+        {
+            continue;
+        }
+        // This rejects every symlink anywhere in the managed staging tree
+        // before the same-filesystem rename is allowed.
+        tree_bytes_and_latest_modified(&path)?;
+        compatible.push(path);
+    }
+    if compatible.len() > 1 {
+        bail!(
+            "multiple compatible native staging directories require operator review: {}",
+            compatible
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let Some(existing) = compatible.pop() else {
+        return Ok(false);
+    };
+    fs::rename(&existing, requested_staging).with_context(|| {
+        format!(
+            "adopt compatible native staging {} as {}",
+            existing.display(),
+            requested_staging.display()
+        )
+    })?;
+    atomic_write_json(
+        &requested_staging.join("build_identity.json"),
+        requested_identity,
+    )?;
+    sync_directory(coverage_parent)?;
+    tracing::info!(
+        previous = %existing.display(),
+        requested = %requested_staging.display(),
+        "adopted compatible native staging after producer revision change"
+    );
+    Ok(true)
 }
 
 fn checked_ceil_ratio(value: u64, numerator: u64, denominator: u64) -> Result<u64> {
@@ -3146,6 +3251,45 @@ mod tests {
         symlink(&outside, &link).unwrap();
         assert!(path_is_real_directory(&link, "test staging").is_err());
         assert!(outside.is_dir());
+    }
+
+    #[test]
+    fn compatible_staging_is_adopted_without_copying_payload() {
+        let root = tempdir().unwrap();
+        let old_revision = "1".repeat(40);
+        let new_revision = "2".repeat(40);
+        let old_id = default_gfs_coverage_id("2026072018", &old_revision).unwrap();
+        let new_id = default_gfs_coverage_id("2026072018", &new_revision).unwrap();
+        let old_staging = root.path().join(format!(".incoming_{old_id}"));
+        let new_staging = root.path().join(format!(".incoming_{new_id}"));
+        fs::create_dir_all(&old_staging).unwrap();
+        fs::write(old_staging.join("payload.om"), b"payload").unwrap();
+        let old_identity = json!({
+            "version": 1,
+            "lifecycle_manager": NATIVE_LIFECYCLE_MANAGER,
+            "algorithm": GFS_MATERIALIZATION_REVISION,
+            "coverage_id": old_id,
+            "latest_run": "2026072018",
+            "producer_revision": old_revision,
+            "source_coverages": {"2026072018": {"gfs013_surface": "source-a"}},
+            "domain_grids": {"ncep_gfs013": {"nx": 1}}
+        });
+        atomic_write_json(&old_staging.join("build_identity.json"), &old_identity).unwrap();
+        let mut new_identity = old_identity.clone();
+        new_identity["coverage_id"] = json!(new_id);
+        new_identity["producer_revision"] = json!(new_revision);
+
+        assert!(adopt_compatible_staging(root.path(), &new_staging, &new_identity).unwrap());
+
+        assert!(!old_staging.exists());
+        assert_eq!(
+            fs::read(new_staging.join("payload.om")).unwrap(),
+            b"payload"
+        );
+        let adopted: Value =
+            serde_json::from_slice(&fs::read(new_staging.join("build_identity.json")).unwrap())
+                .unwrap();
+        assert_eq!(adopted, new_identity);
     }
 
     #[test]
