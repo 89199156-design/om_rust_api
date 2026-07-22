@@ -52,6 +52,15 @@ class BuildOmFileFormatCodecTests(unittest.TestCase):
 
     def test_default_source_is_pinned_and_every_runtime_symbol_is_checked(self) -> None:
         self.assertIn(PINNED_REVISION, self.content)
+        self.assertIn(
+            "https://github.com/open-meteo/om-file-format.git",
+            self.content,
+        )
+        self.assertIn(
+            "git@github.com:open-meteo/om-file-format.git",
+            self.content,
+        )
+        self.assertIn("remote set-url origin", self.content)
         for symbol in REQUIRED_SYMBOLS:
             with self.subTest(symbol=symbol):
                 self.assertIn(symbol, self.content)

@@ -4,6 +4,8 @@ set -euo pipefail
 SRC_DIR="${OM_FILE_FORMAT_SRC:-}"
 DEFAULT_REF="71f422b2706d8a81f1cecf52ae3073990de1ddbe"
 REF="${OM_FILE_FORMAT_REF:-$DEFAULT_REF}"
+PRIMARY_REMOTE="${OM_FILE_FORMAT_REMOTE:-https://github.com/open-meteo/om-file-format.git}"
+FALLBACK_REMOTE="${OM_FILE_FORMAT_FALLBACK_REMOTE:-git@github.com:open-meteo/om-file-format.git}"
 REQUIRED_SYMBOLS=(
   om_variable_init
   om_decoder_init
@@ -98,8 +100,16 @@ else
   mkdir -p "$BUILD_DIR/om-file-format"
   git -C "$BUILD_DIR/om-file-format" init --quiet
   git -C "$BUILD_DIR/om-file-format" remote add origin \
-    https://github.com/open-meteo/om-file-format.git
-  git -C "$BUILD_DIR/om-file-format" fetch --depth=1 origin "$REF"
+    "$PRIMARY_REMOTE"
+  if ! git -C "$BUILD_DIR/om-file-format" fetch --depth=1 origin "$REF"; then
+    if [[ -z "$FALLBACK_REMOTE" ]] || [[ "$FALLBACK_REMOTE" == "$PRIMARY_REMOTE" ]]; then
+      echo "failed to fetch pinned om-file-format source from $PRIMARY_REMOTE" >&2
+      exit 1
+    fi
+    echo "primary om-file-format fetch failed; retrying the same pinned source via $FALLBACK_REMOTE" >&2
+    git -C "$BUILD_DIR/om-file-format" remote set-url origin "$FALLBACK_REMOTE"
+    git -C "$BUILD_DIR/om-file-format" fetch --depth=1 origin "$REF"
+  fi
   git -C "$BUILD_DIR/om-file-format" checkout --quiet --detach FETCH_HEAD
 fi
 
