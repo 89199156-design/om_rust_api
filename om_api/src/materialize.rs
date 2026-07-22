@@ -38,7 +38,12 @@ const COMPRESSION_PFOR_DELTA2D_INT16: u8 = 0;
 const PROCESS_VALUES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MINIMUM_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ESTIMATE_OVERHEAD_BYTES: u64 = 256 * 1024 * 1024;
-const ESTIMATE_NUMERATOR: u64 = 5;
+// Legacy bundles compress each sparse 2-D hour independently. Native files
+// compress each location's dense time series, which is materially smaller.
+// Three quarters of the cadence-expanded source payload plus fixed overhead
+// is still conservative for the pinned GFS layout (and is backed by a hard
+// free-space guard before every output block).
+const ESTIMATE_NUMERATOR: u64 = 3;
 const ESTIMATE_DENOMINATOR: u64 = 4;
 const DEFAULT_STALE_STAGING_AGE: StdDuration = StdDuration::from_secs(24 * 60 * 60);
 const NATIVE_LIFECYCLE_MANAGER: &str = "om-native-materialize";
@@ -213,6 +218,8 @@ struct VariableTask {
     variable: String,
     source: Arc<ProductSnapshot>,
     destination: PathBuf,
+    disk_probe: PathBuf,
+    minimum_free_bytes: u64,
 }
 
 type RunVariableInventory = BTreeMap<(String, String), Vec<String>>;
@@ -459,7 +466,7 @@ pub fn build_gfs_coverage(
         }
     }
 
-    let (tasks, run_variables) = build_variable_tasks(&sources, &staging)?;
+    let (tasks, run_variables) = build_variable_tasks(options, &sources, &staging)?;
     let disk_preflight = preflight_native_build(options, &tasks, &staging)?;
     fs::create_dir_all(&staging)?;
     if !identity_path.exists() {
@@ -984,7 +991,20 @@ fn available_space(path: &Path) -> Result<u64> {
         .context("available disk byte count overflow")
 }
 
+fn ensure_minimum_free_space(path: &Path, minimum_free_bytes: u64) -> Result<()> {
+    let available = available_space(path)?;
+    if available < minimum_free_bytes {
+        bail!(
+            "native GFS materialization stopped before exhausting disk: available={} required_free={}",
+            available,
+            minimum_free_bytes
+        );
+    }
+    Ok(())
+}
+
 fn build_variable_tasks(
+    options: &GfsBuildOptions,
     sources: &[LegacySourceRun],
     staging: &Path,
 ) -> Result<(Vec<VariableTask>, RunVariableInventory)> {
@@ -1036,6 +1056,8 @@ fn build_variable_tasks(
                     variable,
                     source: snapshot.clone(),
                     destination,
+                    disk_probe: options.data_root.clone(),
+                    minimum_free_bytes: options.minimum_free_bytes,
                 });
             }
         }
@@ -1064,6 +1086,7 @@ fn interpolation_scale(variable: &str, kind: InterpolationKind) -> Result<f32> {
 }
 
 fn materialize_variable(task: &VariableTask, decoder: &OfficialDecoder) -> Result<()> {
+    ensure_minimum_free_space(&task.disk_probe, task.minimum_free_bytes)?;
     let entries = source_entries(task)?;
     let first_hour = entries
         .first()
@@ -1175,6 +1198,7 @@ fn materialize_variable(task: &VariableTask, decoder: &OfficialDecoder) -> Resul
     let requires_interpolation = usize::try_from(n_time)? != entries.len();
     let mut y0 = 0_u64;
     while y0 < task.domain.grid.ny {
+        ensure_minimum_free_space(&task.disk_probe, task.minimum_free_bytes)?;
         let height = process_y.min(task.domain.grid.ny - y0);
         let location_count = usize::try_from(height * task.domain.grid.nx)?;
         let n_time_usize = usize::try_from(n_time)?;
