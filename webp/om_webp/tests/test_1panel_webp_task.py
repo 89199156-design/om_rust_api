@@ -6,11 +6,17 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from check_1panel_webp_task import TASKS, decision
+from check_1panel_webp_task import ALL_PRODUCTION_TASKS, DOWNLOAD_TASKS, TASKS, decision
 
 
 class WebpTaskGateTests(unittest.TestCase):
-    def database(self, *, is_executing: int, active_records: int) -> tuple[tempfile.TemporaryDirectory, Path]:
+    def database(
+        self,
+        *,
+        is_executing: int,
+        active_records: int,
+        executing_peer: str | None = None,
+    ) -> tuple[tempfile.TemporaryDirectory, Path]:
         temporary = tempfile.TemporaryDirectory()
         path = Path(temporary.name) / "agent.db"
         with closing(sqlite3.connect(path)) as connection:
@@ -20,13 +26,20 @@ class WebpTaskGateTests(unittest.TestCase):
             connection.execute(
                 "create table job_records (cronjob_id integer, status text)"
             )
-            connection.execute(
-                "insert into cronjobs (id, name, is_executing) values (1, ?, ?)",
-                (TASKS[0], is_executing),
+            connection.executemany(
+                "insert into cronjobs (id, name, is_executing) values (?, ?, ?)",
+                [
+                    (
+                        index,
+                        name,
+                        is_executing if name == TASKS[0] else int(name == executing_peer),
+                    )
+                    for index, name in enumerate(ALL_PRODUCTION_TASKS, start=1)
+                ],
             )
             connection.executemany(
-                "insert into job_records (cronjob_id, status) values (1, 'Running')",
-                [()] * active_records,
+                "insert into job_records (cronjob_id, status) values (?, 'Running')",
+                [(ALL_PRODUCTION_TASKS.index(TASKS[0]) + 1,)] * active_records,
             )
             connection.commit()
         return temporary, path
@@ -40,6 +53,28 @@ class WebpTaskGateTests(unittest.TestCase):
         temporary, path = self.database(is_executing=1, active_records=2)
         with temporary:
             self.assertEqual(decision(path, TASKS[0])[0], "skip")
+
+    def test_running_download_skips_webp(self):
+        temporary, path = self.database(
+            is_executing=1,
+            active_records=1,
+            executing_peer=DOWNLOAD_TASKS[0],
+        )
+        with temporary:
+            action, reason = decision(path, TASKS[0])
+            self.assertEqual(action, "skip")
+            self.assertIn(DOWNLOAD_TASKS[0], reason)
+
+    def test_running_peer_webp_skips_webp(self):
+        temporary, path = self.database(
+            is_executing=1,
+            active_records=1,
+            executing_peer=TASKS[1],
+        )
+        with temporary:
+            action, reason = decision(path, TASKS[0])
+            self.assertEqual(action, "skip")
+            self.assertIn(TASKS[1], reason)
 
 
 if __name__ == "__main__":

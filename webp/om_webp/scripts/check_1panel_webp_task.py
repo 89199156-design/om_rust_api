@@ -10,7 +10,9 @@ import sys
 from pathlib import Path
 
 
+DOWNLOAD_TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD")
 TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD")
+ALL_PRODUCTION_TASKS = DOWNLOAD_TASKS + TASKS
 ACTIVE_RECORD_STATUSES = ("Running", "Waiting")
 
 
@@ -18,12 +20,20 @@ def decision(database: Path, current_task: str) -> tuple[str, str]:
     if current_task not in TASKS:
         raise ValueError(f"unsupported WebP task: {current_task}")
     with closing(sqlite3.connect(database)) as connection:
-        row = connection.execute(
-            "select id, is_executing from cronjobs where name = ?", (current_task,)
-        ).fetchone()
-        if row is None:
-            raise RuntimeError(f"1Panel WebP task is missing: {current_task}")
-        task_id, is_executing = int(row[0]), int(row[1] or 0)
+        rows = {
+            str(name): (int(task_id), int(is_executing or 0))
+            for task_id, name, is_executing in connection.execute(
+                "select id, name, is_executing from cronjobs "
+                "where name in (?, ?, ?, ?)",
+                ALL_PRODUCTION_TASKS,
+            )
+        }
+        missing = [name for name in ALL_PRODUCTION_TASKS if name not in rows]
+        if missing:
+            raise RuntimeError(
+                f"1Panel production task is missing: {', '.join(missing)}"
+            )
+        task_id, is_executing = rows[current_task]
         active_records = int(
             connection.execute(
                 "select count(*) from job_records where cronjob_id = ? and status in (?, ?)",
@@ -35,7 +45,14 @@ def decision(database: Path, current_task: str) -> tuple[str, str]:
     # than one active record means an older instance is still present.
     if is_executing == 1 and active_records > 1:
         return "skip", "本任务已有上一实例仍在执行"
-    return "run", "本任务没有上一执行实例"
+    conflicts = [
+        name
+        for name in ALL_PRODUCTION_TASKS
+        if name != current_task and rows[name][1] == 1
+    ]
+    if conflicts:
+        return "skip", f"{', '.join(conflicts)} 正在执行"
+    return "run", "其他下载与 WebP 任务均未执行"
 
 
 def main() -> int:

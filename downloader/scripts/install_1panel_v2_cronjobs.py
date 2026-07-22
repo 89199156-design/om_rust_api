@@ -182,17 +182,17 @@ def download_group_script(
 
 def downloader_tasks() -> list[tuple[str, str, str]]:
     return [
-        ("OM_GFS_DOWNLOAD", "0,20,40 * * * *", download_group_script("gfs")),
-        ("OM_CAMS_DOWNLOAD", "10,30,50 * * * *", download_group_script("cams")),
+        ("OM_GFS_DOWNLOAD", "0 * * * *&&20 * * * *&&40 * * * *", download_group_script("gfs")),
+        ("OM_CAMS_DOWNLOAD", "10 * * * *&&30 * * * *&&50 * * * *", download_group_script("cams")),
     ]
 
 
 def api_publisher_tasks(*, raw_root: Path) -> list[tuple[str, str, str]]:
     return [
-        ("OM_GFS_DOWNLOAD", "0,20,40 * * * *", download_group_script("gfs", publish_root=raw_root)),
+        ("OM_GFS_DOWNLOAD", "0 * * * *&&20 * * * *&&40 * * * *", download_group_script("gfs", publish_root=raw_root)),
         (
             "OM_CAMS_DOWNLOAD",
-            "10,30,50 * * * *",
+            "10 * * * *&&30 * * * *&&50 * * * *",
             download_group_script("cams", publish_root=raw_root),
         ),
     ]

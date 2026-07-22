@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from scripts.check_1panel_download_tasks import TASKS, decision
+from scripts.check_1panel_download_tasks import ALL_PRODUCTION_TASKS, TASKS, decision
 
 
 class DownloadTaskGateTests(unittest.TestCase):
@@ -20,19 +20,34 @@ class DownloadTaskGateTests(unittest.TestCase):
         return temporary, path
 
     def test_current_1panel_row_does_not_block_its_own_invocation(self):
-        temporary, path = self.database({TASKS[0]: 1, TASKS[1]: 0})
+        states = {name: 0 for name in ALL_PRODUCTION_TASKS}
+        states[TASKS[0]] = 1
+        temporary, path = self.database(states)
         with temporary:
             self.assertEqual(decision(path, TASKS[0])[0], "run")
 
     def test_running_peer_skips_without_starting_download(self):
-        temporary, path = self.database({TASKS[0]: 1, TASKS[1]: 1})
+        states = {name: 0 for name in ALL_PRODUCTION_TASKS}
+        states[TASKS[0]] = states[TASKS[1]] = 1
+        temporary, path = self.database(states)
         with temporary:
             action, reason = decision(path, TASKS[0])
             self.assertEqual(action, "skip")
             self.assertIn(TASKS[1], reason)
 
+    def test_running_webp_task_skips_without_starting_download(self):
+        states = {name: 0 for name in ALL_PRODUCTION_TASKS}
+        states[TASKS[0]] = states[ALL_PRODUCTION_TASKS[-1]] = 1
+        temporary, path = self.database(states)
+        with temporary:
+            action, reason = decision(path, TASKS[0])
+            self.assertEqual(action, "skip")
+            self.assertIn(ALL_PRODUCTION_TASKS[-1], reason)
+
     def test_missing_task_is_configuration_error(self):
-        temporary, path = self.database({TASKS[0]: 1})
+        states = {name: 0 for name in ALL_PRODUCTION_TASKS}
+        states.pop(TASKS[1])
+        temporary, path = self.database(states)
         with temporary, self.assertRaisesRegex(RuntimeError, TASKS[1]):
             decision(path, TASKS[0])
 

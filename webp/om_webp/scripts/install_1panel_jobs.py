@@ -27,7 +27,11 @@ def ensure_group(cur: sqlite3.Cursor, timestamp: str) -> int:
 
 
 def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, object]:
-    spec = "5,25,45 * * * *" if scope == "gfs" else "15,35,55 * * * *"
+    spec = (
+        "5 * * * *&&25 * * * *&&45 * * * *"
+        if scope == "gfs"
+        else "15 * * * *&&35 * * * *&&55 * * * *"
+    )
     script = "\n".join(
         [
             "#!/usr/bin/env bash",

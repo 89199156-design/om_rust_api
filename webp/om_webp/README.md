@@ -32,9 +32,19 @@ uses every available CPU and is reserved for isolated/offline rendering.
 
 The native 1Panel jobs `OM_GFS_WEBP_BUILD` and `OM_CAMS_WEBP_BUILD` are
 scheduled only by 1Panel. Their panel scripts query `agent.db` before starting;
-an older active instance exits successfully. They compare the source
+an older active instance or any running OM download/WebP peer exits
+successfully without creating a separate lock. They compare the source
 `release_id` with the local completion marker, so unchanged releases also exit
 immediately without loading the OM snapshot.
+
+Production binaries are built and installed from a clean Git worktree with:
+
+```bash
+/usr/bin/env bash webp/om_webp/scripts/install_om_webp.sh
+```
+
+The installer records the exact Git revision and SHA-256 identities under the
+production application directory.
 
 ## Verification
 

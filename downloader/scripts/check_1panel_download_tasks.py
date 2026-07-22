@@ -11,30 +11,38 @@ from pathlib import Path
 
 
 TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD")
+WEBP_TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD")
+ALL_PRODUCTION_TASKS = TASKS + WEBP_TASKS
 
 
 def decision(database: Path, current_task: str) -> tuple[str, str]:
     if current_task not in TASKS:
         raise ValueError(f"unsupported download task: {current_task}")
 
-    peer_task = TASKS[1] if current_task == TASKS[0] else TASKS[0]
     with closing(sqlite3.connect(database)) as connection:
         rows = {
             str(name): int(is_executing or 0)
             for name, is_executing in connection.execute(
-                "select name, is_executing from cronjobs where name in (?, ?)", TASKS
+                "select name, is_executing from cronjobs where name in (?, ?, ?, ?)",
+                ALL_PRODUCTION_TASKS,
             )
         }
 
-    missing = [name for name in TASKS if name not in rows]
+    missing = [name for name in ALL_PRODUCTION_TASKS if name not in rows]
     if missing:
-        raise RuntimeError(f"1Panel download task is missing: {', '.join(missing)}")
+        raise RuntimeError(f"1Panel production task is missing: {', '.join(missing)}")
 
     # 1Panel marks the current row as executing before invoking its script, so
-    # that row represents this invocation.  A running peer is the only conflict.
-    if rows[peer_task] == 1:
-        return "skip", f"{peer_task} 正在执行"
-    return "run", "两个下载任务均无其他执行实例"
+    # that row represents this invocation. All other production jobs share the
+    # native data tree and must be idle while a download publishes atomically.
+    conflicts = [
+        name
+        for name in ALL_PRODUCTION_TASKS
+        if name != current_task and rows[name] == 1
+    ]
+    if conflicts:
+        return "skip", f"{', '.join(conflicts)} 正在执行"
+    return "run", "其他下载与 WebP 任务均未执行"
 
 
 def main() -> int:

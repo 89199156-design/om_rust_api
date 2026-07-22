@@ -252,6 +252,21 @@ fi
 install -m 0755 -- "$BUILD_BINARY" "$BIN_DIR/om-api"
 install -m 0755 -- "$MATERIALIZER_BUILD_BINARY" "$BIN_DIR/om-native-materialize"
 
+BUILD_INFO_TMP="$(mktemp "$BIN_DIR/.om-api.build-info.tmp.XXXXXX")"
+cleanup_build_info_tmp() {
+  rm -f -- "$BUILD_INFO_TMP"
+}
+trap cleanup_build_info_tmp EXIT
+{
+  printf 'git_revision=%s\n' "$SOURCE_REVISION"
+  printf 'binary_sha256=%s\n' "$(sha256sum -- "$BIN_DIR/om-api" | awk '{print $1}')"
+  printf 'built_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$BUILD_INFO_TMP"
+chmod 0644 "$BUILD_INFO_TMP"
+mv -f -- "$BUILD_INFO_TMP" "$BIN_DIR/om-api.build-info"
+BUILD_INFO_TMP=""
+trap - EXIT
+
 SOURCE_REVISION_TMP="$(mktemp "$INSTALL_DIR/.source-revision.tmp.XXXXXX")"
 cleanup_source_revision_tmp() {
   rm -f -- "$SOURCE_REVISION_TMP"

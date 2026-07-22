@@ -46,8 +46,14 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(
             [(name, spec) for name, spec, _script in publisher_tasks],
             [
-                ("OM_GFS_DOWNLOAD", "0,20,40 * * * *"),
-                ("OM_CAMS_DOWNLOAD", "10,30,50 * * * *"),
+                (
+                    "OM_GFS_DOWNLOAD",
+                    "0 * * * *&&20 * * * *&&40 * * * *",
+                ),
+                (
+                    "OM_CAMS_DOWNLOAD",
+                    "10 * * * *&&30 * * * *&&50 * * * *",
+                ),
             ],
         )
         for name, _spec, script in publisher_tasks:
