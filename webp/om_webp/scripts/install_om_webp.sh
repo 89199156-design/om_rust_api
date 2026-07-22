@@ -22,6 +22,18 @@ if ! command -v sha256sum >/dev/null 2>&1; then
   echo "sha256sum is required to record the deployed binary identity" >&2
   exit 1
 fi
+
+SUDO=""
+if [[ "$(id -u)" -ne 0 ]]; then
+  SUDO="sudo"
+fi
+run_privileged() {
+  if [[ -n "$SUDO" ]]; then
+    "$SUDO" "$@"
+  else
+    "$@"
+  fi
+}
 if ! git -C "$REPOSITORY_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "WebP production deployment requires a Git worktree: $REPOSITORY_ROOT" >&2
   exit 1
@@ -47,7 +59,7 @@ cargo build --release \
   --bin om-webp-api-verify \
   --bin om-webp-inspect
 
-install -d -m 0755 "$BIN_DIR" "$INSTALL_DIR/data/current" \
+run_privileged install -d -m 0755 "$BIN_DIR" "$INSTALL_DIR/data/current" \
   "$INSTALL_DIR/data/logs" "$INSTALL_DIR/data/releases" \
   "$INSTALL_DIR/data/staging"
 for binary in "${BINARIES[@]}"; do
@@ -56,17 +68,22 @@ for binary in "${BINARIES[@]}"; do
     echo "cargo build completed but binary is missing: $build_binary" >&2
     exit 1
   fi
-  install -m 0755 -- "$build_binary" "$BIN_DIR/$binary"
+  run_privileged install -m 0755 -- "$build_binary" "$BIN_DIR/$binary"
 done
 
-ln -sfn -- "$REPOSITORY_ROOT/webp" "$INSTALL_DIR/source"
-ln -sfn -- "$REPOSITORY_ROOT/webp/om_webp/scripts" "$INSTALL_DIR/scripts"
-ln -sfn -- "$REPOSITORY_ROOT/webp/om_webp/README.md" "$INSTALL_DIR/README.md"
+run_privileged ln -sfn -- "$REPOSITORY_ROOT/webp" "$INSTALL_DIR/source"
+run_privileged ln -sfn -- \
+  "$REPOSITORY_ROOT/webp/om_webp/scripts" "$INSTALL_DIR/scripts"
+run_privileged ln -sfn -- \
+  "$REPOSITORY_ROOT/webp/om_webp/README.md" "$INSTALL_DIR/README.md"
 
-REVISION_TMP="$(mktemp "$INSTALL_DIR/.source-revision.tmp.XXXXXX")"
-BUILD_INFO_TMP="$(mktemp "$BIN_DIR/.om-webp.build-info.tmp.XXXXXX")"
+REVISION_TMP="$(mktemp)"
+BUILD_INFO_TMP="$(mktemp)"
+REVISION_STAGED="$INSTALL_DIR/.source-revision.tmp.$$"
+BUILD_INFO_STAGED="$BIN_DIR/.om-webp.build-info.tmp.$$"
 cleanup_metadata_tmp() {
   rm -f -- "$REVISION_TMP" "$BUILD_INFO_TMP"
+  run_privileged rm -f -- "$REVISION_STAGED" "$BUILD_INFO_STAGED"
 }
 trap cleanup_metadata_tmp EXIT
 printf '%s\n' "$SOURCE_REVISION" > "$REVISION_TMP"
@@ -79,9 +96,13 @@ printf '%s\n' "$SOURCE_REVISION" > "$REVISION_TMP"
   done
   printf 'built_at_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$BUILD_INFO_TMP"
-chmod 0644 "$REVISION_TMP" "$BUILD_INFO_TMP"
-mv -f -- "$REVISION_TMP" "$SOURCE_REVISION_FILE"
-mv -f -- "$BUILD_INFO_TMP" "$BUILD_INFO_FILE"
+run_privileged install -m 0644 -- "$REVISION_TMP" "$REVISION_STAGED"
+run_privileged install -m 0644 -- "$BUILD_INFO_TMP" "$BUILD_INFO_STAGED"
+run_privileged mv -f -- "$REVISION_STAGED" "$SOURCE_REVISION_FILE"
+run_privileged mv -f -- "$BUILD_INFO_STAGED" "$BUILD_INFO_FILE"
+REVISION_STAGED=""
+BUILD_INFO_STAGED=""
+rm -f -- "$REVISION_TMP" "$BUILD_INFO_TMP"
 REVISION_TMP=""
 BUILD_INFO_TMP=""
 trap - EXIT
