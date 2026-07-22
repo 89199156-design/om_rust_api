@@ -752,7 +752,7 @@ impl DailyWeatherAggregation {
             | Self::Mean(variable)
             | Self::Sum(variable)
             | Self::PrecipitationHours(variable) => variable,
-            Self::DominantWindDirection => "wind_u_component_10m",
+            Self::DominantWindDirection => "wind_speed_10m",
         }
     }
 
@@ -1015,25 +1015,26 @@ fn daily_weather_value(
         let mut v_sum = 0.0_f32;
         let mut time = start;
         while time < end {
-            let u = read_daily_hour(
+            let speed = read_daily_hour(
                 snapshot,
                 decoder,
-                "wind_u_component_10m",
+                "wind_speed_10m",
                 time,
                 latitude,
                 longitude,
             )?;
-            let v = read_daily_hour(
+            let direction = read_daily_hour(
                 snapshot,
                 decoder,
-                "wind_v_component_10m",
+                "wind_direction_10m",
                 time,
                 latitude,
                 longitude,
             )?;
-            if !u.is_finite() || !v.is_finite() {
+            if !speed.is_finite() || !direction.is_finite() {
                 return Ok(f32::NAN);
             }
+            let (u, v) = wind_components(speed, direction);
             u_sum += u;
             v_sum += v;
             time += Duration::hours(1);
@@ -6516,6 +6517,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wind_direction_matches_pinned_official_fast_approximation() {
+        let inputs = [
+            (-1.0, -3.0),
+            (-0.0, -2.0),
+            (0.0, -1.0),
+            (1.0, -0.0),
+            (2.0, 0.0),
+            (3.0, 1.0),
+            (4.0, 2.0),
+            (5.0, 3.0),
+            (6.0, 4.0),
+        ];
+        // Bit patterns captured from the pinned official C source compiled for
+        // the same Linux/x86_64 production target.
+        let expected = [
+            f32::from_bits(0x41937b00),
+            f32::from_bits(0x43b40000),
+            f32::from_bits(0x43b40000),
+            f32::from_bits(0x43870000),
+            f32::from_bits(0x43870000),
+            f32::from_bits(0x437b90a1),
+            f32::from_bits(0x43736f5d),
+            f32::from_bits(0x436f094c),
+            f32::from_bits(0x436c4f56),
+        ];
+
+        let actual = inputs.map(|(u, v)| wind_direction(u, v));
+        assert_eq!(actual, expected);
+        assert!(wind_direction(f32::NAN, 1.0).is_nan());
+    }
+
+    #[test]
     fn hj633_co_interpolation_does_not_ceil_exact_integer_due_to_f32_noise() {
         assert_eq!(
             hj633_2026_iaqi(0.6, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
@@ -7547,6 +7580,14 @@ fn thunderstorm_probability(
     (base_probability * cloud_cover_factor * latitude_factor).clamp(0.0, 100.0)
 }
 
+fn wind_components(speed: f32, direction_degrees: f32) -> (f32, f32) {
+    let radians = direction_degrees * std::f32::consts::PI / 180.0;
+    (-1.0 * speed * radians.sin(), -1.0 * speed * radians.cos())
+}
+
+/// Port of Open-Meteo's pinned `CHelper/src/shim.c::windirectionFast`.
+/// Keep all constants and operations in single precision and preserve the
+/// nested fused multiply-add sequence used by the official implementation.
 fn wind_direction(u: f32, v: f32) -> f32 {
     if v == 0.0 {
         return if u < 0.0 { 90.0 } else { 270.0 };
@@ -7554,7 +7595,28 @@ fn wind_direction(u: f32, v: f32) -> f32 {
     if u == 0.0 {
         return if v < 0.0 { 360.0 } else { 180.0 };
     }
-    180.0 + u.atan2(v).to_degrees()
+
+    let swap = v.abs() < u.abs();
+    let atan_input = if swap { v / u } else { u / v };
+    let x_sq = atan_input * atan_input;
+    let polynomial = x_sq.mul_add(
+        x_sq.mul_add(
+            x_sq.mul_add(
+                x_sq.mul_add(x_sq.mul_add(-0.01172120, 0.05265332), -0.11643287),
+                0.19354346,
+            ),
+            -0.33262347,
+        ),
+        0.99997726,
+    );
+    let mut result = atan_input * polynomial;
+    if swap {
+        result = std::f32::consts::FRAC_PI_2.copysign(atan_input) - result;
+    }
+    if v < 0.0 {
+        result += std::f32::consts::PI.copysign(u);
+    }
+    result * (180.0 / std::f32::consts::PI) + 180.0
 }
 
 fn wind_scale_factor(from: f32, to: f32) -> f32 {
