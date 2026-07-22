@@ -69,6 +69,9 @@ class InstallOmApiTests(unittest.TestCase):
             self.content,
         )
 
+    def test_service_file_limit_covers_native_forecast_inventory(self) -> None:
+        self.assertIn("LimitNOFILE=65536", self.content)
+
     def test_installer_rejects_bad_download_without_leaving_a_target(self) -> None:
         functions_start = self.content.index("run_privileged() {")
         functions_end = self.content.index(

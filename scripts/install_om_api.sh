@@ -287,6 +287,7 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$BIN_DIR/om-api
 Restart=always
 RestartSec=3
+LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 
