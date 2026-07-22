@@ -22,6 +22,7 @@ NATIVE_LIB = APP_DIR / "native" / "libom_turbopfor.so"
 CONFIG = APP_DIR / "config" / "models.json"
 PYTHON = Path("/usr/bin/python3")
 PROGRESS_REPORTER = APP_DIR / "scripts" / "task_progress_reporter.py"
+GFS_MATERIALIZER = APP_DIR / "scripts" / "materialize_openmeteo_gfs.sh"
 LOG_DIR = APP_DIR / "data" / "logs"
 PRODUCTS = (
     "gfs013_surface",
@@ -87,6 +88,8 @@ def download_group_script(
     publish_args = []
     if publish_root is not None:
         publish_args = [f"--publish-openmeteo-group-to {shell_path(publish_root)} "]
+        if group == "gfs":
+            publish_args.append("--defer-openmeteo-gfs-activation ")
     command = (
         "/usr/bin/python3 -m om_downloader.cli "
         f"--download-openmeteo-group {group} "
@@ -148,6 +151,14 @@ def download_group_script(
             f"  cd {shell_path(APP_DIR)}",
             f"  export OM_TURBOPFOR_LIB={shell_path(NATIVE_LIB)}",
             f"  {command}",
+            *(
+                [
+                    f"  /usr/bin/env bash {shell_path(GFS_MATERIALIZER)} "
+                    f"--raw-root {shell_path(publish_root)}"
+                ]
+                if group == "gfs" and publish_root is not None
+                else []
+            ),
             "}",
             "run_reported_download() {",
             "  (",
@@ -207,6 +218,8 @@ def source_sync_task_script(
         "--source-known-hosts", shell_path(source_known_hosts),
         "--cleanup-grace-seconds", "300",
     ]
+    if group == "gfs":
+        arguments.append("--defer-gfs-activation")
     command = " ".join(
         [
             "/usr/bin/env",

@@ -1,5 +1,7 @@
 target/
 bin/
+!om_api/src/bin/
+!om_api/src/bin/*.rs
 native/
 *.so
 *.env

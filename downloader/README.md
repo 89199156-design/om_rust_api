@@ -56,6 +56,23 @@ cd /opt/1panel/apps/weather_om_downloader && OM_TURBOPFOR_LIB=/opt/1panel/apps/w
 cd /opt/1panel/apps/weather_om_downloader && OM_TURBOPFOR_LIB=/opt/1panel/apps/weather_om_downloader/native/libom_turbopfor.so /usr/bin/python3 -m om_downloader.cli --download-openmeteo-group cams --config config/models.json --output data --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 ```
 
+To recover one exact historical GFS short run into the legacy retained-release store, first
+stop the production GFS download/sync tasks, then run the production CLI with an explicit
+run and retention target:
+
+```bash
+cd /opt/1panel/apps/weather_om_downloader && OM_TURBOPFOR_LIB=/opt/1panel/apps/weather_om_downloader/native/libom_turbopfor.so /usr/bin/python3 -m om_downloader.cli --recover-openmeteo-gfs-short-run 2026071918 --retain-openmeteo-group-to /data/om_raw --config config/models.json --output data --download-workers 6
+```
+
+The recovery command loads the exact historical Open-Meteo run metadata, requires coherent
+`f000..f005` coverage for all three GFS products, downloads through the normal production
+range/manifest/checksum path, and calls the normal retained-release promotion. It never calls
+release activation, never writes product or group `current` markers, and verifies those marker
+bytes remain unchanged. Recovery payloads use `data/recovery/gfs/<run>/`; verified payloads are
+removed from that staging area after they have been retained, while failed payloads remain
+restartable. The command does not prune other retained releases. Re-enable scheduled tasks only
+after the retained window and downstream publication have been validated.
+
 If the 1Panel installer script is not used, create these as two separate 1Panel plan tasks. Do not put them in system `cron` or `systemd timer`.
 Production 1Panel commands should use `--download-workers 6` but should not set `--range-io-size-max` for the OM main channel. Workers parallelise metadata/LUT planning and Range reads; they do not split output into small files. Each product writes one cropped coverage bundle, and artificial 4 MiB splitting would reintroduce excessive HTTP Range overhead.
 The 1Panel scripts query `/opt/1panel/db/agent.db` before downloading. If the peer GFS/CAMS task is already executing, the new invocation exits successfully without entering download logic. The production group commands do not create filesystem task locks.
@@ -173,3 +190,23 @@ Rules:
 - Product downloads publish `.omranges` files plus manifest byte-range metadata. Shanghai must treat these as range bundles, not full `.om` files.
 - Product downloads record `missing_object_required_variables`; if a required variable is present in the run catalog but absent from an individual valid-time object, `status` is forced to `incomplete`.
 - Publish only complete and checksummed `latest.json` manifests.
+
+## Shanghai native GFS publication
+
+The Shanghai API publisher keeps the five retained legacy source releases
+(three `f000...f005` runs followed by two complete `f000...f384` runs) separate
+from the runtime-native coverage. GFS download or source-sync tasks use deferred
+legacy activation, then call the committed `scripts/materialize_openmeteo_gfs.sh`.
+The helper holds a filesystem lock and invokes the installed production
+`om-native-materialize`; it never hard-codes a batch.
+
+Materialisation expands the official sparse GFS cadence to 385 hourly frames
+with the pinned Open-Meteo interpolation and quantisation semantics, validates
+the complete immutable coverage, switches the convenience symlink, and writes
+the ready marker last. A failed build therefore leaves the previous native
+coverage active. Before writing, a conservative disk estimate must leave at
+least 2 GiB free by default. After a successful publication, lifecycle cleanup
+retains the current coverage plus one rollback coverage and age-gates cleanup
+of stale staging. Automatic deletion is limited to exact generated identities
+carrying the production lifecycle marker; unknown directories, symlinks,
+custom IDs, and manually renamed backups are never cleanup candidates.

@@ -5,6 +5,7 @@ from scripts.install_1panel_v2_cronjobs import (
     REMOVED_PLACEHOLDER_TASKS,
     api_publisher_tasks,
     api_source_sync_tasks,
+    downloader_tasks,
 )
 
 
@@ -53,6 +54,22 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn("check_1panel_download_tasks.py", script)
             self.assertIn(f"--current-task {name}", script)
             self.assertNotIn("flock", script)
+        publisher_scripts = {name: script for name, _spec, script in publisher_tasks}
+        self.assertIn(
+            "--defer-openmeteo-gfs-activation",
+            publisher_scripts["OM_GFS_DOWNLOAD"],
+        )
+        self.assertIn(
+            "materialize_openmeteo_gfs.sh --raw-root /tmp/raw",
+            publisher_scripts["OM_GFS_DOWNLOAD"],
+        )
+        self.assertNotIn(
+            "materialize_openmeteo_gfs.sh",
+            publisher_scripts["OM_CAMS_DOWNLOAD"],
+        )
+        for _name, _spec, script in downloader_tasks():
+            self.assertNotIn("materialize_openmeteo_gfs.sh", script)
+            self.assertNotIn("--defer-openmeteo-gfs-activation", script)
 
         removed_names = (
             "OM_BUILD_GFS013_SURFACE",
@@ -108,6 +125,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--raw-root /tmp/raw", scripts["OM_GFS_SOURCE_SYNC"])
         self.assertIn("sudo -H -u ubuntu", scripts["OM_GFS_SOURCE_SYNC"])
         self.assertIn("sudo -H -u ubuntu", scripts["OM_CAMS_SOURCE_SYNC"])
+        self.assertIn("--defer-gfs-activation", scripts["OM_GFS_SOURCE_SYNC"])
+        self.assertNotIn("--defer-gfs-activation", scripts["OM_CAMS_SOURCE_SYNC"])
 
         sync_content = Path("scripts/sync_openmeteo_source_group.sh").read_text(
             encoding="utf-8"
@@ -121,10 +140,20 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("--source-known-hosts", sync_content)
         self.assertIn("source_reconciliation_running", sync_content)
         self.assertIn("source publication changed during synchronization", sync_content)
+        self.assertIn("gfs) RETENTION=5", sync_content)
         self.assertIn("manifest_status=0", sync_content)
         self.assertIn("payload_status=0", sync_content)
         self.assertIn('if [ "$manifest_status" -eq 23 ]', sync_content)
         self.assertIn('if [ "$payload_status" -eq 23 ]', sync_content)
+        self.assertIn("--defer-openmeteo-gfs-activation", sync_content)
+        self.assertIn("materialize_openmeteo_gfs.sh", sync_content)
+
+        materializer_content = Path("scripts/materialize_openmeteo_gfs.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("flock -n 9", materializer_content)
+        self.assertIn("build-and-publish", materializer_content)
+        self.assertNotIn("2026072018", materializer_content)
 
 
 if __name__ == "__main__":

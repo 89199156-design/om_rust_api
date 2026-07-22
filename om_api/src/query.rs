@@ -4676,7 +4676,7 @@ fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) ->
 /// sparse interval is filled, its C value is deaveraged in place and becomes
 /// the already-processed A/B input of later intervals. A pointwise four-frame
 /// calculation cannot reproduce sunrise and sunset boundaries.
-fn interpolate_solar_backwards_in_place(
+pub(crate) fn interpolate_solar_backwards_in_place(
     values: &mut [f32],
     start: DateTime<Utc>,
     latitude: f64,
@@ -5214,7 +5214,7 @@ fn native_dt_seconds_at(times: &[DateTime<Utc>], index: usize) -> i64 {
     (times[index + 1] - times[index]).num_seconds()
 }
 
-fn round_to_scalefactor(value: f32, scalefactor: f32) -> f32 {
+pub(crate) fn round_to_scalefactor(value: f32, scalefactor: f32) -> f32 {
     (value * scalefactor).round() / scalefactor
 }
 
@@ -5227,7 +5227,7 @@ fn maybe_round_to_scalefactor(value: f32, scalefactor: f32, round_values: bool) 
 }
 
 #[derive(Debug, Clone, Copy)]
-enum InterpolationKind {
+pub(crate) enum InterpolationKind {
     Direct,
     SolarBackwardsAveraged {
         scalefactor: f32,
@@ -5247,7 +5247,7 @@ enum InterpolationKind {
     },
 }
 
-fn interpolation_kind_for_variable(variable: &str) -> InterpolationKind {
+pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKind {
     if is_cams_variable(variable) {
         return cams_interpolation_kind(variable);
     }

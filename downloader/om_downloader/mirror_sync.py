@@ -724,6 +724,7 @@ def sync_retained_group_releases_from_mirror(
     output_root: Path,
     *,
     retain_complete_releases: int = DEFAULT_COMPLETE_RELEASE_RETENTION,
+    activate_current: bool = True,
     now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     if group not in OPENMETEO_GROUP_PRODUCTS:
@@ -793,7 +794,11 @@ def sync_retained_group_releases_from_mirror(
         _write_group_release(output_root, group, release, mirror_root, now_utc=now)
 
     newest_release = desired[0][1]
-    activation = activate_group_release(output_root, group, newest_release, now_utc=now)
+    activation = (
+        activate_group_release(output_root, group, newest_release, now_utc=now)
+        if activate_current
+        else None
+    )
     pruned = prune_expired_group_releases(
         output_root,
         group,
@@ -812,6 +817,7 @@ def sync_retained_group_releases_from_mirror(
         ],
         "synced_coverages": len(promoted),
         "activation": activation,
+        "activation_deferred": not activate_current,
         "pruned_raw_paths": pruned,
     }
 
@@ -862,27 +868,58 @@ def prune_expired_group_releases(
     releases = _load_complete_group_releases(output_root, group)
     current_path = output_root / "groups" / group / "current" / "ready_for_processing.json"
     current_release_id: str | None = None
+    current_is_native = False
     if current_path.exists():
         current = _load_json(current_path)
         current_release_id = group_release_id(current)
-        if all(payload.get("release_id") != current_release_id for _, payload in releases):
+        current_is_native = current.get("runtime_format") == "openmeteo-native-v1"
+        if not current_is_native and all(
+            payload.get("release_id") != current_release_id for _, payload in releases
+        ):
             payload = json.loads(json.dumps(current))
             payload["release_id"] = current_release_id
             _atomic_write_json(_release_path(output_root, group, current_release_id), payload)
             releases = _load_complete_group_releases(output_root, group)
 
+    # Old native publishers briefly wrote a second, non-canonical release for
+    # the same source run.  Prefer the canonical legacy source release before
+    # applying distinct-run retention so migration cleans the duplicate instead
+    # of deleting the source identity required by the materializer.
+    releases.sort(
+        key=lambda release: (
+            str(release[1].get("latest_complete_run") or ""),
+            str(release[1].get("release_id") or "")
+            == group_release_id(release[1]),
+            str(release[1].get("synced_at") or ""),
+            str(release[1].get("release_id") or ""),
+        ),
+        reverse=True,
+    )
+
     retained_releases: list[tuple[Path, dict[str, Any]]] = []
     expired_releases: list[tuple[Path, dict[str, Any]]] = []
     retained_runs: set[str] = set()
+    preserve_release_id = current_release_id if preserve_current and not current_is_native else None
+    if preserve_release_id is not None:
+        current_release = next(
+            (
+                release
+                for release in releases
+                if str(release[1].get("release_id") or group_release_id(release[1]))
+                == preserve_release_id
+            ),
+            None,
+        )
+        if current_release is not None:
+            retained_releases.append(current_release)
+            retained_runs.add(str(current_release[1].get("latest_complete_run") or ""))
     for release in releases:
         payload = release[1]
         run = str(payload.get("latest_complete_run") or "")
         release_id = str(payload.get("release_id") or group_release_id(payload))
-        if preserve_current and release_id == current_release_id:
-            retained_releases.append(release)
-            retained_runs.add(run)
+        if preserve_release_id is not None and release_id == preserve_release_id:
             continue
-        if run in retained_runs or len(retained_releases) >= retain_complete_releases:
+        if run in retained_runs or len(retained_runs) >= retain_complete_releases:
             expired_releases.append(release)
             continue
         retained_runs.add(run)

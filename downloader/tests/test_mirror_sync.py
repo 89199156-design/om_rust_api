@@ -9,6 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from om_downloader.mirror_sync import (
+    group_release_id,
+    prune_expired_group_releases,
     sync_from_manifest_path,
     sync_from_manifest_url,
     sync_group_from_mirror,
@@ -920,6 +922,75 @@ class MirrorSyncTests(unittest.TestCase):
                 (output_root / greenhouse / "coverages" / new_greenhouse_coverage).exists()
             )
             self.assertTrue((mirror_root / product / "coverages" / new_coverage).exists())
+
+    def test_native_current_and_duplicate_do_not_consume_gfs_retention_slots(self):
+        products = ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+        runs = ["2026072018", "2026072012", "2026072006", "2026072000", "2026071918"]
+
+        def release(run: str) -> dict:
+            payload = {
+                "group": "gfs",
+                "status": "complete",
+                "latest_complete_run": run,
+                "product_manifests": {
+                    product: {
+                        "coverage_id": f"{product}_{run}",
+                        "status": "complete",
+                        "latest_complete_run": run,
+                    }
+                    for product in products
+                },
+            }
+            payload["release_id"] = group_release_id(payload)
+            return payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases_root = root / "groups" / "gfs" / "releases"
+            releases_root.mkdir(parents=True)
+            payloads = [release(run) for run in runs]
+            for payload in payloads:
+                (releases_root / f"{payload['release_id']}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+
+            native = dict(payloads[0])
+            native.update(
+                {
+                    "runtime_format": "openmeteo-native-v1",
+                    "coverage_id": "gfs_native_2026072018_old",
+                    "coverage_path": "coverages/gfs/gfs_native_2026072018_old",
+                }
+            )
+            current = root / "groups" / "gfs" / "current"
+            current.mkdir(parents=True)
+            (current / "ready_for_processing.json").write_text(
+                json.dumps(native), encoding="utf-8"
+            )
+            duplicate = dict(native)
+            duplicate["release_id"] = duplicate["coverage_id"]
+            duplicate_path = releases_root / f"{duplicate['release_id']}.json"
+            duplicate_path.write_text(json.dumps(duplicate), encoding="utf-8")
+
+            for _ in range(2):
+                prune_expired_group_releases(
+                    root,
+                    "gfs",
+                    retain_complete_releases=5,
+                    preserve_current=True,
+                )
+
+            retained = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in releases_root.glob("*.json")
+            ]
+            duplicate_removed = not duplicate_path.exists()
+
+        self.assertEqual(
+            {payload["latest_complete_run"] for payload in retained}, set(runs)
+        )
+        self.assertEqual(len(retained), 5)
+        self.assertTrue(duplicate_removed)
 
 
 if __name__ == "__main__":

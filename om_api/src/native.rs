@@ -632,9 +632,10 @@ pub fn load_native_group_products(
     {
         bail!("native coverage path does not match marker identity");
     }
-    if data_root.join("current").join(group).canonicalize()? != coverage_root {
-        bail!("native current pointer does not match ready marker");
-    }
+    // The ready marker is the authoritative atomic publication point.  The
+    // convenience `current/<group>` symlink is updated immediately before the
+    // marker, so a process starting in that tiny window must continue loading
+    // the immutable coverage named by the old marker instead of failing startup.
     if group == "gfs" {
         validate_dem(&coverage_root, &ready)?;
     }

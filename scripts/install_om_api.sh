@@ -24,6 +24,7 @@ if [[ "$BUILD_TARGET_DIR" != /* ]]; then
   exit 2
 fi
 BUILD_BINARY="$BUILD_TARGET_DIR/release/om-api"
+MATERIALIZER_BUILD_BINARY="$BUILD_TARGET_DIR/release/om-native-materialize"
 if [[ "$API_DEM_ROOT" != /* ]]; then
   echo "OM_API_DEM_ROOT must be an absolute path: $API_DEM_ROOT" >&2
   exit 2
@@ -31,8 +32,52 @@ fi
 DEM_STATIC_DIR="$API_DEM_ROOT/copernicus_dem90/static"
 BIN_DIR="$INSTALL_DIR/bin"
 NATIVE_DIR="$INSTALL_DIR/native"
+SOURCE_REVISION_FILE="$INSTALL_DIR/source-revision"
 ENV_FILE="$INSTALL_DIR/${SERVICE_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+PINNED_OM_FILE_FORMAT_REF="71f422b2706d8a81f1cecf52ae3073990de1ddbe"
+
+resolve_source_revision() {
+  local requested_revision="${OM_API_SOURCE_REVISION:-}"
+  local resolved_revision=""
+  local repository_revision=""
+  local worktree_status=""
+
+  if command -v git >/dev/null 2>&1 \
+    && git -C "$APP_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    repository_revision="$(git -C "$APP_ROOT" rev-parse --verify 'HEAD^{commit}')"
+    worktree_status="$(git -C "$APP_ROOT" status --porcelain=v1 --untracked-files=all)"
+    if [[ -n "$worktree_status" ]]; then
+      echo "refusing to deploy from a dirty source worktree: $APP_ROOT" >&2
+      printf '%s\n' "$worktree_status" >&2
+      return 1
+    fi
+    if [[ -n "$requested_revision" ]] \
+      && [[ "$requested_revision" != "$repository_revision" ]]; then
+      echo "OM_API_SOURCE_REVISION does not match source HEAD: requested=$requested_revision head=$repository_revision" >&2
+      return 1
+    fi
+    resolved_revision="${requested_revision:-$repository_revision}"
+    if ! git -C "$APP_ROOT" rev-parse --verify "${resolved_revision}^{commit}" >/dev/null 2>&1; then
+      echo "source revision is not resolvable in the repository: $resolved_revision" >&2
+      return 1
+    fi
+  else
+    if [[ -z "$requested_revision" ]]; then
+      echo "OM_API_SOURCE_REVISION is required when APP_ROOT is not a Git worktree: $APP_ROOT" >&2
+      return 1
+    fi
+    resolved_revision="$requested_revision"
+  fi
+
+  if [[ ! "$resolved_revision" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "source revision must be a full lowercase 40-character Git SHA: $resolved_revision" >&2
+    return 1
+  fi
+  printf '%s\n' "$resolved_revision"
+}
+
+SOURCE_REVISION="$(resolve_source_revision)"
 
 validate_required_dem_chunks() {
   if [ ! -d "$DEM_STATIC_DIR" ]; then
@@ -59,7 +104,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 if ! command -v cc >/dev/null 2>&1; then
-  echo "cc is required to build the native om-file-format decoder." >&2
+  echo "cc is required to build the native om-file-format codec." >&2
   exit 1
 fi
 
@@ -174,20 +219,49 @@ install_verified_static_asset \
 install_verified_static_asset \
   "GFS025" "$GFS025_STATIC_URL" "$GFS025_STATIC_SHA256" "$GFS025_STATIC_PATH"
 
-if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] || [ ! -f "$NATIVE_DIR/libomfileformat.so" ]; then
+OM_FILE_FORMAT_REF="${OM_FILE_FORMAT_REF:-$PINNED_OM_FILE_FORMAT_REF}"
+OM_FILE_FORMAT_REVISION_FILE="$NATIVE_DIR/om-file-format.source-revision"
+INSTALLED_OM_FILE_FORMAT_REVISION=""
+if [ -f "$OM_FILE_FORMAT_REVISION_FILE" ]; then
+  INSTALLED_OM_FILE_FORMAT_REVISION="$(tr -d '\r\n' < "$OM_FILE_FORMAT_REVISION_FILE")"
+fi
+if [ "${OM_REBUILD_OMFILE:-0}" = "1" ] \
+  || [ -n "${OM_FILE_FORMAT_SRC:-}" ] \
+  || [ ! -f "$NATIVE_DIR/libomfileformat.so" ] \
+  || [ "$INSTALLED_OM_FILE_FORMAT_REVISION" != "$OM_FILE_FORMAT_REF" ]; then
   bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" "$NATIVE_DIR"
 else
+  bash "$APP_ROOT/scripts/build_omfileformat_decoder.sh" \
+    --verify "$NATIVE_DIR/libomfileformat.so"
   echo "reusing=$NATIVE_DIR/libomfileformat.so"
 fi
 
-cargo build --release --bin om-api \
+cargo build --release \
+  --bin om-api \
+  --bin om-native-materialize \
   --manifest-path "$APP_ROOT/om_api/Cargo.toml" \
   --target-dir "$BUILD_TARGET_DIR"
 if [ ! -f "$BUILD_BINARY" ]; then
   echo "cargo build completed but om-api binary is missing: $BUILD_BINARY" >&2
   exit 1
 fi
+if [ ! -f "$MATERIALIZER_BUILD_BINARY" ]; then
+  echo "cargo build completed but om-native-materialize binary is missing: $MATERIALIZER_BUILD_BINARY" >&2
+  exit 1
+fi
 install -m 0755 -- "$BUILD_BINARY" "$BIN_DIR/om-api"
+install -m 0755 -- "$MATERIALIZER_BUILD_BINARY" "$BIN_DIR/om-native-materialize"
+
+SOURCE_REVISION_TMP="$(mktemp "$INSTALL_DIR/.source-revision.tmp.XXXXXX")"
+cleanup_source_revision_tmp() {
+  rm -f -- "$SOURCE_REVISION_TMP"
+}
+trap cleanup_source_revision_tmp EXIT
+printf '%s\n' "$SOURCE_REVISION" > "$SOURCE_REVISION_TMP"
+chmod 0644 "$SOURCE_REVISION_TMP"
+mv -f -- "$SOURCE_REVISION_TMP" "$SOURCE_REVISION_FILE"
+SOURCE_REVISION_TMP=""
+trap - EXIT
 
 cat > "$ENV_FILE" <<EOF
 OM_DATA_ROOT=$DATA_ROOT
@@ -248,3 +322,5 @@ $SUDO systemctl reload nginx
 echo "installed=$INSTALL_DIR"
 echo "service=$SERVICE_NAME"
 echo "bind=$BIND_ADDR"
+echo "source_revision=$SOURCE_REVISION"
+echo "source_revision_file=$SOURCE_REVISION_FILE"

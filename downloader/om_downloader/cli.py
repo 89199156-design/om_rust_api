@@ -67,7 +67,7 @@ OPENMETEO_GROUP_PRODUCTS = {
 }
 GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 GFS_COMPLETE_RUN_RETENTION = 2
-GFS_PARTIAL_RUN_RETENTION = 2
+GFS_PARTIAL_RUN_RETENTION = 3
 GFS_PARTIAL_FORECAST_HOUR_END = 5
 GFS_TOTAL_RELEASE_RETENTION = GFS_COMPLETE_RUN_RETENTION + GFS_PARTIAL_RUN_RETENTION
 CAMS_COMPLETE_RUN_RETENTION = 3
@@ -1654,6 +1654,107 @@ def _discover_recent_gfs_retention_plans(
     return ranked
 
 
+def _parse_exact_gfs_run_id(run_id: str) -> datetime:
+    if len(run_id) != 10 or not run_id.isdigit():
+        raise ValueError("GFS run must use YYYYMMDDHH format")
+    try:
+        reference_time = datetime.strptime(run_id, "%Y%m%d%H").replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise ValueError(f"invalid GFS run: {run_id}") from exc
+    if reference_time.strftime("%Y%m%d%H") != run_id or reference_time.hour % 6 != 0:
+        raise ValueError(f"GFS run must be one of the 00/06/12/18 UTC cycles: {run_id}")
+    return reference_time
+
+
+def _build_exact_gfs_short_run_plans(
+    products: list[ProductConfig],
+    *,
+    run_id: str,
+    bucket_url: str,
+) -> dict[str, tuple[Any, list[Any], Any]]:
+    reference_time = _parse_exact_gfs_run_id(run_id)
+    catalogs_by_model: dict[str, OpenMeteoSpatialCatalog] = {}
+    plans: dict[str, tuple[Any, list[Any], Any]] = {}
+    for product in products:
+        if product.forecast_hour_end < GFS_PARTIAL_FORECAST_HOUR_END:
+            raise ValueError(
+                f"GFS product cannot retain f000..f{GFS_PARTIAL_FORECAST_HOUR_END:03d}: "
+                f"{product.name} ends at f{product.forecast_hour_end:03d}"
+            )
+        catalog = catalogs_by_model.get(product.openmeteo_model)
+        if catalog is None:
+            catalog = load_openmeteo_spatial_run(
+                product.openmeteo_model,
+                reference_time,
+                bucket_url=bucket_url,
+            )
+            catalogs_by_model[product.openmeteo_model] = catalog
+        if not catalog.completed:
+            raise ValueError(f"Open-Meteo GFS run is not complete: {product.name}/{run_id}")
+        if catalog.reference_time_utc != reference_time:
+            raise ValueError(
+                f"Open-Meteo GFS run mismatch for {product.name}: "
+                f"expected {run_id}, got {catalog.reference_time_utc:%Y%m%d%H}"
+            )
+        run = om_run_from_spatial_catalog(product.name, catalog)
+        plan = build_run_forecast_hour_coverage_plan(
+            product,
+            run,
+            forecast_hour_end=GFS_PARTIAL_FORECAST_HOUR_END,
+        )
+        expected_hours = tuple(range(GFS_PARTIAL_FORECAST_HOUR_END + 1))
+        actual_hours = tuple(slot.forecast_hour for slot in plan.slots)
+        source_runs = {slot.source_run for slot in plan.slots}
+        if (
+            plan.latest_complete_run != run_id
+            or actual_hours != expected_hours
+            or source_runs != {run_id}
+        ):
+            raise ValueError(
+                f"exact GFS short-run plan is invalid for {product.name}/{run_id}: "
+                f"hours={actual_hours}, source_runs={sorted(source_runs)}"
+            )
+        plans[product.name] = (catalog, [run], plan)
+    return plans
+
+
+def _current_group_marker_state(
+    output_root: Path,
+    group: str,
+) -> dict[str, bytes | None]:
+    relative_paths = [
+        Path("groups") / group / "current" / "latest.json",
+        Path("groups") / group / "current" / "ready_for_processing.json",
+    ]
+    relative_paths.extend(
+        Path(product) / "current" / marker
+        for product in OPENMETEO_GROUP_PRODUCTS[group]
+        for marker in ("latest.json", "ready_for_processing.json")
+    )
+    state: dict[str, bytes | None] = {}
+    for relative_path in relative_paths:
+        path = output_root / relative_path
+        if path.exists() and not path.is_file():
+            raise ValueError(f"current marker is not a regular file: {path}")
+        state[relative_path.as_posix()] = path.read_bytes() if path.exists() else None
+    return state
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    resolved_left = left.resolve(strict=False)
+    resolved_right = right.resolve(strict=False)
+    for child, parent in (
+        (resolved_left, resolved_right),
+        (resolved_right, resolved_left),
+    ):
+        try:
+            child.relative_to(parent)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
 def _discover_recent_complete_product_plans(
     product: ProductConfig,
     *,
@@ -1846,6 +1947,7 @@ def _reconcile_gfs_retention_window(
     if not args.config:
         parser.error("--config is required with --download-openmeteo-group")
 
+    defer_activation = bool(getattr(args, "defer_openmeteo_gfs_activation", False))
     config = load_models(Path(args.config))
     products = [config.products[name] for name in OPENMETEO_GROUP_PRODUCTS["gfs"]]
     target_plans = _discover_recent_gfs_retention_plans(
@@ -1858,6 +1960,11 @@ def _reconcile_gfs_retention_window(
         if args.publish_openmeteo_group_to
         else source_root
     )
+    if defer_activation and not args.publish_openmeteo_group_to:
+        parser.error(
+            "--defer-openmeteo-gfs-activation requires "
+            "--publish-openmeteo-group-to for an API publisher"
+        )
     target_runs = [run_id for run_id, _plans in target_plans]
     plans_by_run = dict(target_plans)
     pre_pruned_source_paths = prune_expired_group_releases(
@@ -1937,7 +2044,7 @@ def _reconcile_gfs_retention_window(
         api_root / "groups" / "gfs" / "current" / "ready_for_processing.json"
     )
     activation = None
-    if (
+    if not defer_activation and (
         not current
         or current.get("latest_complete_run") != newest_run
         or not _group_release_matches_plans(current, products, plans_by_run[newest_run])
@@ -1964,7 +2071,168 @@ def _reconcile_gfs_retention_window(
                 "pre_pruned_source_paths": pre_pruned_source_paths,
                 "pre_pruned_raw_paths": pre_pruned_raw_paths,
                 "activation": activation,
+                "activation_deferred": defer_activation,
                 "pruned_raw_paths": pruned,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _recover_openmeteo_gfs_short_run(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> int:
+    if not args.config:
+        parser.error("--config is required with --recover-openmeteo-gfs-short-run")
+    if not args.retain_openmeteo_group_to:
+        parser.error(
+            "--retain-openmeteo-group-to is required with "
+            "--recover-openmeteo-gfs-short-run"
+        )
+
+    run_id = args.recover_openmeteo_gfs_short_run
+    try:
+        reference_time = _parse_exact_gfs_run_id(run_id)
+    except ValueError as exc:
+        parser.error(str(exc))
+    api_root = Path(args.retain_openmeteo_group_to).resolve(strict=False)
+    recovery_root = (Path(args.output) / "recovery" / "gfs" / run_id).resolve(
+        strict=False
+    )
+    if _paths_overlap(api_root, recovery_root):
+        parser.error(
+            "--retain-openmeteo-group-to must not overlap the generated recovery "
+            f"staging root: {recovery_root}"
+        )
+
+    config = load_models(Path(args.config))
+    missing_products = [
+        name for name in OPENMETEO_GROUP_PRODUCTS["gfs"] if name not in config.products
+    ]
+    if missing_products:
+        parser.error(f"group gfs missing products in config: {', '.join(missing_products)}")
+    products = [config.products[name] for name in OPENMETEO_GROUP_PRODUCTS["gfs"]]
+    plans = _build_exact_gfs_short_run_plans(
+        products,
+        run_id=run_id,
+        bucket_url=args.openmeteo_bucket_url,
+    )
+
+    download_args = copy(args)
+    download_args.download_openmeteo_group = "gfs"
+    download_args.now = _format_utc(reference_time)
+    download_args.output = str(recovery_root)
+    download_args.publish_openmeteo_group_to = None
+    source_root = recovery_root / "published"
+    lock_path = Path(args.output) / "locks" / f"gfs_short_run_recovery_{run_id}.lock"
+
+    with file_lock(lock_path):
+        markers_before = _current_group_marker_state(api_root, "gfs")
+        existing = _matching_group_releases(
+            api_root,
+            "gfs",
+            products,
+            {run_id: plans},
+        )
+        if run_id in existing:
+            markers_after = _current_group_marker_state(api_root, "gfs")
+            if markers_after != markers_before:
+                raise ValueError("GFS current markers changed while checking retained releases")
+            cleared_paths = _clear_group_download_payloads(
+                recovery_root,
+                product_names=[product.name for product in products],
+            )
+            print(
+                json.dumps(
+                    {
+                        "group": "gfs",
+                        "status": "skipped",
+                        "reason": "exact short-run release already retained",
+                        "latest_complete_run": run_id,
+                        "forecast_hour_start": 0,
+                        "forecast_hour_end": GFS_PARTIAL_FORECAST_HOUR_END,
+                        "retained_to": str(api_root),
+                        "current_markers_unchanged": True,
+                        "activated": False,
+                        "cleared_recovery_payload_paths": cleared_paths,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            result = _download_openmeteo_group_release(
+                download_args,
+                parser,
+                plan_by_product_override=plans,
+                preserve_published=True,
+            )
+        if result != 0:
+            return result
+        output_lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+        download_result = json.loads(output_lines[-1]) if output_lines else None
+
+        source_group_manifest = _read_json_if_exists(
+            source_root / "groups" / "gfs" / "latest.json"
+        )
+        source_products_are_valid = all(
+            _manifest_matches_plan(
+                _read_json_if_exists(source_root / product.name / "latest.json"),
+                plans[product.name][2],
+                product,
+                recovery_root,
+            )
+            for product in products
+        )
+        if (
+            not source_group_manifest
+            or source_group_manifest.get("status") != "complete"
+            or not _group_release_matches_plans(
+                source_group_manifest,
+                products,
+                plans,
+            )
+            or not source_products_are_valid
+        ):
+            raise ValueError(f"recovered GFS source release failed validation: {run_id}")
+        retain_result = retain_group_release_from_mirror("gfs", source_root, api_root)
+        retained = _matching_group_releases(
+            api_root,
+            "gfs",
+            products,
+            {run_id: plans},
+        )
+        if run_id not in retained:
+            raise ValueError(f"retained GFS release failed validation: {run_id}")
+        markers_after = _current_group_marker_state(api_root, "gfs")
+        if markers_after != markers_before:
+            raise ValueError(
+                "GFS current markers changed during retained-release recovery; "
+                "the recovery command never activates releases"
+            )
+        cleared_paths = _clear_group_download_payloads(
+            recovery_root,
+            product_names=[product.name for product in products],
+        )
+
+    print(
+        json.dumps(
+            {
+                "group": "gfs",
+                "status": "complete",
+                "latest_complete_run": run_id,
+                "forecast_hour_start": 0,
+                "forecast_hour_end": GFS_PARTIAL_FORECAST_HOUR_END,
+                "download_result": download_result,
+                "retain_result": retain_result,
+                "retained_to": str(api_root),
+                "current_markers_unchanged": True,
+                "activated": False,
+                "cleared_recovery_payload_paths": cleared_paths,
             },
             ensure_ascii=False,
         )
@@ -2025,6 +2293,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inspect-product-catalog")
     parser.add_argument("--download-openmeteo-product")
     parser.add_argument("--download-openmeteo-group")
+    parser.add_argument("--recover-openmeteo-gfs-short-run")
+    parser.add_argument("--retain-openmeteo-group-to")
     parser.add_argument("--build-processing-stage")
     parser.add_argument("--sync-from-manifest-url")
     parser.add_argument("--sync-from-manifest-path")
@@ -2032,6 +2302,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sync-openmeteo-group-releases-from-source")
     parser.add_argument("--print-openmeteo-group-release-id")
     parser.add_argument("--publish-openmeteo-group-to")
+    parser.add_argument(
+        "--defer-openmeteo-gfs-activation",
+        action="store_true",
+        help=(
+            "retain the newest GFS source window without replacing API current; "
+            "the production native materializer publishes current after validation"
+        ),
+    )
     parser.add_argument("--openmeteo-bucket-url", default=DEFAULT_OPENMETEO_BUCKET_URL)
     parser.add_argument("--inspect-om-url")
     parser.add_argument("--plan-om-ranges-url")
@@ -2243,6 +2521,9 @@ def main(argv: list[str] | None = None) -> int:
                 group,
                 args.retain_complete_releases,
             ),
+            activate_current=not (
+                group == "gfs" and args.defer_openmeteo_gfs_activation
+            ),
         )
         print(json.dumps(result, ensure_ascii=False))
         return 0
@@ -2257,6 +2538,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False))
         return 0
+
+    if args.recover_openmeteo_gfs_short_run:
+        return _recover_openmeteo_gfs_short_run(args, parser)
 
     if args.download_openmeteo_group:
         return _download_openmeteo_group(args, parser)

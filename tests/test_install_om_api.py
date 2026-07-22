@@ -10,6 +10,9 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPOSITORY_ROOT / "scripts" / "install_om_api.sh"
+CODEC_BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_omfileformat_decoder.sh"
+PINNED_CODEC_REVISION = "71f422b2706d8a81f1cecf52ae3073990de1ddbe"
+TEST_SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
 POSIX_DEPLOY_TESTS_AVAILABLE = os.name == "posix" and all(
     shutil.which(command) is not None for command in ("bash", "id", "install")
 )
@@ -31,6 +34,8 @@ class InstallOmApiTests(unittest.TestCase):
         for expected in expected_values:
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.content)
+
+        self.assertIn(PINNED_CODEC_REVISION, self.content)
 
         self.assertIn(
             '"GFS013" "$GFS013_STATIC_URL" "$GFS013_STATIC_SHA256" '
@@ -145,12 +150,25 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             copied_installer = script_dir / INSTALL_SCRIPT.name
             shutil.copyfile(INSTALL_SCRIPT, copied_installer)
             copied_installer.chmod(0o755)
+            self._write_executable(
+                script_dir / CODEC_BUILD_SCRIPT.name,
+                """
+                #!/usr/bin/env bash
+                set -euo pipefail
+                test "${1:-}" = "--verify"
+                test -s "${2:-}"
+                printf 'verified=%s\n' "$2"
+                """,
+            )
             (manifest_dir / "Cargo.toml").write_text(
                 '[package]\nname = "om-api"\nversion = "0.0.0"\n',
                 encoding="utf-8",
             )
             (nginx_dir / "om_client_api.conf").write_text("", encoding="utf-8")
             (install_root / "native" / "libomfileformat.so").write_bytes(b"decoder")
+            (
+                install_root / "native" / "om-file-format.source-revision"
+            ).write_text(f"{PINNED_CODEC_REVISION}\n", encoding="utf-8")
             self._write_dem_chunks(dem_root)
 
             static_source = test_root / "HSURF.om"
@@ -197,6 +215,8 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 mkdir -p "$target_dir/release"
                 printf 'workspace-target-binary\n' > "$target_dir/release/om-api"
                 chmod 0755 "$target_dir/release/om-api"
+                printf 'workspace-materializer-binary\n' > "$target_dir/release/om-native-materialize"
+                chmod 0755 "$target_dir/release/om-native-materialize"
                 """,
             )
             self._write_executable(
@@ -248,6 +268,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     "OM_GFS025_STATIC_URL": static_source.resolve().as_uri(),
                     "OM_GFS025_STATIC_SHA256": static_sha256,
                     "OM_API_SERVICE_NAME": "weather-om-api-test",
+                    "OM_API_SOURCE_REVISION": TEST_SOURCE_REVISION,
                 }
             )
             result = subprocess.run(
@@ -273,8 +294,15 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 encoding="utf-8"
             ).splitlines()
             self.assertIn("--release", cargo_arguments)
-            binary_option = cargo_arguments.index("--bin")
-            self.assertEqual(cargo_arguments[binary_option + 1], "om-api")
+            requested_binaries = [
+                cargo_arguments[index + 1]
+                for index, argument in enumerate(cargo_arguments)
+                if argument == "--bin"
+            ]
+            self.assertEqual(
+                requested_binaries,
+                ["om-api", "om-native-materialize"],
+            )
             manifest_option = cargo_arguments.index("--manifest-path")
             self.assertEqual(
                 Path(cargo_arguments[manifest_option + 1]),
@@ -285,6 +313,16 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             self.assertEqual(
                 (install_root / "bin" / "om-api").read_text(encoding="utf-8"),
                 "workspace-target-binary\n",
+            )
+            self.assertEqual(
+                (
+                    install_root / "bin" / "om-native-materialize"
+                ).read_text(encoding="utf-8"),
+                "workspace-materializer-binary\n",
+            )
+            self.assertEqual(
+                (install_root / "source-revision").read_text(encoding="utf-8"),
+                f"{TEST_SOURCE_REVISION}\n",
             )
             service_environment = (
                 install_root / "weather-om-api-test.env"
@@ -303,6 +341,12 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             data_root = test_root / "data"
             dem_root = test_root / "dem"
             install_root = test_root / "install"
+            source_root = test_root / "source"
+            script_dir = source_root / "scripts"
+            script_dir.mkdir(parents=True)
+            copied_installer = script_dir / INSTALL_SCRIPT.name
+            shutil.copyfile(INSTALL_SCRIPT, copied_installer)
+            copied_installer.chmod(0o755)
             data_root.mkdir()
             self._write_dem_chunks(dem_root, missing_latitude=31)
 
@@ -312,11 +356,12 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     "OM_DATA_ROOT": str(data_root),
                     "OM_API_DEM_ROOT": str(dem_root),
                     "OM_API_CARGO_TARGET_DIR": str(test_root / "target"),
+                    "OM_API_SOURCE_REVISION": TEST_SOURCE_REVISION,
                 }
             )
             result = subprocess.run(
-                ["bash", str(INSTALL_SCRIPT), str(install_root)],
-                cwd=REPOSITORY_ROOT,
+                ["bash", str(copied_installer), str(install_root)],
+                cwd=source_root,
                 env=environment,
                 text=True,
                 capture_output=True,
@@ -354,6 +399,101 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             "OM_API_CARGO_TARGET_DIR must be an absolute path: relative-target",
             result.stderr,
         )
+
+    @unittest.skipUnless(
+        POSIX_DEPLOY_TESTS_AVAILABLE,
+        "requires a POSIX deployment shell",
+    )
+    def test_installer_rejects_an_invalid_explicit_source_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            test_root = Path(temporary_directory)
+            source_root = test_root / "source"
+            script_dir = source_root / "scripts"
+            script_dir.mkdir(parents=True)
+            copied_installer = script_dir / INSTALL_SCRIPT.name
+            shutil.copyfile(INSTALL_SCRIPT, copied_installer)
+            copied_installer.chmod(0o755)
+
+            environment = os.environ.copy()
+            environment["OM_API_SOURCE_REVISION"] = "not-a-full-git-sha"
+            result = subprocess.run(
+                ["bash", str(copied_installer), str(test_root / "install")],
+                cwd=source_root,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "source revision must be a full lowercase 40-character Git SHA",
+                result.stderr,
+            )
+
+    @unittest.skipUnless(
+        POSIX_DEPLOY_TESTS_AVAILABLE and shutil.which("git") is not None,
+        "requires a POSIX deployment shell and Git",
+    )
+    def test_installer_refuses_a_dirty_source_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source_root = Path(temporary_directory) / "source"
+            script_dir = source_root / "scripts"
+            script_dir.mkdir(parents=True)
+            copied_installer = script_dir / INSTALL_SCRIPT.name
+            shutil.copyfile(INSTALL_SCRIPT, copied_installer)
+            copied_installer.chmod(0o755)
+            tracked_file = source_root / "tracked.txt"
+            tracked_file.write_text("clean\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=source_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=source_root,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=OM Installer Test",
+                    "-c",
+                    "user.email=om-installer-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "test fixture",
+                ],
+                cwd=source_root,
+                check=True,
+            )
+            revision = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_root,
+                text=True,
+            ).strip()
+            tracked_file.write_text("dirty\n", encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment["OM_API_SOURCE_REVISION"] = revision
+            result = subprocess.run(
+                ["bash", str(copied_installer), str(source_root / "install")],
+                cwd=source_root,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                f"refusing to deploy from a dirty source worktree: {source_root}",
+                result.stderr,
+            )
+            self.assertIn(" M tracked.txt", result.stderr)
 
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:

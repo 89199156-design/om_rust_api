@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --group GROUP --source-host USER@HOST --source-root PATH --raw-root PATH --source-ssh-key PATH --source-known-hosts PATH [--cleanup-grace-seconds SECONDS]" >&2
+  echo "usage: $0 --group GROUP --source-host USER@HOST --source-root PATH --raw-root PATH --source-ssh-key PATH --source-known-hosts PATH [--cleanup-grace-seconds SECONDS] [--defer-gfs-activation]" >&2
   exit 2
 }
 
@@ -13,6 +13,7 @@ RAW=""
 SOURCE_SSH_KEY=""
 SOURCE_KNOWN_HOSTS=""
 CLEANUP_GRACE_SECONDS=300
+DEFER_GFS_ACTIVATION=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -23,15 +24,19 @@ while [ "$#" -gt 0 ]; do
     --source-ssh-key) SOURCE_SSH_KEY="${2:-}"; shift 2 ;;
     --source-known-hosts) SOURCE_KNOWN_HOSTS="${2:-}"; shift 2 ;;
     --cleanup-grace-seconds) CLEANUP_GRACE_SECONDS="${2:-}"; shift 2 ;;
+    --defer-gfs-activation) DEFER_GFS_ACTIVATION=1; shift ;;
     *) usage ;;
   esac
 done
 
 case "$GROUP" in
-  gfs) RETENTION=4 ;;
+  gfs) RETENTION=5 ;;
   cams) RETENTION=3 ;;
   *) usage ;;
 esac
+if [ "$DEFER_GFS_ACTIVATION" -eq 1 ] && [ "$GROUP" != "gfs" ]; then
+  usage
+fi
 [ -n "$SOURCE_HOST" ] && [ -n "$SOURCE_ROOT" ] && [ -n "$RAW" ] || usage
 [ -r "$SOURCE_SSH_KEY" ] || { echo "missing source SSH key: $SOURCE_SSH_KEY" >&2; exit 2; }
 [ -r "$SOURCE_KNOWN_HOSTS" ] || { echo "missing trusted SSH known_hosts: $SOURCE_KNOWN_HOSTS" >&2; exit 2; }
@@ -369,10 +374,19 @@ elif [ "$payload_status" -ne 0 ]; then
 fi
 
 cd "$APP_DIR"
-/usr/bin/python3 -m om_downloader.cli \
-  --sync-openmeteo-group-releases-from-source "$GROUP" \
-  --source-stage-root "$STAGE_ROOT" \
-  --output "$RAW" \
+SYNC_ARGS=(
+  --sync-openmeteo-group-releases-from-source "$GROUP"
+  --source-stage-root "$STAGE_ROOT"
+  --output "$RAW"
   --retain-complete-releases "$RETENTION"
+)
+if [ "$DEFER_GFS_ACTIVATION" -eq 1 ]; then
+  SYNC_ARGS+=(--defer-openmeteo-gfs-activation)
+fi
+/usr/bin/python3 -m om_downloader.cli "${SYNC_ARGS[@]}"
+
+if [ "$DEFER_GFS_ACTIVATION" -eq 1 ]; then
+  /usr/bin/env bash "$APP_DIR/scripts/materialize_openmeteo_gfs.sh" --raw-root "$RAW"
+fi
 
 rm -rf -- "$STAGE_ROOT"
