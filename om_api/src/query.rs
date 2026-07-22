@@ -752,7 +752,7 @@ impl DailyWeatherAggregation {
             | Self::Mean(variable)
             | Self::Sum(variable)
             | Self::PrecipitationHours(variable) => variable,
-            Self::DominantWindDirection => "wind_speed_10m",
+            Self::DominantWindDirection => "wind_u_component_10m",
         }
     }
 
@@ -1015,26 +1015,25 @@ fn daily_weather_value(
         let mut v_sum = 0.0_f32;
         let mut time = start;
         while time < end {
-            let speed = read_daily_hour(
+            let u = read_daily_hour(
                 snapshot,
                 decoder,
-                "wind_speed_10m",
+                "wind_u_component_10m",
                 time,
                 latitude,
                 longitude,
             )?;
-            let direction = read_daily_hour(
+            let v = read_daily_hour(
                 snapshot,
                 decoder,
-                "wind_direction_10m",
+                "wind_v_component_10m",
                 time,
                 latitude,
                 longitude,
             )?;
-            if !speed.is_finite() || !direction.is_finite() {
+            if !u.is_finite() || !v.is_finite() {
                 return Ok(f32::NAN);
             }
-            let (u, v) = wind_components(speed, direction);
             u_sum += u;
             v_sum += v;
             time += Duration::hours(1);
@@ -7578,11 +7577,6 @@ fn thunderstorm_probability(
         0.6 + (0.4 * ((cloudcover - 30.0) / 30.0))
     };
     (base_probability * cloud_cover_factor * latitude_factor).clamp(0.0, 100.0)
-}
-
-fn wind_components(speed: f32, direction_degrees: f32) -> (f32, f32) {
-    let radians = direction_degrees * std::f32::consts::PI / 180.0;
-    (-1.0 * speed * radians.sin(), -1.0 * speed * radians.cos())
 }
 
 /// Port of Open-Meteo's pinned `CHelper/src/shim.c::windirectionFast`.
