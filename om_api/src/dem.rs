@@ -204,6 +204,25 @@ pub fn read_dem90(
     Ok(value)
 }
 
+/// Validate one production Copernicus DEM chunk with the same reader and
+/// decoder used by API requests.  Open-Meteo's DEM archive is intentionally
+/// still stored in the legacy OM v1/v2 layout, while forecast arrays use OM
+/// v3.  Treating these immutable DEM chunks as v3 would reject valid source
+/// data during native coverage publication.
+pub(crate) fn validate_dem_om_file(decoder: &OfficialDecoder, path: &Path) -> Result<u64> {
+    let file = LocalOmFile::open(path.to_path_buf())?;
+    let value = decoder
+        .decode_point(&file.metadata, &file, &[0, 0])
+        .with_context(|| format!("decode Copernicus DEM probe {}", path.display()))?;
+    if value.is_infinite() {
+        bail!(
+            "Copernicus DEM decode probe is infinite: {}",
+            path.display()
+        );
+    }
+    Ok(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +249,21 @@ mod tests {
             dem_file_path(root, 31),
             root.join("copernicus_dem90/static/lat_31.om")
         );
+    }
+
+    #[test]
+    fn accepts_legacy_dem_header_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "om-api-dem-legacy-header-{}.om",
+            std::process::id()
+        ));
+        let mut header = vec![0_u8; OM_LEGACY_HEADER_SIZE as usize];
+        header[0..3].copy_from_slice(b"OM\x01");
+        std::fs::write(&path, header).expect("write legacy DEM header");
+
+        let file = LocalOmFile::open(path.clone()).expect("open legacy DEM metadata");
+
+        assert_eq!(file.metadata.len(), 5);
+        std::fs::remove_file(path).expect("remove legacy DEM header");
     }
 }

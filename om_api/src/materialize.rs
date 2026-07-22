@@ -5,6 +5,7 @@
 //! pinned production fork's `GenericVariableHandle.generateFullRunData` and
 //! `InterpolationInplace.swift`. Publication is immutable and marker-last.
 
+use crate::dem::validate_dem_om_file;
 use crate::manifest::{
     load_product_snapshot_for_coverage, BundleEntry, NativeGridMetadata, ProductSnapshot,
 };
@@ -2390,7 +2391,7 @@ pub fn validate_gfs_coverage(
         let path = coverage_root
             .join("copernicus_dem90/static")
             .join(format!("lat_{latitude}.om"));
-        decoded_probes += validate_static_array(decoder, &path, "elevation", None)?;
+        decoded_probes += validate_dem_om_file(decoder, &path)?;
         om_files += 1;
     }
 
