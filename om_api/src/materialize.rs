@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime};
 
-pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v3";
+pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v4";
 pub const GFS_PRODUCTS: [&str; 3] = ["gfs013_surface", "gfs025", "gfs_pressure_profile"];
 const DATA_TYPE_FLOAT_ARRAY: u8 = 20;
 const COMPRESSION_PFOR_DELTA2D_INT16: u8 = 0;
@@ -3160,7 +3160,7 @@ mod tests {
         let revision = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             default_gfs_coverage_id("2026072018", revision).unwrap(),
-            "gfs_native_2026072018_official-hourly-quantized-v3_0123456789ab"
+            "gfs_native_2026072018_official-hourly-quantized-v4_0123456789ab"
         );
         assert!(default_gfs_coverage_id("2026072021", revision).is_err());
         assert!(default_gfs_coverage_id("2026072018", "not-a-sha").is_err());

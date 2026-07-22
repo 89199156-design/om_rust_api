@@ -4,7 +4,8 @@ use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialD
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
     backwards_direct_normal_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
-    extra_terrestrial_radiation_backwards, is_day, SOLAR_CONSTANT,
+    extra_terrestrial_radiation_backwards, extra_terrestrial_radiation_factor_backwards, is_day,
+    SOLAR_CONSTANT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
@@ -4666,8 +4667,7 @@ fn read_backwards_value(
 }
 
 fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) -> f32 {
-    (extra_terrestrial_radiation_backwards(time, 3600, latitude as f32, longitude as f32)
-        / SOLAR_CONSTANT)
+    extra_terrestrial_radiation_factor_backwards(time, 3600, latitude as f32, longitude as f32)
         .max(0.0)
 }
 
@@ -6755,6 +6755,39 @@ mod tests {
         };
         assert_eq!(calculate(selected_latitude), Some(81.0));
         assert_eq!(calculate(13.765_053), Some(95.0));
+    }
+
+    #[test]
+    fn sparse_solar_preserves_official_half_step_quantization() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 20, 18, 0, 0).unwrap();
+        let mut values = vec![f32::NAN; 385];
+        for (index, bits) in [
+            (168, 0x0000_0000),
+            (171, 0x0000_0000),
+            (174, 0x3e4c_cccd),
+            (177, 0x4088_0000),
+            (180, 0x4108_cccd),
+            (183, 0x40d1_999a),
+            (186, 0x3f99_999a),
+            (189, 0x0000_0000),
+            (192, 0x0000_0000),
+            (195, 0x0000_0000),
+        ] {
+            values[index] = f32::from_bits(bits);
+        }
+
+        interpolate_solar_backwards_in_place(
+            &mut values,
+            start,
+            f32::from_bits(0x4163_bd08) as f64,
+            f32::from_bits(0x42d2_3c00) as f64,
+        );
+
+        assert_eq!(values[181].to_bits(), 0x4105_3333);
+        assert_eq!(
+            maybe_round_to_scalefactor(values[181], 20.0, true).to_bits(),
+            0x4105_999a
+        );
     }
 
     #[test]

@@ -253,13 +253,27 @@ pub fn extra_terrestrial_radiation_backwards(
     latitude: f32,
     longitude: f32,
 ) -> f32 {
+    extra_terrestrial_radiation_factor_backwards(timestamp, dt_seconds, latitude, longitude)
+        * SOLAR_CONSTANT
+}
+
+/// Normalized extraterrestrial radiation factor used internally by Open-Meteo's
+/// solar interpolation. Keep this value before multiplying by `SOLAR_CONSTANT`:
+/// multiplying and dividing it back can lose one ULP at public quantization
+/// boundaries.
+pub fn extra_terrestrial_radiation_factor_backwards(
+    timestamp: DateTime<Utc>,
+    dt_seconds: i64,
+    latitude: f32,
+    longitude: f32,
+) -> f32 {
     let Some(geometry) = backwards_geometry(timestamp, dt_seconds, latitude, longitude, 0.0) else {
         return 0.0;
     };
     let seconds = timestamp.timestamp().rem_euclid(SECONDS_PER_AVERAGE_YEAR) as f32;
     let day = seconds / SECONDS_PER_DAY as f32 - 4.0 + 1.0;
     let sun_radius = 1.0 - 0.01672 * radians((360.0 / 365.256_38) * day).cos();
-    backwards_sun_elevation(geometry, false) / (sun_radius * sun_radius) * SOLAR_CONSTANT
+    backwards_sun_elevation(geometry, false) / (sun_radius * sun_radius)
 }
 
 pub fn is_day(timestamp: DateTime<Utc>, latitude: f32, longitude: f32) -> f32 {
@@ -351,5 +365,27 @@ mod tests {
         let timestamp = Utc.timestamp_opt(1_784_070_000, 0).unwrap();
         let duration = backwards_sunshine_duration(200.0, timestamp, 3600, 29.580215, 106.52344);
         assert_eq!(duration.to_bits(), 1_162_005_532);
+    }
+
+    #[test]
+    fn normalized_radiation_preserves_official_interpolation_ulp() {
+        let timestamp = Utc.timestamp_opt(1_785_222_000, 0).unwrap();
+        let factor = extra_terrestrial_radiation_factor_backwards(
+            timestamp,
+            3600,
+            f32::from_bits(0x4163_bd08),
+            f32::from_bits(0x42d2_3c00),
+        );
+        assert_eq!(factor.to_bits(), 0x3f67_b48d);
+        assert_eq!(
+            (factor * SOLAR_CONSTANT).to_bits(),
+            extra_terrestrial_radiation_backwards(
+                timestamp,
+                3600,
+                f32::from_bits(0x4163_bd08),
+                f32::from_bits(0x42d2_3c00),
+            )
+            .to_bits()
+        );
     }
 }
