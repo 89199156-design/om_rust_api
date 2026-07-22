@@ -3,6 +3,7 @@ import unittest
 
 from scripts.install_1panel_v2_cronjobs import (
     REMOVED_PLACEHOLDER_TASKS,
+    _existing_cronjob_values,
     api_publisher_tasks,
     api_source_sync_tasks,
     downloader_tasks,
@@ -10,6 +11,12 @@ from scripts.install_1panel_v2_cronjobs import (
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_existing_job_update_preserves_scheduler_runtime_fields(self):
+        values = _existing_cronjob_values(
+            {"spec": "0 * * * *", "entry_ids": "1", "is_executing": 1}
+        )
+        self.assertEqual(values, {"spec": "0 * * * *"})
+
     def test_install_script_contains_server_deploy_steps_without_system_scheduler(self):
         script = Path("scripts/install_from_zip.sh")
         content = script.read_text(encoding="utf-8")

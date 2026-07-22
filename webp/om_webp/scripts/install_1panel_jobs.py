@@ -82,6 +82,15 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
     }
 
 
+def existing_job_values(payload: dict[str, object]) -> dict[str, object]:
+    """Keep scheduler-owned runtime fields when updating an existing job."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"entry_ids", "is_executing"}
+    }
+
+
 def main() -> int:
     if not AGENT_DB.exists():
         raise FileNotFoundError(AGENT_DB)
@@ -98,6 +107,7 @@ def main() -> int:
             payload = {key: value for key, value in payload.items() if key in columns}
             row = cur.execute("select id from cronjobs where name=?", (name,)).fetchone()
             if row:
+                payload = existing_job_values(payload)
                 payload["id"] = int(row[0])
                 assignments = ",".join(f"{key}=:{key}" for key in payload if key != "id")
                 cur.execute(f"update cronjobs set {assignments} where id=:id", payload)

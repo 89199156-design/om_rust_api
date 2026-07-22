@@ -349,6 +349,15 @@ def _cronjob_values(timestamp: str, name: str, spec: str, script: str, group_id:
     }
 
 
+def _existing_cronjob_values(values: dict[str, object]) -> dict[str, object]:
+    """Keep scheduler-owned runtime fields when updating an existing job."""
+    return {
+        key: value
+        for key, value in values.items()
+        if key not in {"entry_ids", "is_executing"}
+    }
+
+
 def install_agent_jobs(tasks: list[tuple[str, str, str]], *, cleanup_names: tuple[str, ...] = ()) -> None:
     if not AGENT_DB.exists():
         raise FileNotFoundError(f"{AGENT_DB} does not exist")
@@ -376,6 +385,7 @@ def install_agent_jobs(tasks: list[tuple[str, str, str]], *, cleanup_names: tupl
                 values["args"] = ""
             values = {key: value for key, value in values.items() if key in cronjob_columns}
             if row:
+                values = _existing_cronjob_values(values)
                 assignments = ", ".join(f"{key}=:{key}" for key in values)
                 values["id"] = row[0]
                 cur.execute(f"update cronjobs set {assignments} where id=:id", values)

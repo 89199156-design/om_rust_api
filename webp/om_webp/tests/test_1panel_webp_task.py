@@ -7,9 +7,16 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_1panel_webp_task import ALL_PRODUCTION_TASKS, DOWNLOAD_TASKS, TASKS, decision
+from install_1panel_jobs import existing_job_values
 
 
 class WebpTaskGateTests(unittest.TestCase):
+    def test_existing_job_update_preserves_scheduler_runtime_fields(self):
+        payload = existing_job_values(
+            {"spec": "5 * * * *", "entry_ids": "1", "is_executing": 1}
+        )
+        self.assertEqual(payload, {"spec": "5 * * * *"})
+
     def database(
         self,
         *,
