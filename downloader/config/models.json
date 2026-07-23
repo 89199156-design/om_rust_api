@@ -173,7 +173,7 @@
         ],
         "interpolation_support_hours": 12,
         "missing_variable_fallback_lookback_hours": 72,
-        "missing_variable_fallback_context_hours": 6,
+        "missing_variable_fallback_context_hours": 12,
         "optional_variables": [],
       "required_pressure_variable_prefixes": [
         "temperature",

@@ -120,16 +120,20 @@ real older source-run identity so the existing first-stage interpolation runs
 within that source run before newest-run overlay, matching the official
 rolling database rather than interpolating across runs.
 
-Every selected older fallback frame also retains the configured six-hour
-left/right context from that same source run when the objects exist. This is
-required because an isolated long-range endpoint cannot reconstruct the
-missing three-hour midpoint: Open-Meteo interpolates the older run first and
-only then lets the newer run overwrite the frames it actually supplies.
-Context entries are marked as interpolation support and deduplicated by
-variable, source run, valid time and logical coverage hour.
+Every selected older fallback frame also retains all available three-hour-axis
+candidates in the configured 12-hour left/right context from that same source
+run. The long-range gust objects themselves are six-hourly, so the candidates
+that actually contain the variable are normally at ±6 and ±12 hours. Both
+distances are required by four-point Hermite interpolation: ±6 supplies the
+immediate B/C neighbours and ±12 supplies A/D. Open-Meteo interpolates the
+older run first and only then lets the newer run overwrite the frames it
+actually supplies. Context entries are marked as interpolation support and
+deduplicated by variable, source run, valid time and logical coverage hour.
 
 Regressions:
-`test_missing_variable_fallback_candidates_reach_retained_long_run` and
+`test_missing_variable_fallback_candidates_reach_retained_long_run`,
+`test_fallback_context_captures_all_four_point_hermite_support_candidates`,
+and
 `ecmwf_retained_gust_frame_supplies_official_second_stage_lookahead`.
 
 ## Verification contract

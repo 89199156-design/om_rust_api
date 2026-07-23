@@ -147,6 +147,11 @@ def load_models(path: Path) -> ModelsConfig:
             raise ValueError(
                 f"product {name} missing_variable_fallback_context_hours must not be negative"
             )
+        if missing_variable_fallback_context_hours % 3 != 0:
+            raise ValueError(
+                f"product {name} missing_variable_fallback_context_hours must be "
+                "aligned to the three-hour regularization axis"
+            )
         coverage_strategy = str(raw.get("coverage_strategy", "latest_run"))
         if coverage_strategy not in ("latest_run", "latest_with_long_run_tail"):
             raise ValueError(

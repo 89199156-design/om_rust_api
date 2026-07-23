@@ -257,6 +257,12 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
 
 
 class CliOpenMeteoDownloadTests(unittest.TestCase):
+    def test_fallback_context_captures_all_four_point_hermite_support_candidates(self):
+        self.assertEqual(
+            cli_module._missing_variable_fallback_context_offsets(12),
+            (-12, -9, -6, -3, 3, 6, 9, 12),
+        )
+
     def test_missing_variable_fallback_candidates_reach_retained_long_run(self):
         product = SimpleNamespace(
             missing_variable_fallback_lookback_hours=72,

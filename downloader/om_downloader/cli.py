@@ -455,6 +455,20 @@ def _missing_variable_fallback_candidates(
     return sorted(candidates, key=lambda item: item[1], reverse=True)
 
 
+def _missing_variable_fallback_context_offsets(context_hours: int) -> tuple[int, ...]:
+    """Return every regular three-hour axis offset inside the context window.
+
+    ECMWF's retained long-range frames can be six-hourly, but Open-Meteo first
+    regularizes each source run onto a three-hour axis with four-point Hermite
+    interpolation. Capturing only the outer endpoints, or only the immediate
+    six-hour neighbours, omits the A/D support needed for the same curve.
+    """
+    if context_hours <= 0:
+        return ()
+    distances = tuple(range(3, context_hours + 1, 3))
+    return tuple(-distance for distance in reversed(distances)) + distances
+
+
 def _with_interpolation_support_records(
     product: ProductConfig,
     plan: Any,
@@ -1172,7 +1186,9 @@ def _download_openmeteo_product(
                 )
                 context_hours = product.missing_variable_fallback_context_hours
                 if fallback_variables and context_hours > 0:
-                    for context_offset in (-context_hours, context_hours):
+                    for context_offset in _missing_variable_fallback_context_offsets(
+                        context_hours
+                    ):
                         context_valid_time = valid_time + timedelta(hours=context_offset)
                         context_forecast_hour = fallback_forecast_hour + context_offset
                         context_coverage_forecast_hour = (

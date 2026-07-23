@@ -67,6 +67,37 @@ class ModelConfigTests(unittest.TestCase):
                 load_models(path)
             self.assertIn("required_variables", str(ctx.exception))
 
+    def test_rejects_fallback_context_off_the_three_hour_axis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "models.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "products": {
+                            "bad": {
+                                "download_product": "bad",
+                                "forecast_hour_end": 1,
+                                "run_cadence_hours": 6,
+                                "timezone_anchors": [0],
+                                "requested_bounds": {
+                                    "lon_min": 0,
+                                    "lat_min": 0,
+                                    "lon_max": 1,
+                                    "lat_max": 1,
+                                },
+                                "bounds_padding_degrees": 0,
+                                "required_variables": [],
+                                "missing_variable_fallback_context_hours": 4,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                load_models(path)
+            self.assertIn("three-hour regularization axis", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
