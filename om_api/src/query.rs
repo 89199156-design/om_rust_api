@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 const GFS013_STATIC_ELEVATION_PATH: &str = "static/ncep_gfs013/HSURF.om";
@@ -8481,12 +8481,7 @@ fn read_static_elevation_grid(
     height: u64,
     width: u64,
 ) -> Result<Vec<f32>> {
-    let static_root = std::env::var_os("OM_MODEL_STATIC_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| snapshot.data_root.clone());
-    if !static_root.is_absolute() {
-        bail!("OM_MODEL_STATIC_ROOT must be absolute");
-    }
+    let static_root = model_static_root(snapshot)?;
     let path = static_root.join(spec.relative_path);
     let file =
         Arc::new(File::open(&path).with_context(|| format!("failed to open {}", path.display()))?);
@@ -8512,6 +8507,24 @@ fn read_static_elevation_grid(
         &FullFileRangeReader { file },
         &[y0, x0],
         &[height, width],
+    )
+}
+
+fn resolve_model_static_root(
+    data_root: &Path,
+    configured_root: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let static_root = configured_root.unwrap_or_else(|| data_root.to_path_buf());
+    if !static_root.is_absolute() {
+        bail!("OM_MODEL_STATIC_ROOT must be absolute");
+    }
+    Ok(static_root)
+}
+
+fn model_static_root(snapshot: &OmDataSnapshot) -> Result<PathBuf> {
+    resolve_model_static_root(
+        &snapshot.data_root,
+        std::env::var_os("OM_MODEL_STATIC_ROOT").map(PathBuf::from),
     )
 }
 
@@ -8629,7 +8642,7 @@ fn weather_model_location(
     let Some(decoder) = decoder else {
         return Ok(None);
     };
-    let static_path = snapshot.data_root.join(spec.relative_path);
+    let static_path = model_static_root(snapshot)?.join(spec.relative_path);
     if !static_path.exists() {
         bail!(
             "required official {} static elevation file is missing: {}",
@@ -9166,6 +9179,22 @@ mod tests {
             target_elevation: f32::NAN,
         };
         assert_eq!(surface_pressure_elevation(sampling), 864.0);
+    }
+
+    #[test]
+    fn fixed_model_static_root_overrides_cycle_data_root() {
+        let data_root = Path::new("/data/om_raw");
+        let fixed_root = PathBuf::from("/opt/1panel/apps/weather_om_api");
+
+        assert_eq!(
+            resolve_model_static_root(data_root, Some(fixed_root.clone())).unwrap(),
+            fixed_root
+        );
+        assert_eq!(
+            resolve_model_static_root(data_root, None).unwrap(),
+            data_root
+        );
+        assert!(resolve_model_static_root(data_root, Some(PathBuf::from("relative"))).is_err());
     }
 
     #[test]
