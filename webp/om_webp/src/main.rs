@@ -703,16 +703,14 @@ fn main() -> Result<()> {
     for (block_index, block_times) in times.chunks(args.series_block_hours).enumerate() {
         let rendered = pool.install(|| {
             with_weather_model(args.scope.weather_model(), || {
-                with_ecmwf_request_cache(|| {
-                    render_series_block(
-                        &snapshot,
-                        &decoder,
-                        &grid,
-                        &selected,
-                        block_times,
-                        args.scope.tolerate_unavailable_layers(),
-                    )
-                })
+                render_series_block(
+                    &snapshot,
+                    &decoder,
+                    &grid,
+                    &selected,
+                    block_times,
+                    args.scope.tolerate_unavailable_layers(),
+                )
             })
         })?;
         for (offset, layers) in rendered.into_iter().enumerate() {
@@ -1057,14 +1055,20 @@ fn read_layer_grid_series(
     grid: &RegionGrid,
     tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<f32>>> {
-    match read_variable_grid_series(
-        snapshot,
-        decoder,
-        variable,
-        times,
-        &grid.latitudes,
-        &grid.longitudes,
-    ) {
+    // The ECMWF regular-series cache can retain roughly one full regional
+    // forecast per raw dependency. Keep it scoped to one output layer so a
+    // 16-layer WebP block does not pin every source variable at once.
+    let values = with_ecmwf_request_cache(|| {
+        read_variable_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            &grid.latitudes,
+            &grid.longitudes,
+        )
+    });
+    match values {
         Ok(mut series) => {
             for values in &mut series {
                 values
