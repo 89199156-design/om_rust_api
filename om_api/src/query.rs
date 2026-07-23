@@ -6,7 +6,8 @@ use crate::solar::{
     backwards_diffuse_radiation, backwards_direct_normal_irradiance,
     backwards_global_tilted_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
     daylight_duration, extra_terrestrial_radiation_backwards,
-    extra_terrestrial_radiation_factor_backwards, is_day, sun_transit, SunTransit, SOLAR_CONSTANT,
+    extra_terrestrial_radiation_factor_backwards, is_day, sun_transit, SunTransit,
+    PI as SWIFT_FLOAT_PI, SOLAR_CONSTANT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
@@ -8949,6 +8950,27 @@ mod tests {
     }
 
     #[test]
+    fn dominant_wind_direction_uses_swift_float_pi() {
+        // Frozen p0052 internal frames land exactly on an integer-output
+        // boundary. Rust's one-ULP-higher PI returns 185; Swift Float.pi,
+        // used by Open-Meteo's uWind/vWind helpers, returns the official 184.
+        let speed = [
+            4.909175, 5.5443664, 5.323533, 4.785394, 4.8270073, 5.830952, 6.207254, 6.1,
+        ];
+        let direction = [
+            183.50346, 187.2531, 174.61078, 190.84026, 193.17256, 185.90605, 182.77016,
+            180.0,
+        ];
+        assert_eq!(
+            json_value_for_variable(
+                "wind_direction_10m",
+                dominant_wind_direction(&speed, &direction),
+            ),
+            serde_json::json!(184)
+        );
+    }
+
+    #[test]
     fn hj633_co_interpolation_does_not_ceil_exact_integer_due_to_f32_noise() {
         assert_eq!(
             hj633_2026_iaqi(0.6, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
@@ -10440,14 +10462,14 @@ fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
         .iter()
         .zip(direction)
         .map(|(&speed, &direction)| {
-            -1.0 * speed * (direction * std::f32::consts::PI / 180.0).sin()
+            -1.0 * speed * (direction * SWIFT_FLOAT_PI / 180.0).sin()
         })
         .sum::<f32>();
     let v = speed
         .iter()
         .zip(direction)
         .map(|(&speed, &direction)| {
-            -1.0 * speed * (direction * std::f32::consts::PI / 180.0).cos()
+            -1.0 * speed * (direction * SWIFT_FLOAT_PI / 180.0).cos()
         })
         .sum::<f32>();
     wind_direction(u, v)

@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 pub const SOLAR_CONSTANT: f32 = 1367.7;
 // Swift's Float.pi is one ULP below Rust's f32::consts::PI. Open-Meteo's
 // solar helpers use the Swift value for every degree/radian conversion.
-const PI: f32 = f32::from_bits(0x4049_0fda);
+pub(crate) const PI: f32 = f32::from_bits(0x4049_0fda);
 const SECONDS_PER_DAY: i64 = 86_400;
 const SECONDS_PER_AVERAGE_YEAR: i64 = 31_557_600;
 const LOOKUP_START: i64 = -631_152_000; // 1950-01-01T00:00:00Z
