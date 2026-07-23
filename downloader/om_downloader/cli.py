@@ -1170,6 +1170,59 @@ def _download_openmeteo_product(
                     fallback_url,
                     fallback_content_length,
                 )
+                context_hours = product.missing_variable_fallback_context_hours
+                if fallback_variables and context_hours > 0:
+                    for context_offset in (-context_hours, context_hours):
+                        context_valid_time = valid_time + timedelta(hours=context_offset)
+                        context_forecast_hour = fallback_forecast_hour + context_offset
+                        context_coverage_forecast_hour = (
+                            coverage_forecast_hour + context_offset
+                        )
+                        if (
+                            context_forecast_hour < 0
+                            or context_forecast_hour > product.forecast_hour_end
+                            or context_coverage_forecast_hour < 0
+                        ):
+                            continue
+                        context_url = openmeteo_spatial_object_url(
+                            bucket_url,
+                            product.openmeteo_model,
+                            reference_time_utc=fallback_base_time,
+                            valid_time_utc=context_valid_time,
+                        )
+                        try:
+                            (
+                                context_source,
+                                context_content_length,
+                                context_inventory,
+                            ) = inventory_for_url(context_url, fallback_variables)
+                        except Exception:
+                            continue
+                        context_variables = tuple(
+                            variable
+                            for variable in fallback_variables
+                            if variable in context_inventory.arrays
+                        )
+                        context_object_record = {
+                            "valid_time_utc": _format_utc(context_valid_time),
+                            "source_run": fallback_run_id,
+                            "forecast_hour": context_forecast_hour,
+                            "coverage_source_run": object_record.get(
+                                "coverage_source_run", primary_run
+                            ),
+                            "coverage_forecast_hour": (
+                                context_coverage_forecast_hour
+                            ),
+                            "interpolation_support": True,
+                        }
+                        append_planned_variables(
+                            context_variables,
+                            context_source,
+                            context_inventory,
+                            context_object_record,
+                            context_url,
+                            context_content_length,
+                        )
                 remaining_missing.difference_update(fallback_variables)
                 missing_for_object = sorted(remaining_missing)
         return {
@@ -1229,8 +1282,25 @@ def _download_openmeteo_product(
                     completed[future_orders.pop(future)] = future.result()
                 yield from yield_ready_objects()
 
+    def iter_unique_planned_entries():
+        seen: set[tuple[Any, ...]] = set()
+        for entry in iter_planned_entries():
+            record = entry["object_record"]
+            key = (
+                entry["bundle"]["variable"],
+                record["source_run"],
+                record["valid_time_utc"],
+                int(record["forecast_hour"]),
+                record.get("coverage_source_run"),
+                int(record.get("coverage_forecast_hour", record["forecast_hour"])),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            yield entry
+
     files = []
-    planned_entries = iter_planned_entries()
+    planned_entries = iter_unique_planned_entries()
     try:
         first_entry = next(planned_entries)
     except StopIteration:

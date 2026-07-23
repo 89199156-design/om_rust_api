@@ -120,6 +120,14 @@ real older source-run identity so the existing first-stage interpolation runs
 within that source run before newest-run overlay, matching the official
 rolling database rather than interpolating across runs.
 
+Every selected older fallback frame also retains the configured six-hour
+left/right context from that same source run when the objects exist. This is
+required because an isolated long-range endpoint cannot reconstruct the
+missing three-hour midpoint: Open-Meteo interpolates the older run first and
+only then lets the newer run overwrite the frames it actually supplies.
+Context entries are marked as interpolation support and deduplicated by
+variable, source run, valid time and logical coverage hour.
+
 Regressions:
 `test_missing_variable_fallback_candidates_reach_retained_long_run` and
 `ecmwf_retained_gust_frame_supplies_official_second_stage_lookahead`.

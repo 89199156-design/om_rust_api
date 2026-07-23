@@ -33,6 +33,7 @@ class ProductConfig:
     required_initial_fallback_variables: tuple[str, ...] = ()
     interpolation_support_hours: int = 0
     missing_variable_fallback_lookback_hours: int = 0
+    missing_variable_fallback_context_hours: int = 0
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,13 @@ def load_models(path: Path) -> ModelsConfig:
             raise ValueError(
                 f"product {name} missing_variable_fallback_lookback_hours must not be negative"
             )
+        missing_variable_fallback_context_hours = int(
+            raw.get("missing_variable_fallback_context_hours", 0)
+        )
+        if missing_variable_fallback_context_hours < 0:
+            raise ValueError(
+                f"product {name} missing_variable_fallback_context_hours must not be negative"
+            )
         coverage_strategy = str(raw.get("coverage_strategy", "latest_run"))
         if coverage_strategy not in ("latest_run", "latest_with_long_run_tail"):
             raise ValueError(
@@ -163,6 +171,9 @@ def load_models(path: Path) -> ModelsConfig:
             interpolation_support_hours=interpolation_support_hours,
             missing_variable_fallback_lookback_hours=(
                 missing_variable_fallback_lookback_hours
+            ),
+            missing_variable_fallback_context_hours=(
+                missing_variable_fallback_context_hours
             ),
         )
     return ModelsConfig(version=int(data.get("version", 1)), products=products)
