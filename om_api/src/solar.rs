@@ -289,11 +289,12 @@ pub fn backwards_direct_normal_irradiance(
         return 0.0;
     };
     let daylight = backwards_sun_elevation(geometry, true);
-    let dni = if daylight <= 0.0001 {
-        direct_radiation
-    } else {
-        direct_radiation / daylight
-    };
+    // The frozen ECMWF API baseline caps the denominator at sin(3°). This
+    // avoids unstable DNI spikes close to sunrise and sunset. A later upstream
+    // source revision removed this cap, but it does not describe the captured
+    // 2026-07-23 official responses used by this clone.
+    let zenith_cutoff_sin = radians(3.0).sin();
+    let dni = direct_radiation / daylight.max(zenith_cutoff_sin);
     if !convert_to_instant {
         return dni;
     }
@@ -485,6 +486,46 @@ mod tests {
                 f32::from_bits(0x42d2_3c00),
             )
             .to_bits()
+        );
+    }
+
+    #[test]
+    fn backwards_dni_matches_official_swift_reference() {
+        let start = Utc.with_ymd_and_hms(2022, 7, 31, 0, 0, 0).unwrap();
+        let direct = [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 116.0, 305.0, 485.0, 615.0, 680.0, 681.0, 579.0,
+            428.0, 272.0, 87.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let expected = [
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 88.22421, 525.6257, 730.035, 838.7038, 889.7469,
+            908.00757, 911.16675, 843.0275, 749.2078, 665.61414, 414.24954, 40.669086, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        for (hour, (direct, expected)) in direct.into_iter().zip(expected).enumerate() {
+            let actual = backwards_direct_normal_irradiance(
+                direct,
+                start + chrono::Duration::hours(hour as i64),
+                3600,
+                -22.5,
+                17.0,
+                false,
+            );
+            assert!(
+                (actual - expected).abs() < 0.01,
+                "hour={hour} actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backwards_dni_matches_frozen_ecmwf_sunset_frame() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 26, 16, 0, 0).unwrap();
+        let direct = 15.0 - backwards_diffuse_radiation(15.0, timestamp, 3600, 58.0, 70.0);
+        let actual = backwards_direct_normal_irradiance(direct, timestamp, 3600, 58.0, 70.0, false);
+        assert!(
+            (actual - 18.7).abs() < 0.05,
+            "actual={actual:?}, bits={:08x}",
+            actual.to_bits()
         );
     }
 }
