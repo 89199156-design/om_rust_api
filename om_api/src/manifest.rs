@@ -19,6 +19,15 @@ pub struct ProductManifest {
     pub public_start_utc: Option<DateTime<Utc>>,
     #[serde(default)]
     pub files: Vec<ManifestFile>,
+    #[serde(default)]
+    pub coverage_plan: Vec<CoveragePlanEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CoveragePlanEntry {
+    pub valid_time_utc: DateTime<Utc>,
+    pub source_run: String,
+    pub forecast_hour: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +48,12 @@ pub struct BundleEntry {
     pub valid_time_utc: DateTime<Utc>,
     pub source_run: String,
     pub forecast_hour: i64,
+    #[serde(default)]
+    pub coverage_source_run: Option<String>,
+    #[serde(default)]
+    pub coverage_forecast_hour: Option<i64>,
+    #[serde(default)]
+    pub interpolation_support: bool,
     #[serde(default)]
     pub source_url: Option<String>,
     pub selection_ranges: Vec<[u64; 2]>,
@@ -111,6 +126,7 @@ pub struct ProductSnapshot {
     pub bundle_path: PathBuf,
     pub bundle_handle: Arc<File>,
     pub entries: HashMap<EntryKey, BundleEntry>,
+    pub entries_by_source_run: HashMap<String, Vec<BundleEntry>>,
     pub static_entries: HashMap<String, BundleEntry>,
     pub native_handles: HashMap<String, Arc<File>>,
 }
@@ -161,7 +177,7 @@ fn load_product_snapshot_from_manifest_path(
         .find(|file| file.path.ends_with(".omranges"))
         .cloned()
         .context("complete manifest does not contain an .omranges bundle")?;
-    let bundle_path = safe_join(&product_root, &bundle_file.path)?;
+    let bundle_path = safe_join(product_root, &bundle_file.path)?;
     if !bundle_path.exists() {
         bail!("bundle file does not exist: {}", bundle_path.display());
     }
@@ -180,14 +196,26 @@ fn load_product_snapshot_from_manifest_path(
     );
 
     let mut entries = HashMap::new();
+    let mut entries_by_source_run: HashMap<String, Vec<BundleEntry>> = HashMap::new();
     for entry in &bundle_file.entries {
-        entries.insert(
-            EntryKey {
-                variable: entry.variable.clone(),
-                valid_time_utc: entry.valid_time_utc,
-            },
-            entry.clone(),
-        );
+        let logical_source_run = entry
+            .coverage_source_run
+            .as_deref()
+            .unwrap_or(&entry.source_run)
+            .to_string();
+        entries_by_source_run
+            .entry(logical_source_run)
+            .or_default()
+            .push(entry.clone());
+        if !entry.interpolation_support {
+            entries.insert(
+                EntryKey {
+                    variable: entry.variable.clone(),
+                    valid_time_utc: entry.valid_time_utc,
+                },
+                entry.clone(),
+            );
+        }
     }
     if entries.is_empty() {
         bail!(
@@ -204,6 +232,7 @@ fn load_product_snapshot_from_manifest_path(
         bundle_path,
         bundle_handle,
         entries,
+        entries_by_source_run,
         static_entries: HashMap::new(),
         native_handles: HashMap::new(),
     })

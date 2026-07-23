@@ -2,7 +2,10 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use om_api::official::OfficialDecoder;
-use om_api::query::{read_variable_grid, read_variable_value, round_variable_output_value};
+use om_api::query::{
+    read_variable_grid, read_variable_value, round_variable_output_value, with_weather_model,
+    WeatherModel,
+};
 use om_api::snapshot::OmDataSnapshot;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -11,6 +14,29 @@ use std::path::PathBuf;
 enum Scope {
     Gfs,
     Cams,
+    #[value(name = "ecmwf_ifs025", alias = "ecmwf", alias = "ec")]
+    EcmwfIfs025,
+}
+
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs",
+            Self::Cams => "cams",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
+        }
+    }
+
+    fn weather_model(self) -> WeatherModel {
+        match self {
+            Self::Gfs | Self::Cams => WeatherModel::Gfs,
+            Self::EcmwfIfs025 => WeatherModel::EcmwfIfs025,
+        }
+    }
+
+    fn tolerate_unavailable_variables(self) -> bool {
+        !matches!(self, Self::EcmwfIfs025)
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -58,6 +84,24 @@ const GFS_VARIABLES: &[&str] = &[
 
 const CAMS_VARIABLES: &[&str] = &["pm2_5", "pm10", "aerosol_optical_depth", "dust"];
 
+const ECMWF_IFS025_VARIABLES: &[&str] = &[
+    "cloud_cover",
+    "cloud_cover_high",
+    "cloud_cover_mid",
+    "cloud_cover_low",
+    "temperature_2m",
+    "dew_point_2m",
+    "relative_humidity_2m",
+    "wind_u_component_10m",
+    "wind_v_component_10m",
+    "precipitation",
+    "snow_depth",
+    "weather_code",
+    "cape",
+    "pressure_msl",
+    "surface_pressure",
+];
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let snapshot = OmDataSnapshot::load(&args.data_root)?;
@@ -66,20 +110,27 @@ fn main() -> Result<()> {
     let variables = match args.scope {
         Scope::Gfs => GFS_VARIABLES,
         Scope::Cams => CAMS_VARIABLES,
+        Scope::EcmwfIfs025 => ECMWF_IFS025_VARIABLES,
     };
+    let model = args.scope.weather_model();
     let indices = sample_indices(latitudes.len() * longitudes.len(), args.samples.max(3));
     let mut results = Vec::new();
     for variable in variables {
-        let grid = match read_variable_grid(
-            &snapshot,
-            &decoder,
-            variable,
-            args.time,
-            &latitudes,
-            &longitudes,
-        ) {
+        let grid = match with_weather_model(model, || {
+            read_variable_grid(
+                &snapshot,
+                &decoder,
+                variable,
+                args.time,
+                &latitudes,
+                &longitudes,
+            )
+        }) {
             Ok(values) => values,
-            Err(error) if error.to_string().contains("variable/time is not available") => {
+            Err(error)
+                if args.scope.tolerate_unavailable_variables()
+                    && error.to_string().contains("variable/time is not available") =>
+            {
                 println!("[om-grid-verify] variable={variable} unavailable");
                 continue;
             }
@@ -90,14 +141,16 @@ fn main() -> Result<()> {
         for index in &indices {
             let y = index / longitudes.len();
             let x = index % longitudes.len();
-            let point = read_variable_value(
-                &snapshot,
-                Some(&decoder),
-                variable,
-                args.time,
-                latitudes[y],
-                longitudes[x],
-            )?;
+            let point = with_weather_model(model, || {
+                read_variable_value(
+                    &snapshot,
+                    Some(&decoder),
+                    variable,
+                    args.time,
+                    latitudes[y],
+                    longitudes[x],
+                )
+            })?;
             let grid_value = round_variable_output_value(variable, grid[*index]);
             let point_value = round_variable_output_value(variable, point);
             if grid_value.is_nan() && point_value.is_nan() {
@@ -128,7 +181,7 @@ fn main() -> Result<()> {
         "{}",
         serde_json::json!({
             "status": "success",
-            "scope": match args.scope { Scope::Gfs => "gfs", Scope::Cams => "cams" },
+            "scope": args.scope.name(),
             "time": args.time,
             "grid": format!("{}x{}", longitudes.len(), latitudes.len()),
             "samples_per_variable": indices.len(),
@@ -171,4 +224,32 @@ fn sample_indices(length: usize, count: usize) -> Vec<usize> {
 
 fn round6(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecmwf_scope_and_inventory_are_explicit() {
+        let args = Args::try_parse_from([
+            "om-grid-verify",
+            "--scope",
+            "ecmwf_ifs025",
+            "--data-root",
+            "/data/om_raw",
+            "--decoder-lib",
+            "/tmp/libomfileformat.so",
+            "--time",
+            "2026-07-19T00:00:00Z",
+        ])
+        .unwrap();
+        assert_eq!(args.scope.name(), "ecmwf_ifs025");
+        assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs025);
+        assert!(!args.scope.tolerate_unavailable_variables());
+        assert_eq!(ECMWF_IFS025_VARIABLES.len(), 15);
+        assert!(!ECMWF_IFS025_VARIABLES.contains(&"wind_gusts_10m"));
+        assert!(!ECMWF_IFS025_VARIABLES.contains(&"visibility"));
+        assert!(!ECMWF_IFS025_VARIABLES.contains(&"uv_index"));
+    }
 }

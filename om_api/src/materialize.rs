@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime};
 
-pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v4";
+pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v5";
 pub const GFS_PRODUCTS: [&str; 3] = ["gfs013_surface", "gfs025", "gfs_pressure_profile"];
 const DATA_TYPE_FLOAT_ARRAY: u8 = 20;
 const COMPRESSION_PFOR_DELTA2D_INT16: u8 = 0;
@@ -275,6 +275,8 @@ struct GfsNativeProduct {
 struct GfsNativeStaticSource {
     source: String,
     runtime_path: String,
+    storage: String,
+    environment: String,
     latitude_chunk_min: i32,
     latitude_chunk_max: i32,
     file_count: usize,
@@ -416,7 +418,7 @@ pub fn build_gfs_coverage(
     let identity = build_identity(options, &sources);
     let target = coverage_parent.join(&options.coverage_id);
     if path_is_real_directory(&target, "immutable native coverage")? {
-        let validation = validate_gfs_coverage(&target, decoder)?;
+        let validation = validate_gfs_coverage(&target, &options.dem_root, decoder)?;
         let identity_path = target.join("build_identity.json");
         let existing: Value =
             serde_json::from_slice(&fs::read(&identity_path).with_context(|| {
@@ -510,11 +512,9 @@ pub fn build_gfs_coverage(
         &staging.join("ncep_gfs025/static/HSURF.om"),
         &gfs025_contract(),
     )?;
-    link_dem_chunks(&options.dem_root, &staging)?;
-
     let marker = build_coverage_marker(options, &sources, legacy_marker, &staging)?;
     atomic_write_json(&staging.join("coverage.json"), &marker)?;
-    let validation = validate_gfs_coverage(&staging, decoder)?;
+    let validation = validate_gfs_coverage(&staging, &options.dem_root, decoder)?;
     Ok(GfsBuildResult {
         coverage_id: options.coverage_id.clone(),
         staging_path: staging,
@@ -1014,26 +1014,6 @@ fn estimate_native_build_bytes(options: &GfsBuildOptions, tasks: &[VariableTask]
             )?)
             .and_then(|value| value.checked_add(1024 * 1024))
             .context("native static byte estimate overflow")?;
-    }
-
-    for latitude in 0..=58 {
-        let source = options
-            .dem_root
-            .join("copernicus_dem90/static")
-            .join(format!("lat_{latitude}.om"));
-        let bytes = source
-            .metadata()
-            .with_context(|| format!("read DEM source size: {}", source.display()))?
-            .len();
-        if bytes == 0 {
-            bail!(
-                "required Copernicus DEM90 chunk is empty: {}",
-                source.display()
-            );
-        }
-        estimated = estimated
-            .checked_add(bytes)
-            .context("native DEM byte estimate overflow")?;
     }
 
     checked_ceil_ratio(estimated, ESTIMATE_NUMERATOR, ESTIMATE_DENOMINATOR)?
@@ -1822,38 +1802,6 @@ fn materialize_static_elevation(
     Ok(())
 }
 
-fn link_dem_chunks(dem_root: &Path, staging: &Path) -> Result<()> {
-    let source_root = dem_root.join("copernicus_dem90/static");
-    let destination_root = staging.join("copernicus_dem90/static");
-    fs::create_dir_all(&destination_root)?;
-    for latitude in 0..=58 {
-        let name = format!("lat_{latitude}.om");
-        let source = source_root.join(&name);
-        let destination = destination_root.join(&name);
-        if !source.is_file() || source.metadata()?.len() == 0 {
-            bail!(
-                "required Copernicus DEM90 chunk is missing: {}",
-                source.display()
-            );
-        }
-        if destination.exists() {
-            if destination.metadata()?.len() == source.metadata()?.len() {
-                continue;
-            }
-            fs::remove_file(&destination)?;
-        }
-        if let Err(link_error) = fs::hard_link(&source, &destination) {
-            fs::copy(&source, &destination).with_context(|| {
-                format!(
-                    "copy DEM chunk after hard-link failure ({link_error}): {}",
-                    source.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn build_coverage_marker(
     options: &GfsBuildOptions,
     sources: &[LegacySourceRun],
@@ -1959,6 +1907,8 @@ fn build_coverage_marker(
             "copernicus_dem90": {
                 "source": "copernicus_dem90",
                 "runtime_path": "copernicus_dem90/static",
+                "storage": "external_env",
+                "environment": "OM_DEM_ROOT",
                 "latitude_chunk_min": 0,
                 "latitude_chunk_max": 58,
                 "file_count": 59
@@ -2238,6 +2188,7 @@ fn validate_build_identity(coverage_root: &Path, marker: &GfsCoverageMarker) -> 
 
 pub fn validate_gfs_coverage(
     coverage_root: &Path,
+    dem_root: &Path,
     decoder: &OfficialDecoder,
 ) -> Result<GfsValidationResult> {
     let root_metadata = fs::symlink_metadata(coverage_root)
@@ -2347,11 +2298,20 @@ pub fn validate_gfs_coverage(
     if marker.static_sources.len() != 1
         || dem.source != "copernicus_dem90"
         || dem.runtime_path != "copernicus_dem90/static"
+        || dem.storage != "external_env"
+        || dem.environment != "OM_DEM_ROOT"
         || dem.latitude_chunk_min != 0
         || dem.latitude_chunk_max != 58
         || dem.file_count != 59
     {
         bail!("native GFS Copernicus DEM90 contract is invalid");
+    }
+    let dem_static_root = dem_root.join(&dem.runtime_path);
+    if !dem_root.is_absolute() || !dem_static_root.is_dir() {
+        bail!(
+            "native GFS external Copernicus DEM90 root is invalid: {}",
+            dem_static_root.display()
+        );
     }
 
     let mut om_files = 0_u64;
@@ -2493,11 +2453,8 @@ pub fn validate_gfs_coverage(
         om_files += 1;
     }
     for latitude in 0..=58 {
-        let path = coverage_root
-            .join("copernicus_dem90/static")
-            .join(format!("lat_{latitude}.om"));
+        let path = dem_static_root.join(format!("lat_{latitude}.om"));
         decoded_probes += validate_dem_om_file(decoder, &path)?;
-        om_files += 1;
     }
 
     let (files, bytes) = coverage_stats(coverage_root)?;
@@ -2520,6 +2477,7 @@ pub fn validate_gfs_coverage(
 
 pub fn publish_gfs_coverage(
     data_root: &Path,
+    dem_root: &Path,
     coverage_id: &str,
     decoder: &OfficialDecoder,
 ) -> Result<GfsPublishResult> {
@@ -2542,7 +2500,7 @@ pub fn publish_gfs_coverage(
                 staging.display()
             );
         }
-        validate_gfs_coverage(&target, decoder)?;
+        validate_gfs_coverage(&target, dem_root, decoder)?;
         true
     } else {
         if !staging_exists {
@@ -2551,7 +2509,7 @@ pub fn publish_gfs_coverage(
                 staging.display()
             );
         }
-        validate_gfs_coverage(&staging, decoder)?;
+        validate_gfs_coverage(&staging, dem_root, decoder)?;
         fs::rename(&staging, &target).with_context(|| {
             format!(
                 "promote native GFS staging coverage {} to {}",
@@ -2562,7 +2520,7 @@ pub fn publish_gfs_coverage(
         sync_directory(&coverage_parent)?;
         false
     };
-    let validation = validate_gfs_coverage(&target, decoder)?;
+    let validation = validate_gfs_coverage(&target, dem_root, decoder)?;
     if validation.coverage_id != coverage_id {
         bail!("published native GFS coverage identity does not match its directory");
     }
@@ -2619,6 +2577,7 @@ pub fn publish_gfs_coverage(
     atomic_write_json(&current_marker, &ready)?;
     let cleanup = prune_completed_gfs_coverages(
         data_root,
+        dem_root,
         coverage_id,
         previous_current_id.as_deref(),
         decoder,
@@ -2728,6 +2687,7 @@ fn collect_managed_coverages(coverage_parent: &Path) -> Result<Vec<ManagedCovera
 
 fn prune_completed_gfs_coverages(
     data_root: &Path,
+    dem_root: &Path,
     current_coverage_id: &str,
     previous_current_id: Option<&str>,
     decoder: &OfficialDecoder,
@@ -2752,12 +2712,13 @@ fn prune_completed_gfs_coverages(
         if keep.contains(&candidate.coverage_id) {
             continue;
         }
-        let validation = validate_gfs_coverage(&candidate.path, decoder).with_context(|| {
-            format!(
-                "refusing to remove unvalidated native coverage {}",
-                candidate.path.display()
-            )
-        })?;
+        let validation =
+            validate_gfs_coverage(&candidate.path, dem_root, decoder).with_context(|| {
+                format!(
+                    "refusing to remove unvalidated native coverage {}",
+                    candidate.path.display()
+                )
+            })?;
         if validation.coverage_id != candidate.coverage_id {
             bail!("native cleanup candidate identity changed during validation");
         }
@@ -3160,7 +3121,7 @@ mod tests {
         let revision = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             default_gfs_coverage_id("2026072018", revision).unwrap(),
-            "gfs_native_2026072018_official-hourly-quantized-v4_0123456789ab"
+            "gfs_native_2026072018_official-hourly-quantized-v5_0123456789ab"
         );
         assert!(default_gfs_coverage_id("2026072021", revision).is_err());
         assert!(default_gfs_coverage_id("2026072018", "not-a-sha").is_err());

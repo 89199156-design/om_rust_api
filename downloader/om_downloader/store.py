@@ -16,6 +16,7 @@ from .http_range import (
     fetch_byte_range_with_retry,
     fetch_http_prefix_to_file,
 )
+from .storage_guard import enforce_environment_storage_guard
 
 
 def write_fixture_om_file(output_root: Path, model: str, coverage_id: str) -> dict:
@@ -43,6 +44,11 @@ def write_http_range_file(
 ) -> dict:
     directory = output_root / "published" / model / "coverages" / coverage_id
     path = directory / f"{model}_{coverage_id}.om"
+    ranges = tuple(ranges)
+    enforce_environment_storage_guard(
+        path,
+        additional_bytes=sum(item.length for item in ranges),
+    )
     return download_byte_ranges(
         source_url,
         ranges,
@@ -90,6 +96,7 @@ def write_om_range_bundle_file(
             "reused_existing": True,
         }
     else:
+        enforce_environment_storage_guard(path, additional_bytes=expected_bytes)
         file_record = download_byte_ranges(
             source_url,
             byte_ranges,
@@ -129,6 +136,13 @@ def _coverage_bundle_entry(
         "valid_time_utc": object_record["valid_time_utc"],
         "source_run": object_record["source_run"],
         "forecast_hour": object_record["forecast_hour"],
+        "coverage_source_run": object_record.get(
+            "coverage_source_run", object_record["source_run"]
+        ),
+        "coverage_forecast_hour": object_record.get(
+            "coverage_forecast_hour", object_record["forecast_hour"]
+        ),
+        "interpolation_support": bool(object_record.get("interpolation_support")),
         "source_url": source_url,
         "selection_ranges": bundle["selection_ranges"],
         "array": bundle["array"],
@@ -185,6 +199,14 @@ def _coverage_bundle_file_record(
 
 def _write_prepared_coverage_bundle(path: Path, prepared: list[dict]) -> None:
     temp_path = path.with_name(path.name + ".tmp")
+    enforce_environment_storage_guard(
+        path,
+        additional_bytes=sum(
+            byte_range.length
+            for item in prepared
+            for byte_range in item["byte_ranges"]
+        ),
+    )
     try:
         with temp_path.open("wb") as file_obj:
             for item in prepared:
@@ -430,6 +452,7 @@ def _download_merged_object_range(
 
 def _download_prepared_group_ranges(
     file_obj,
+    path: Path,
     prepared: list[dict],
     *,
     range_workers: int,
@@ -529,6 +552,7 @@ def _download_prepared_group_ranges(
         expected = int(state["item"]["manifest"]["bundle_bytes"])
         if len(payload) != expected:
             raise ValueError(f"downloaded entry payload is {len(payload)} bytes, expected {expected}")
+        enforce_environment_storage_guard(path, additional_bytes=len(payload))
         file_obj.write(payload)
         counters["written_bytes"] += len(payload)
         counters["manifest_entries"].append(state["item"]["manifest"])
@@ -562,6 +586,7 @@ def _download_prepared_group_prefix(
     remote_content_length = prepared[0].get("remote_content_length")
     source_temp = path.with_name(f".{path.name}.source-{group_index}.tmp")
     try:
+        enforce_environment_storage_guard(path, additional_bytes=prefix_bytes)
         fetched = fetch_http_prefix_to_file(
             source_url,
             source_temp,
@@ -592,6 +617,7 @@ def _download_prepared_group_prefix(
                         raise ValueError(
                             f"local prefix read returned {len(payload)} bytes, expected {byte_range.length}"
                         )
+                    enforce_environment_storage_guard(path, additional_bytes=len(payload))
                     file_obj.write(payload)
                     entry_bytes += len(payload)
                 expected = int(item["manifest"]["bundle_bytes"])
@@ -801,6 +827,7 @@ def _write_prepared_coverage_bundle_merged_streaming(
             if len(payload) != expected:
                 raise ValueError(f"downloaded entry payload is {len(payload)} bytes, expected {expected}")
             file_obj.seek(bundle_offset)
+            enforce_environment_storage_guard(path, additional_bytes=len(payload))
             file_obj.write(payload)
             counters["written_bytes"] += len(payload)
             manifest_by_sequence[sequence] = manifest
@@ -1005,6 +1032,7 @@ def _write_prepared_coverage_bundle_adaptive(
             return
         _download_prepared_group_ranges(
             file_obj,
+            path,
             prepared,
             range_workers=range_workers,
             timeout=timeout,
@@ -1095,6 +1123,10 @@ def _write_prepared_coverage_bundle_streaming(
         nonlocal next_sequence_to_write, written_bytes
         while next_sequence_to_write in completed_by_sequence:
             result = completed_by_sequence.pop(next_sequence_to_write)
+            enforce_environment_storage_guard(
+                path,
+                additional_bytes=len(result["payload"]),
+            )
             file_obj.write(result["payload"])
             written_bytes += len(result["payload"])
             manifest_entries.append(result["item"]["manifest"])

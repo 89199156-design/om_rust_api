@@ -28,6 +28,10 @@ class ProductConfig:
     optional_variables: tuple[str, ...]
     requested_pressure_levels_hpa: tuple[int, ...]
     history_hours: int = 0
+    coverage_strategy: str = "latest_run"
+    required_sparse_variables: tuple[str, ...] = ()
+    required_initial_fallback_variables: tuple[str, ...] = ()
+    interpolation_support_hours: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,22 @@ def load_models(path: Path) -> ModelsConfig:
             ),
             requested_levels,
         )
+        required_sparse_variables = _as_str_tuple(
+            raw.get("required_sparse_variables", []),
+            "required_sparse_variables",
+        )
+        required_initial_fallback_variables = _as_str_tuple(
+            raw.get("required_initial_fallback_variables", []),
+            "required_initial_fallback_variables",
+        )
+        interpolation_support_hours = int(raw.get("interpolation_support_hours", 0))
+        if interpolation_support_hours < 0:
+            raise ValueError(f"product {name} interpolation_support_hours must not be negative")
+        coverage_strategy = str(raw.get("coverage_strategy", "latest_run"))
+        if coverage_strategy not in ("latest_run", "latest_with_long_run_tail"):
+            raise ValueError(
+                f"product {name} has unsupported coverage_strategy: {coverage_strategy}"
+            )
         products[name] = ProductConfig(
             name=name,
             download_product=str(raw["download_product"]),
@@ -129,5 +149,9 @@ def load_models(path: Path) -> ModelsConfig:
             optional_variables=optional_variables,
             requested_pressure_levels_hpa=requested_levels,
             history_hours=int(raw.get("history_hours", 0)),
+            coverage_strategy=coverage_strategy,
+            required_sparse_variables=required_sparse_variables,
+            required_initial_fallback_variables=required_initial_fallback_variables,
+            interpolation_support_hours=interpolation_support_hours,
         )
     return ModelsConfig(version=int(data.get("version", 1)), products=products)

@@ -19,7 +19,7 @@ from urllib.error import HTTPError
 from .checksum import sha256_file
 from .coverage import (
     build_complete_run_coverage_plan,
-    build_coverage_plan,
+    build_product_coverage_plan,
     build_run_forecast_hour_coverage_plan,
     required_start_for_anchors,
 )
@@ -60,10 +60,16 @@ from .mirror_sync import (
 )
 from .http_range import ByteRange
 from .store import write_fixture_om_file, write_http_range_file, write_om_coverage_bundle_file
+from .static_assets import (
+    OPENMETEO_STATIC_ASSETS,
+    static_asset_manifest_record,
+)
+from .storage_guard import enforce_environment_storage_guard
 
 OPENMETEO_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
+    "ecmwf": ("ecmwf_ifs025",),
 }
 GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 GFS_COMPLETE_RUN_RETENTION = 2
@@ -82,6 +88,43 @@ def _effective_group_retention(group: str, requested: int) -> int:
     if group == "cams":
         return max(requested, CAMS_COMPLETE_RUN_RETENTION)
     return requested
+
+
+def _prepare_group_static_assets(
+    group_name: str,
+    *,
+    output_root: Path,
+    bucket_url: str,
+) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
+    del output_root
+    models = OPENMETEO_GROUP_PRODUCTS.get(group_name, ())
+    records: dict[str, dict[str, object]] = {}
+    results: list[dict[str, object]] = []
+    for model in models:
+        spec = OPENMETEO_STATIC_ASSETS.get(model)
+        if spec is None:
+            continue
+        record = static_asset_manifest_record(spec, bucket_url=bucket_url)
+        records[model] = record
+        results.append(
+            {
+                **record,
+                "status": "external",
+                "reason": "immutable model elevation is installed on the system disk",
+            }
+        )
+    return records, results
+
+
+def _group_static_assets_match(
+    manifest: dict[str, Any] | None,
+    expected: dict[str, dict[str, object]],
+) -> bool:
+    if not expected:
+        return True
+    if not manifest:
+        return False
+    return manifest.get("static_assets") == expected
 
 
 def _parse_utc(value: str) -> datetime:
@@ -360,6 +403,76 @@ def _forecast_hour_for_run(run: Any, valid_time: datetime) -> int | None:
     return forecast_hour
 
 
+def _with_interpolation_support_records(
+    product: ProductConfig,
+    plan: Any,
+    runs: list[Any],
+    object_records: list[dict[str, Any]],
+    *,
+    bucket_url: str,
+) -> list[dict[str, Any]]:
+    """Retain old-run right lookahead needed across a stitched ECMWF boundary.
+
+    Open-Meteo first expands each individual IFS run from its native mixed
+    3/6-hour cadence onto a regular 3-hour axis, and only then overlays newer
+    runs.  The public coverage therefore needs a small hidden window from the
+    older run; interpolating directly across the selected-run boundary changes
+    Hermite and solar values.
+    """
+    records = []
+    for record in object_records:
+        enriched = dict(record)
+        enriched.setdefault("coverage_source_run", record["source_run"])
+        enriched.setdefault("coverage_forecast_hour", record["forecast_hour"])
+        enriched.setdefault("interpolation_support", False)
+        records.append(enriched)
+    if product.interpolation_support_hours <= 0:
+        return records
+
+    runs_by_id = {run.run_id: run for run in runs}
+    last_selected: dict[str, datetime] = {}
+    for slot in plan.slots:
+        valid_time = _as_utc(slot.valid_time_utc)
+        last_selected[slot.source_run] = max(
+            valid_time,
+            last_selected.get(slot.source_run, valid_time),
+        )
+    existing = {
+        (str(record["source_run"]), _parse_utc(str(record["valid_time_utc"])))
+        for record in records
+    }
+    support: list[dict[str, Any]] = []
+    for run_id, last_valid_time in last_selected.items():
+        run = runs_by_id[run_id]
+        support_end = last_valid_time + timedelta(hours=product.interpolation_support_hours)
+        for valid_time in sorted(_as_utc(value) for value in run.valid_times_utc):
+            if not (last_valid_time < valid_time <= support_end):
+                continue
+            if (run_id, valid_time) in existing:
+                continue
+            forecast_hour = _forecast_hour_for_run(run, valid_time)
+            if forecast_hour is None:
+                continue
+            support.append(
+                {
+                    "valid_time_utc": _format_utc(valid_time),
+                    "source_run": run_id,
+                    "forecast_hour": forecast_hour,
+                    "coverage_source_run": run_id,
+                    "coverage_forecast_hour": forecast_hour,
+                    "interpolation_support": True,
+                    "url": openmeteo_spatial_object_url(
+                        bucket_url,
+                        product.openmeteo_model,
+                        reference_time_utc=run.base_time_utc,
+                        valid_time_utc=valid_time,
+                    ),
+                }
+            )
+    support.sort(key=lambda item: (item["source_run"], item["valid_time_utc"]))
+    return records + support
+
+
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -371,20 +484,58 @@ def _build_product_plan(
     *,
     now_utc: datetime,
     bucket_url: str,
+    reference_time_utc: datetime | None = None,
 ) -> tuple[Any, list[Any], Any]:
-    latest_catalog = load_openmeteo_spatial_latest(
-        product.openmeteo_model,
+    latest_catalog = (
+        load_openmeteo_spatial_run(
+            product.openmeteo_model,
+            reference_time_utc,
+            bucket_url=bucket_url,
+        )
+        if reference_time_utc is not None
+        else load_openmeteo_spatial_latest(
+            product.openmeteo_model,
+            bucket_url=bucket_url,
+        )
+    )
+    return _build_product_plan_from_catalog(
+        product,
+        latest_catalog,
+        now_utc=now_utc,
         bucket_url=bucket_url,
     )
-    required_start = required_start_for_anchors(now_utc, product.timezone_anchors)
+
+
+def _build_product_plan_from_catalog(
+    product: ProductConfig,
+    latest_catalog: OpenMeteoSpatialCatalog,
+    *,
+    now_utc: datetime,
+    bucket_url: str,
+) -> tuple[Any, list[Any], Any]:
+    if not latest_catalog.completed:
+        raise ValueError(
+            f"Open-Meteo spatial run is not complete: "
+            f"{product.openmeteo_model} {latest_catalog.reference_time_utc.isoformat()}"
+        )
+    required_start = required_start_for_anchors(
+        now_utc,
+        product.timezone_anchors,
+    ) - timedelta(hours=product.history_hours)
+    required_long_run_forecast_hour = (
+        product.forecast_hour_end
+        if product.coverage_strategy == "latest_with_long_run_tail"
+        else None
+    )
     runs = discover_openmeteo_spatial_runs(
         product.name,
         latest_catalog,
         bucket_url=bucket_url,
         required_start_utc=required_start,
         run_cadence_hours=product.run_cadence_hours,
+        required_long_run_forecast_hour=required_long_run_forecast_hour,
     )
-    return latest_catalog, runs, build_coverage_plan(product, runs, now_utc)
+    return latest_catalog, runs, build_product_coverage_plan(product, runs, now_utc)
 
 
 def _coverage_id_for_plan(product: ProductConfig, plan: Any) -> str:
@@ -708,6 +859,7 @@ def _download_openmeteo_product(
     object_range_max_multiplier: float = 2.0,
     object_range_min_ranges: int = 16,
     object_range_max_bytes: int | None = None,
+    reference_time_utc: datetime | None = None,
     plan_data: tuple[Any, list[Any], Any] | None = None,
 ) -> dict[str, Any]:
     run_started_at_utc = _utc_now_text()
@@ -726,7 +878,12 @@ def _download_openmeteo_product(
         raise ValueError("range_io_merge_gap must be non-negative")
     variable_plan_workers = max(1, range_workers // max(1, planning_workers))
     if plan_data is None:
-        _, runs, plan = _build_product_plan(product, now_utc=now_utc, bucket_url=bucket_url)
+        _, runs, plan = _build_product_plan(
+            product,
+            now_utc=now_utc,
+            bucket_url=bucket_url,
+            reference_time_utc=reference_time_utc,
+        )
     else:
         _, runs, plan = plan_data
     coverage_id = _coverage_id_for_plan(product, plan)
@@ -767,9 +924,22 @@ def _download_openmeteo_product(
         bucket_url=bucket_url,
         openmeteo_model=product.openmeteo_model,
     )
+    object_records = _with_interpolation_support_records(
+        product,
+        plan,
+        runs,
+        object_records,
+        bucket_url=bucket_url,
+    )
     region_plan: dict[str, Any] | None = None
     missing_object_required_variables = []
-    wanted_variables = tuple(dict.fromkeys(list(product.required_variables) + list(product.optional_variables)))
+    wanted_variables = tuple(
+        dict.fromkeys(
+            list(product.required_variables)
+            + list(product.required_sparse_variables)
+            + list(product.optional_variables)
+        )
+    )
     runs_by_id = {run.run_id: run for run in runs}
     fallback_inventory_cache: dict[str, tuple[HttpByteRangeSource, int, OmInventory]] = {}
 
@@ -793,7 +963,18 @@ def _download_openmeteo_product(
             object_record["url"],
             wanted_variables,
         )
-        missing_for_object = sorted(set(product.required_variables) - set(inventory.arrays))
+        coverage_forecast_hour = int(
+            object_record.get("coverage_forecast_hour", object_record["forecast_hour"])
+        )
+        forced_fallback = (
+            set(product.required_initial_fallback_variables)
+            if coverage_forecast_hour == 0
+            and not bool(object_record.get("interpolation_support"))
+            else set()
+        )
+        missing_for_object = sorted(
+            (set(product.required_variables) - set(inventory.arrays)) | forced_fallback
+        )
         entries = []
         object_region_plan = None
 
@@ -872,7 +1053,11 @@ def _download_openmeteo_product(
                 entries.append(entry)
 
         append_planned_variables(
-            selected_inventory_variables(product, inventory),
+            tuple(
+                variable
+                for variable in selected_inventory_variables(product, inventory)
+                if variable not in forced_fallback
+            ),
             source,
             inventory,
             object_record,
@@ -916,10 +1101,20 @@ def _download_openmeteo_product(
                     "valid_time_utc": object_record["valid_time_utc"],
                     "source_run": fallback_run.run_id,
                     "forecast_hour": fallback_forecast_hour,
+                    "coverage_source_run": object_record.get(
+                        "coverage_source_run", primary_run
+                    ),
+                    "coverage_forecast_hour": coverage_forecast_hour,
+                    "interpolation_support": bool(
+                        object_record.get("interpolation_support")
+                    ),
                 }
                 fallback_variables = tuple(
                     variable
-                    for variable in product.required_variables
+                    for variable in (
+                        tuple(product.required_variables)
+                        + tuple(product.required_initial_fallback_variables)
+                    )
                     if variable in remaining_missing and variable in fallback_inventory.arrays
                 )
                 append_planned_variables(
@@ -1036,7 +1231,7 @@ def _download_openmeteo_product(
     manifest = build_latest_manifest(product, runs, plan, files, region_plan)
     catalog_missing_required_variables = manifest["missing_required_variables"]
     manifest["missing_object_required_variables"] = missing_object_required_variables
-    required_variables = set(product.required_variables)
+    required_variables = set(product.required_variables) | set(product.required_sparse_variables)
     downloaded_required_variables = {
         str(entry.get("variable"))
         for file_record in files
@@ -1047,7 +1242,59 @@ def _download_openmeteo_product(
     manifest["catalog_missing_required_variables"] = catalog_missing_required_variables
     manifest["missing_required_variables"] = missing_bundle_required_variables
     manifest["missing_bundle_required_variables"] = missing_bundle_required_variables
-    if missing_bundle_required_variables or manifest["missing_pressure_levels_hpa"]:
+    initial_substitutions = {
+        str(entry.get("variable")): {
+            "valid_time_utc": entry.get("valid_time_utc"),
+            "coverage_source_run": entry.get("coverage_source_run"),
+            "coverage_forecast_hour": entry.get("coverage_forecast_hour"),
+            "source_run": entry.get("source_run"),
+            "forecast_hour": entry.get("forecast_hour"),
+        }
+        for file_record in files
+        for entry in file_record.get("entries") or []
+        if entry.get("variable") in product.required_initial_fallback_variables
+        and entry.get("coverage_source_run") == plan.latest_complete_run
+        and int(entry.get("coverage_forecast_hour", -1)) == 0
+        and entry.get("source_run") != plan.latest_complete_run
+        and int(entry.get("forecast_hour", -1)) == product.run_cadence_hours
+    }
+    missing_initial_fallback_variables = sorted(
+        set(product.required_initial_fallback_variables) - set(initial_substitutions)
+    )
+    manifest["initial_frame_substitutions"] = initial_substitutions
+    manifest["missing_initial_fallback_variables"] = missing_initial_fallback_variables
+    manifest["interpolation_support_entries"] = sum(
+        1
+        for file_record in files
+        for entry in file_record.get("entries") or []
+        if entry.get("interpolation_support")
+    )
+    support_records = {
+        (
+            str(entry.get("coverage_source_run") or entry.get("source_run")),
+            str(entry.get("valid_time_utc")),
+            int(entry.get("coverage_forecast_hour", entry.get("forecast_hour", -1))),
+        )
+        for file_record in files
+        for entry in file_record.get("entries") or []
+        if entry.get("interpolation_support")
+    }
+    manifest["interpolation_support_records"] = [
+        {
+            "source_run": source_run,
+            "valid_time_utc": valid_time_utc,
+            "forecast_hour": forecast_hour,
+            "hidden": True,
+            "right_support": True,
+            "support_kind": "right_lookahead",
+        }
+        for source_run, valid_time_utc, forecast_hour in sorted(support_records)
+    ]
+    if (
+        missing_bundle_required_variables
+        or missing_initial_fallback_variables
+        or manifest["missing_pressure_levels_hpa"]
+    ):
         manifest["status"] = "incomplete"
     elif files and manifest["spatial_ranges"]:
         manifest["status"] = "complete"
@@ -1085,6 +1332,7 @@ def _write_group_manifest(
     output_root: Path,
     group_name: str,
     product_manifests: dict[str, dict[str, Any]],
+    static_assets: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     latest_runs = {manifest.get("latest_complete_run") for manifest in product_manifests.values()}
     runs_are_available = all(isinstance(run, str) and run for run in latest_runs)
@@ -1103,6 +1351,9 @@ def _write_group_manifest(
     total_downloaded_bytes = sum(
         int(manifest.get("downloaded_bytes") or 0) for manifest in product_manifests.values()
     )
+    static_asset_bytes = sum(
+        int(record.get("bytes") or 0) for record in (static_assets or {}).values()
+    )
     payload = {
         "group": group_name,
         "status": "complete" if complete else "incomplete",
@@ -1113,6 +1364,9 @@ def _write_group_manifest(
         "files": total_files,
         "bytes": total_bytes,
         "downloaded_bytes": total_downloaded_bytes,
+        "static_assets": static_assets or {},
+        "static_asset_files": len(static_assets or {}),
+        "static_asset_bytes": static_asset_bytes,
         "product_manifests": {
             name: {
                 "coverage_id": manifest.get("coverage_id"),
@@ -1181,17 +1435,27 @@ def _download_openmeteo_group_release(
     group_started_at_utc = _utc_now_text()
     group_started_monotonic = time.monotonic()
     runs_by_product: dict[str, str] | None = None
+    static_assets: dict[str, dict[str, object]] = {}
+    static_asset_results: list[dict[str, object]] = []
     try:
         # 1Panel serializes each row, and the two production rows query
         # agent.db before entering this command.  Group downloads therefore do
         # not create filesystem locks that can survive service stop/start.
         with nullcontext():
             products = [config.products[name] for name in product_names]
+            static_assets, static_asset_results = _prepare_group_static_assets(
+                group_name,
+                output_root=output_root,
+                bucket_url=args.openmeteo_bucket_url,
+            )
             plan_by_product = plan_by_product_override or {
                 product.name: _build_product_plan(
                     product,
                     now_utc=now_utc,
                     bucket_url=args.openmeteo_bucket_url,
+                    reference_time_utc=(
+                        _parse_utc(args.reference_time) if args.reference_time else None
+                    ),
                 )
                 for product in products
             }
@@ -1216,6 +1480,7 @@ def _download_openmeteo_group_release(
                     api_root=publish_root,
                     group_name=group_name,
                 )
+                and _group_static_assets_match(existing_group_manifest, static_assets)
             ):
                 publish_result = sync_group_from_mirror(
                     group_name,
@@ -1252,6 +1517,7 @@ def _download_openmeteo_group_release(
                             "published_to": str(publish_root),
                             "publish_result": publish_result,
                             "cleared_download_payload_paths": cleared_payloads,
+                            "static_assets": static_asset_results,
                         },
                         ensure_ascii=False,
                     )
@@ -1328,7 +1594,12 @@ def _download_openmeteo_group_release(
                         )
                         raise
 
-            group_manifest = _write_group_manifest(output_root, group_name, product_manifests)
+            group_manifest = _write_group_manifest(
+                output_root,
+                group_name,
+                product_manifests,
+                static_assets,
+            )
             group_status, group_reason = _reported_group_status(
                 already_complete=already_complete,
                 group_manifest=group_manifest,
@@ -1376,6 +1647,7 @@ def _download_openmeteo_group_release(
                         "cleared_published_paths": cleared_paths,
                         "publish_result": publish_result,
                         "cleared_download_payload_paths": cleared_download_payloads,
+                        "static_assets": static_asset_results,
                     },
                     ensure_ascii=False,
                 )
@@ -2241,6 +2513,11 @@ def _recover_openmeteo_gfs_short_run(
 
 
 def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.reference_time and args.download_openmeteo_group in ("gfs", "cams"):
+        parser.error(
+            "--reference-time is supported by direct product/group downloads; "
+            "GFS/CAMS retention reconciliation selects its own run window"
+        )
     if args.download_openmeteo_group == "gfs":
         return _reconcile_gfs_retention_window(args, parser)
     if args.download_openmeteo_group != "cams":
@@ -2338,14 +2615,51 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--retain-complete-releases", type=int, default=3)
     parser.add_argument("--raw-root")
     parser.add_argument("--now")
+    parser.add_argument(
+        "--reference-time",
+        help=(
+            "freeze Open-Meteo discovery to an exact completed run reference time "
+            "(ISO-8601, for example 2026-07-18T18:00:00Z)"
+        ),
+    )
     parser.add_argument("--source-url")
     parser.add_argument("--byte-range", action="append", type=_parse_byte_range, default=[])
     args = parser.parse_args(argv)
 
+    mutating_command = any(
+        (
+            args.download_openmeteo_product,
+            args.download_openmeteo_group,
+            args.recover_openmeteo_gfs_short_run,
+            args.retain_openmeteo_group_to,
+            args.build_processing_stage,
+            args.sync_from_manifest_url,
+            args.sync_from_manifest_path,
+            args.sync_openmeteo_group_from_source,
+            args.sync_openmeteo_group_releases_from_source,
+        )
+    )
+    if mutating_command:
+        guarded_paths = {Path(args.output)}
+        if args.publish_openmeteo_group_to:
+            guarded_paths.add(Path(args.publish_openmeteo_group_to))
+        if args.raw_root:
+            guarded_paths.add(Path(args.raw_root))
+        for guarded_path in sorted(guarded_paths, key=str):
+            enforce_environment_storage_guard(guarded_path)
+
     if args.inspect_openmeteo_model:
-        catalog = load_openmeteo_spatial_latest(
-            args.inspect_openmeteo_model,
-            bucket_url=args.openmeteo_bucket_url,
+        catalog = (
+            load_openmeteo_spatial_run(
+                args.inspect_openmeteo_model,
+                _parse_utc(args.reference_time),
+                bucket_url=args.openmeteo_bucket_url,
+            )
+            if args.reference_time
+            else load_openmeteo_spatial_latest(
+                args.inspect_openmeteo_model,
+                bucket_url=args.openmeteo_bucket_url,
+            )
         )
         print(
             json.dumps(
@@ -2362,12 +2676,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.inspect_product_catalog not in config.products:
             parser.error(f"product not found in config: {args.inspect_product_catalog}")
         product = config.products[args.inspect_product_catalog]
-        catalog = load_openmeteo_spatial_latest(
-            product.openmeteo_model,
-            bucket_url=args.openmeteo_bucket_url,
+        catalog = (
+            load_openmeteo_spatial_run(
+                product.openmeteo_model,
+                _parse_utc(args.reference_time),
+                bucket_url=args.openmeteo_bucket_url,
+            )
+            if args.reference_time
+            else load_openmeteo_spatial_latest(
+                product.openmeteo_model,
+                bucket_url=args.openmeteo_bucket_url,
+            )
         )
         available = set(catalog.variables)
-        missing_required = sorted(set(product.required_variables) - available)
+        missing_required = sorted(
+            (set(product.required_variables) | set(product.required_sparse_variables))
+            - available
+        )
         missing_optional = sorted(set(product.optional_variables) - available)
         payload = {
             "product": product.name,
@@ -2379,15 +2704,12 @@ def main(argv: list[str] | None = None) -> int:
             "missing_optional_variables": missing_optional,
         }
         if args.now:
-            required_start = required_start_for_anchors(_parse_utc(args.now), product.timezone_anchors)
-            runs = discover_openmeteo_spatial_runs(
-                product.name,
+            _catalog, runs, plan = _build_product_plan_from_catalog(
+                product,
                 catalog,
+                now_utc=_parse_utc(args.now),
                 bucket_url=args.openmeteo_bucket_url,
-                required_start_utc=required_start,
-                run_cadence_hours=product.run_cadence_hours,
             )
-            plan = build_coverage_plan(product, runs, _parse_utc(args.now))
             object_records = coverage_object_records(
                 plan,
                 runs,
@@ -2578,6 +2900,9 @@ def main(argv: list[str] | None = None) -> int:
                     object_range_max_multiplier=args.object_range_max_multiplier,
                     object_range_min_ranges=args.object_range_min_ranges,
                     object_range_max_bytes=args.object_range_max_bytes,
+                    reference_time_utc=(
+                        _parse_utc(args.reference_time) if args.reference_time else None
+                    ),
                 )
             except Exception as exc:
                 _append_product_failure_summary(
@@ -2610,7 +2935,7 @@ def main(argv: list[str] | None = None) -> int:
     config = load_models(Path(args.config))
     product = config.products[args.model]
     runs = load_fixture_runs(Path(args.metadata))
-    plan = build_coverage_plan(product, runs, _parse_utc(args.now))
+    plan = build_product_coverage_plan(product, runs, _parse_utc(args.now))
     coverage_id = f"{product.name}_{plan.latest_complete_run}_{len(plan.slots)}h"
     output_root = Path(args.output)
     region_plan = _build_region_plan(product)

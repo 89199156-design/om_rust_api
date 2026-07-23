@@ -32,11 +32,23 @@ enum Command {
     Validate {
         #[arg(long)]
         coverage_root: PathBuf,
+        #[arg(
+            long,
+            env = "OM_DEM_ROOT",
+            default_value = "/opt/1panel/apps/weather_om_api/static"
+        )]
+        dem_root: PathBuf,
     },
     /// Atomically promote a validated staging coverage and write current marker last.
     Publish {
         #[arg(long, env = "OM_DATA_ROOT", default_value = "/data/om_raw")]
         data_root: PathBuf,
+        #[arg(
+            long,
+            env = "OM_DEM_ROOT",
+            default_value = "/opt/1panel/apps/weather_om_api/static"
+        )]
+        dem_root: PathBuf,
         #[arg(long)]
         coverage_id: String,
     },
@@ -49,7 +61,11 @@ struct BuildArgs {
     #[arg(long, env = "OM_DATA_ROOT", default_value = "/data/om_raw")]
     data_root: PathBuf,
 
-    #[arg(long, env = "OM_DEM_ROOT", default_value = "/data/om_static")]
+    #[arg(
+        long,
+        env = "OM_DEM_ROOT",
+        default_value = "/opt/1panel/apps/weather_om_api/static"
+    )]
     dem_root: PathBuf,
 
     /// Retained source run to materialize. Defaults to the newest complete
@@ -92,16 +108,28 @@ fn main() -> Result<()> {
     let decoder = OfficialDecoder::load(&cli.omfile_lib)?;
     match cli.command {
         Command::Build(args) => print_json(&build(&args, &decoder)?),
-        Command::Validate { coverage_root } => {
-            print_json(&validate_gfs_coverage(&coverage_root, &decoder)?)
-        }
+        Command::Validate {
+            coverage_root,
+            dem_root,
+        } => print_json(&validate_gfs_coverage(&coverage_root, &dem_root, &decoder)?),
         Command::Publish {
             data_root,
+            dem_root,
             coverage_id,
-        } => print_json(&publish_gfs_coverage(&data_root, &coverage_id, &decoder)?),
+        } => print_json(&publish_gfs_coverage(
+            &data_root,
+            &dem_root,
+            &coverage_id,
+            &decoder,
+        )?),
         Command::BuildAndPublish(args) => {
             let built = build(&args, &decoder)?;
-            let published = publish_gfs_coverage(&args.data_root, &built.coverage_id, &decoder)?;
+            let published = publish_gfs_coverage(
+                &args.data_root,
+                &args.dem_root,
+                &built.coverage_id,
+                &decoder,
+            )?;
             // Production invokes this command while holding the committed
             // helper's flock. Only post-publication, old managed staging is
             // eligible for age-gated cleanup.

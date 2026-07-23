@@ -32,6 +32,14 @@ OPENMETEO_REGULAR_GRIDS = {
         "dx": 0.25,
         "dy": 0.25,
     },
+    "ecmwf_ifs025": {
+        "nx": 1440,
+        "ny": 721,
+        "lon_min": -180.0,
+        "lat_min": -90.0,
+        "dx": 0.25,
+        "dy": 0.25,
+    },
     "cams_global": {
         "nx": 900,
         "ny": 451,

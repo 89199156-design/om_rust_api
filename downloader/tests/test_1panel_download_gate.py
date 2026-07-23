@@ -5,9 +5,30 @@ import tempfile
 import unittest
 
 from scripts.check_1panel_download_tasks import ALL_PRODUCTION_TASKS, TASKS, decision
+from scripts.install_1panel_v2_cronjobs import (
+    _cronjob_values,
+    _existing_cronjob_values,
+    api_publisher_tasks,
+)
 
 
 class DownloadTaskGateTests(unittest.TestCase):
+    def test_ecmwf_task_is_frozen_on_data_disk_and_initially_disabled(self):
+        tasks = {name: script for name, _spec, script in api_publisher_tasks(raw_root=Path("/data/om_raw"))}
+        script = tasks["OM_ECMWF_DOWNLOAD"]
+        self.assertIn("--download-openmeteo-group ecmwf", script)
+        self.assertIn("--output /data/om_downloader", script)
+        self.assertIn("--publish-openmeteo-group-to /data/om_raw", script)
+        self.assertIn("OM_ECMWF_REFERENCE_TIME:-2026-07-23T00:00:00Z", script)
+        payload = _cronjob_values("now", "OM_ECMWF_DOWNLOAD", "spec", script, 1)
+        self.assertEqual(payload["status"], "Disable")
+
+    def test_reinstall_preserves_existing_enabled_or_disabled_status(self):
+        payload = _existing_cronjob_values(
+            {"status": "Disable", "spec": "20 14 * * *", "entry_ids": "1", "is_executing": 1}
+        )
+        self.assertEqual(payload, {"spec": "20 14 * * *"})
+
     def database(self, states: dict[str, int]) -> tuple[tempfile.TemporaryDirectory, Path]:
         temporary = tempfile.TemporaryDirectory()
         path = Path(temporary.name) / "agent.db"

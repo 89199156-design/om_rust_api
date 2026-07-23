@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 
-DOWNLOAD_TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD")
-TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD")
+DOWNLOAD_TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD", "OM_ECMWF_DOWNLOAD")
+TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD", "OM_ECMWF_WEBP_BUILD")
 ALL_PRODUCTION_TASKS = DOWNLOAD_TASKS + TASKS
 ACTIVE_RECORD_STATUSES = ("Running", "Waiting")
 
@@ -24,7 +24,9 @@ def decision(database: Path, current_task: str) -> tuple[str, str]:
             str(name): (int(task_id), int(is_executing or 0))
             for task_id, name, is_executing in connection.execute(
                 "select id, name, is_executing from cronjobs "
-                "where name in (?, ?, ?, ?)",
+                "where name in ("
+                + ", ".join("?" for _ in ALL_PRODUCTION_TASKS)
+                + ")",
                 ALL_PRODUCTION_TASKS,
             )
         }

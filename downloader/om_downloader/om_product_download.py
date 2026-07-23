@@ -12,7 +12,12 @@ from .region import bounds_to_dict, grid_spec_for_openmeteo_model, padded_bounds
 
 def selected_inventory_variables(product: ProductConfig, inventory: OmInventory) -> tuple[str, ...]:
     available = set(inventory.arrays)
-    ordered = list(product.required_variables) + list(product.optional_variables)
+    ordered = (
+        list(product.required_variables)
+        + list(product.required_sparse_variables)
+        + list(product.required_initial_fallback_variables)
+        + list(product.optional_variables)
+    )
     selected: list[str] = []
     seen: set[str] = set()
     for name in ordered:

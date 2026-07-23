@@ -24,18 +24,31 @@ class InstallOmApiTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.content = INSTALL_SCRIPT.read_text(encoding="utf-8")
 
-    def test_pins_both_official_gfs_static_assets(self) -> None:
+    def test_pins_all_official_model_static_assets(self) -> None:
         expected_values = (
             "https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om",
             "203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0",
             "https://openmeteo.s3.amazonaws.com/data/ncep_gfs025/static/HSURF.om",
             "fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d",
+            "https://openmeteo.s3.amazonaws.com/data/ecmwf_ifs025/static/HSURF.om",
+            "935d56ba000b438b61504fbc271bfaa8f70db2acb541d58d5b466a24d294a9fb",
         )
         for expected in expected_values:
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.content)
 
         self.assertIn(PINNED_CODEC_REVISION, self.content)
+
+        self.assertIn(
+            'API_DEM_ROOT="${OM_API_DEM_ROOT:-$INSTALL_DIR/static}"',
+            self.content,
+        )
+        self.assertIn(
+            'MODEL_STATIC_ROOT="${OM_API_MODEL_STATIC_ROOT:-$INSTALL_DIR}"',
+            self.content,
+        )
+        self.assertNotIn("/data/om_static", self.content)
+        self.assertNotIn('$DATA_ROOT/static/', self.content)
 
         self.assertIn(
             '"GFS013" "$GFS013_STATIC_URL" "$GFS013_STATIC_SHA256" '
@@ -45,6 +58,11 @@ class InstallOmApiTests(unittest.TestCase):
         self.assertIn(
             '"GFS025" "$GFS025_STATIC_URL" "$GFS025_STATIC_SHA256" '
             '"$GFS025_STATIC_PATH"',
+            self.content,
+        )
+        self.assertIn(
+            '"ECMWF025" "$ECMWF025_STATIC_URL" "$ECMWF025_STATIC_SHA256" '
+            '"$ECMWF025_STATIC_PATH"',
             self.content,
         )
 
@@ -81,10 +99,13 @@ class InstallOmApiTests(unittest.TestCase):
         harness = f"""
 set -euo pipefail
 SUDO=""
-{functions}
-
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
+MODEL_STATIC_ROOT="$test_root/model-static"
+API_DEM_ROOT="$test_root/dem"
+mkdir -p "$API_DEM_ROOT"
+{functions}
+
 source_path="$test_root/official.om"
 bad_source_path="$test_root/bad.om"
 target_path="$test_root/static/ncep_test/HSURF.om"
@@ -177,8 +198,12 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             static_source = test_root / "HSURF.om"
             static_source.write_bytes(b"official-static-elevation")
             static_sha256 = hashlib.sha256(static_source.read_bytes()).hexdigest()
+            source_archive = test_root / "corresponding-source.tar.gz"
+            source_archive.write_bytes(b"tested-corresponding-source")
+            source_archive_sha256 = hashlib.sha256(source_archive.read_bytes()).hexdigest()
             cargo_arguments_log = test_root / "cargo-arguments.log"
             cargo_target_log = test_root / "cargo-target.log"
+            build_revision_log = test_root / "build-revision.log"
 
             self._write_executable(
                 fake_bin / "cargo",
@@ -186,6 +211,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 #!/usr/bin/env bash
                 set -euo pipefail
                 printf '%s\n' "$@" > "$FAKE_CARGO_ARGUMENTS_LOG"
+                printf '%s\n' "${OM_BUILD_REVISION:-}" > "$FAKE_BUILD_REVISION_LOG"
                 manifest_path=""
                 target_dir=""
                 while [ "$#" -gt 0 ]; do
@@ -262,6 +288,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
                     "FAKE_CARGO_ARGUMENTS_LOG": str(cargo_arguments_log),
                     "FAKE_CARGO_TARGET_LOG": str(cargo_target_log),
+                    "FAKE_BUILD_REVISION_LOG": str(build_revision_log),
                     "REAL_ID": str(real_id),
                     "REAL_INSTALL": str(real_install),
                     "OM_DATA_ROOT": str(data_root),
@@ -270,6 +297,10 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     "OM_GFS013_STATIC_SHA256": static_sha256,
                     "OM_GFS025_STATIC_URL": static_source.resolve().as_uri(),
                     "OM_GFS025_STATIC_SHA256": static_sha256,
+                    "OM_ECMWF025_STATIC_URL": static_source.resolve().as_uri(),
+                    "OM_ECMWF025_STATIC_SHA256": static_sha256,
+                    "OM_API_SOURCE_ARCHIVE": str(source_archive),
+                    "OM_API_SOURCE_ARCHIVE_SHA256": source_archive_sha256,
                     "OM_API_SERVICE_NAME": "weather-om-api-test",
                     "OM_API_SOURCE_REVISION": TEST_SOURCE_REVISION,
                 }
@@ -327,11 +358,38 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 (install_root / "source-revision").read_text(encoding="utf-8"),
                 f"{TEST_SOURCE_REVISION}\n",
             )
+            self.assertEqual(
+                build_revision_log.read_text(encoding="utf-8"),
+                f"{TEST_SOURCE_REVISION}\n",
+            )
+            installed_source_archive = (
+                install_root
+                / "source-archives"
+                / f"om_weather_server-{TEST_SOURCE_REVISION}.tar.gz"
+            )
+            self.assertEqual(installed_source_archive.read_bytes(), source_archive.read_bytes())
+            self.assertEqual(
+                (
+                    installed_source_archive.parent
+                    / f"{installed_source_archive.name}.sha256"
+                ).read_text(encoding="utf-8"),
+                f"{source_archive_sha256}  {installed_source_archive.name}\n",
+            )
             service_environment = (
                 install_root / "weather-om-api-test.env"
             ).read_text(encoding="utf-8")
             self.assertIn(f"OM_DEM_ROOT={dem_root}\n", service_environment)
+            self.assertIn(
+                f"OM_MODEL_STATIC_ROOT={install_root}\n",
+                service_environment,
+            )
             self.assertNotIn("OM_API_DEM_ROOT=", service_environment)
+            self.assertFalse((data_root / "static").exists())
+            for model in ("ncep_gfs013", "ncep_gfs025", "ecmwf_ifs025"):
+                self.assertEqual(
+                    (install_root / "static" / model / "HSURF.om").read_bytes(),
+                    b"official-static-elevation",
+                )
             self.assertFalse((manifest_dir / "target").exists())
 
     @unittest.skipUnless(

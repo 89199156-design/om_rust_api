@@ -46,6 +46,10 @@ struct NativeProductReady {
 struct NativeStaticSourceReady {
     source: String,
     runtime_path: String,
+    #[serde(default)]
+    storage: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
     latitude_chunk_min: i32,
     latitude_chunk_max: i32,
     file_count: usize,
@@ -356,6 +360,9 @@ fn attach_static_elevation(
             valid_time_utc: ready.public_start_utc,
             source_run: ready.latest_complete_run.clone(),
             forecast_hour: 0,
+            coverage_source_run: None,
+            coverage_forecast_hour: None,
+            interpolation_support: false,
             source_url: None,
             selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
             array,
@@ -455,6 +462,9 @@ fn load_native_product_run(
                     valid_time_utc: valid_time,
                     source_run: source_run.to_string(),
                     forecast_hour: (valid_time - reference_time).num_hours(),
+                    coverage_source_run: None,
+                    coverage_forecast_hour: None,
+                    interpolation_support: false,
                     source_url: None,
                     selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
                     array: array.clone(),
@@ -492,6 +502,10 @@ fn load_native_product_run(
         sha256: None,
         entries: Vec::new(),
     };
+    let entries_by_source_run = HashMap::from([(
+        source_run.to_string(),
+        entries.values().cloned().collect::<Vec<_>>(),
+    )]);
     Ok(ProductSnapshot {
         product: product.to_string(),
         product_root: coverage_root.to_path_buf(),
@@ -503,11 +517,13 @@ fn load_native_product_run(
             config_fingerprint: None,
             public_start_utc: Some(ready.public_start_utc),
             files: vec![bundle_file.clone()],
+            coverage_plan: Vec::new(),
         },
         bundle_file,
         bundle_path: manifest_path,
         bundle_handle,
         entries,
+        entries_by_source_run,
         static_entries,
         native_handles,
     })
@@ -584,8 +600,21 @@ fn validate_dem(coverage_root: &Path, ready: &NativeReady) -> Result<()> {
     {
         bail!("native Copernicus DEM90 contract does not match Singapore region");
     }
+    let runtime_root = match dem.storage.as_deref() {
+        None => coverage_root.to_path_buf(),
+        Some("external_env") if dem.environment.as_deref() == Some("OM_DEM_ROOT") => {
+            let root = std::env::var_os("OM_DEM_ROOT")
+                .map(PathBuf::from)
+                .context("external Copernicus DEM90 requires OM_DEM_ROOT")?;
+            if !root.is_absolute() {
+                bail!("OM_DEM_ROOT must be absolute for external Copernicus DEM90");
+            }
+            root
+        }
+        _ => bail!("unsupported native Copernicus DEM90 storage contract"),
+    };
     for latitude in dem.latitude_chunk_min..=dem.latitude_chunk_max {
-        let path = coverage_root
+        let path = runtime_root
             .join(&dem.runtime_path)
             .join(format!("lat_{latitude}.om"));
         if !path.is_file() || path.metadata()?.len() == 0 {

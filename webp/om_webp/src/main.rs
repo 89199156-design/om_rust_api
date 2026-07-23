@@ -4,13 +4,19 @@ use clap::{Parser, ValueEnum};
 use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 use om_api::official::OfficialDecoder;
-use om_api::query::{read_variable_grid_series, round_variable_output_value};
+use om_api::query::{
+    read_variable_grid_series, round_variable_output_value, with_ecmwf_request_cache,
+    with_weather_model, WeatherModel,
+};
 use om_api::snapshot::OmDataSnapshot;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -107,10 +113,90 @@ const CAMS_LAYERS: &[Layer] = &[
     Layer::scalar("dust", "dust", "ug/m3", 0.0, 6000.0, 0.0, 10.0),
 ];
 
+// ECMWF IFS 0.25 degree uses the same client-side encoding contract as GFS.
+// The free deterministic feed publishes gust but not visibility or UV index,
+// so the two unavailable GFS-only layers are absent rather than synthesized.
+const ECMWF_IFS025_LAYERS: &[Layer] = &[
+    Layer::scalar("cloud_total_1", "cloud_cover", "%", 0.0, 100.0, 0.0, 100.0),
+    Layer::scalar(
+        "cloud_high_1",
+        "cloud_cover_high",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar(
+        "cloud_mid_1",
+        "cloud_cover_mid",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar(
+        "cloud_low_1",
+        "cloud_cover_low",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar("t2m", "temperature_2m", "C", -100.0, 100.0, -100.0, 100.0),
+    Layer::scalar("d2m", "dew_point_2m", "C", -100.0, 100.0, -100.0, 100.0),
+    Layer::scalar("r2", "relative_humidity_2m", "%", 0.0, 100.0, 0.0, 100.0),
+    Layer::wind("wind", "wind_u_component_10m", "wind_v_component_10m"),
+    Layer::scalar("tp", "precipitation", "mm", 0.0, 600.0, 0.0, 100.0),
+    Layer::scaled("snod", "snow_depth", "mm", 0.0, 2000.0, 0.0, 10.0, 1000.0),
+    Layer::scalar("gust", "wind_gusts_10m", "m/s", 0.0, 200.0, 0.0, 100.0),
+    Layer::derived(
+        "precip_phase",
+        "weather_code",
+        "code",
+        0.0,
+        4.0,
+        Derive::PrecipPhase,
+    ),
+    Layer::derived(
+        "thunderstorm_code",
+        "weather_code",
+        "wmo code",
+        0.0,
+        100.0,
+        Derive::ThunderstormCode,
+    ),
+    Layer::scalar("cape", "cape", "J/kg", 0.0, 65535.0, 0.0, 1.0),
+    Layer::scaled(
+        "prmsl",
+        "pressure_msl",
+        "Pa",
+        50000.0,
+        115000.0,
+        50000.0,
+        1.0,
+        100.0,
+    ),
+    Layer::scaled(
+        "sp",
+        "surface_pressure",
+        "Pa",
+        50000.0,
+        115000.0,
+        50000.0,
+        1.0,
+        100.0,
+    ),
+];
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Scope {
     Gfs,
     Cams,
+    #[value(name = "ecmwf_ifs025", alias = "ecmwf", alias = "ec")]
+    EcmwfIfs025,
 }
 
 impl Scope {
@@ -118,6 +204,15 @@ impl Scope {
         match self {
             Self::Gfs => "gfs",
             Self::Cams => "cams",
+            Self::EcmwfIfs025 => "ecmwf",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs",
+            Self::Cams => "cams",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
         }
     }
 
@@ -125,6 +220,7 @@ impl Scope {
         match self {
             Self::Gfs => "gfs013_surface",
             Self::Cams => "cams_global",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
         }
     }
 
@@ -132,6 +228,7 @@ impl Scope {
         match self {
             Self::Gfs => "gfs013_surface_data.json",
             Self::Cams => "cams_global_data.json",
+            Self::EcmwfIfs025 => "ecmwf_ifs025_data.json",
         }
     }
 
@@ -139,6 +236,42 @@ impl Scope {
         match self {
             Self::Gfs => GFS_LAYERS,
             Self::Cams => CAMS_LAYERS,
+            Self::EcmwfIfs025 => ECMWF_IFS025_LAYERS,
+        }
+    }
+
+    fn weather_model(self) -> WeatherModel {
+        match self {
+            Self::Gfs | Self::Cams => WeatherModel::Gfs,
+            Self::EcmwfIfs025 => WeatherModel::EcmwfIfs025,
+        }
+    }
+
+    fn tolerate_unavailable_layers(self) -> bool {
+        !matches!(self, Self::EcmwfIfs025)
+    }
+
+    fn data_attribution(self) -> Option<DataAttribution> {
+        match self {
+            Self::EcmwfIfs025 => Some(DataAttribution {
+                attribution: "Weather data by Open-Meteo.com. This service is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF).",
+                provider: "European Centre for Medium-Range Weather Forecasts (ECMWF)",
+                provider_url: "https://www.ecmwf.int/",
+                distributor: "Open-Meteo",
+                distributor_url: "https://open-meteo.com/",
+                license: "CC-BY-4.0",
+                license_url: "https://creativecommons.org/licenses/by/4.0/",
+                terms_url: "https://apps.ecmwf.int/datasets/licences/general/",
+                modified: true,
+                transformations: &[
+                    "spatial subsetting",
+                    "range extraction",
+                    "temporal and spatial interpolation",
+                    "unit conversion and derived-variable calculation",
+                    "lossless WebP encoding",
+                ],
+            }),
+            Self::Gfs | Self::Cams => None,
         }
     }
 }
@@ -150,12 +283,16 @@ struct Args {
     scope: Scope,
     #[arg(long, default_value = "/data/om_raw", env = "OM_DATA_ROOT")]
     data_root: PathBuf,
+    #[arg(long, default_value = "/data/om_webp", env = "OM_WEBP_DATA_ROOT")]
+    output_root: PathBuf,
+    #[arg(long, default_value = "/data", env = "OM_STRICT_DATA_ROOT")]
+    strict_data_root: PathBuf,
     #[arg(
         long,
-        default_value = "/opt/1panel/apps/weather_om_webp/data",
-        env = "OM_WEBP_DATA_ROOT"
+        default_value_t = 10_737_418_240_u64,
+        env = "OM_DATA_MIN_FREE_BYTES"
     )]
-    output_root: PathBuf,
+    minimum_free_bytes: u64,
     #[arg(long, env = "OM_OMFILE_LIB")]
     decoder_lib: PathBuf,
     #[arg(long, default_value_t = 121)]
@@ -228,6 +365,7 @@ impl Layer {
         Self::scaled(name, variable, unit, min, max, vmin, scale, 1.0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     const fn scaled(
         name: &'static str,
         variable: &'static str,
@@ -335,6 +473,20 @@ struct LayerManifest {
     range: [f32; 2],
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DataAttribution {
+    attribution: &'static str,
+    provider: &'static str,
+    provider_url: &'static str,
+    distributor: &'static str,
+    distributor_url: &'static str,
+    license: &'static str,
+    license_url: &'static str,
+    terms_url: &'static str,
+    modified: bool,
+    transformations: &'static [&'static str],
+}
+
 #[derive(Debug, Serialize)]
 struct ProductManifest {
     generated_at: i64,
@@ -348,6 +500,8 @@ struct ProductManifest {
     files: Vec<i64>,
     grid: GridManifest,
     layers: BTreeMap<String, LayerManifest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_attribution: Option<DataAttribution>,
 }
 
 #[derive(Debug)]
@@ -370,8 +524,114 @@ impl Drop for StagingGuard {
     }
 }
 
+fn existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut candidate = path.to_path_buf();
+    loop {
+        if candidate.exists() {
+            return candidate
+                .canonicalize()
+                .with_context(|| format!("resolve storage path {}", candidate.display()));
+        }
+        if !candidate.pop() {
+            bail!("storage path has no existing ancestor: {}", path.display());
+        }
+    }
+}
+
+fn validate_strict_data_layout(strict_root: &Path, paths: &[&Path]) -> Result<()> {
+    if !strict_root.is_absolute() || !strict_root.is_dir() {
+        bail!(
+            "strict data root must be an absolute mounted directory: {}",
+            strict_root.display()
+        );
+    }
+    let resolved_root = strict_root
+        .canonicalize()
+        .with_context(|| format!("resolve strict data root {}", strict_root.display()))?;
+    let root_device = fs::metadata(&resolved_root)?.dev();
+    if fs::metadata("/")?.dev() == root_device {
+        bail!(
+            "strict data root shares the system filesystem device: {}",
+            resolved_root.display()
+        );
+    }
+    for path in paths {
+        if !path.is_absolute() {
+            bail!("strict data path must be absolute: {}", path.display());
+        }
+        let resolved = if path.exists() {
+            path.canonicalize()?
+        } else {
+            let ancestor = existing_ancestor(path)?;
+            let suffix = path.strip_prefix(&ancestor).unwrap_or(Path::new(""));
+            ancestor.join(suffix)
+        };
+        if !resolved.starts_with(&resolved_root) {
+            bail!(
+                "strict data path escapes {}: {}",
+                resolved_root.display(),
+                resolved.display()
+            );
+        }
+        let ancestor = existing_ancestor(path)?;
+        if fs::metadata(&ancestor)?.dev() != root_device {
+            bail!("strict data path is on another device: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn available_space(path: &Path) -> Result<u64> {
+    let ancestor = existing_ancestor(path)?;
+    let c_path = CString::new(ancestor.as_os_str().as_bytes())
+        .context("storage path contains an interior NUL")?;
+    let mut output = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: statvfs writes the output structure on success.
+    if unsafe { libc::statvfs(c_path.as_ptr(), output.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("read free space for {}", ancestor.display()));
+    }
+    // SAFETY: the successful statvfs call initialized output.
+    let output = unsafe { output.assume_init() };
+    Ok(output.f_bavail.saturating_mul(output.f_frsize))
+}
+
+fn ensure_free_space(path: &Path, reserve_bytes: u64, additional_bytes: u64) -> Result<()> {
+    if reserve_bytes < 512 * 1024 * 1024 {
+        bail!("WebP minimum free-space reserve must be at least 512 MiB");
+    }
+    let required = reserve_bytes
+        .checked_add(additional_bytes)
+        .context("WebP free-space requirement overflow")?;
+    let available = available_space(path)?;
+    if available < required {
+        bail!(
+            "insufficient data-disk space for WebP staging: available={} additional={} reserve={}",
+            available,
+            additional_bytes,
+            reserve_bytes
+        );
+    }
+    Ok(())
+}
+
+fn estimate_staging_bytes(grid_points: usize, layers: usize, frames: usize) -> Result<u64> {
+    let rgba_bytes = u64::try_from(grid_points)?
+        .checked_mul(4)
+        .and_then(|value| value.checked_mul(u64::try_from(layers).ok()?))
+        .and_then(|value| value.checked_mul(u64::try_from(frames).ok()?))
+        .context("WebP staging estimate overflow")?;
+    rgba_bytes
+        .checked_add(16 * 1024 * 1024)
+        .context("WebP staging estimate overflow")
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    validate_strict_data_layout(
+        &args.strict_data_root,
+        &[&args.data_root, &args.output_root],
+    )?;
     let workers = if args.workers == 0 {
         std::thread::available_parallelism()
             .map(usize::from)
@@ -396,6 +656,12 @@ fn main() -> Result<()> {
     let grid = compute_grid(args.left_lon, args.right_lon, args.bottom_lat, args.top_lat)?;
     let start = parse_run(&ready.latest_complete_run)?;
     let times = render_times(start, args.frames)?;
+    let estimated_staging_bytes = estimate_staging_bytes(grid.len(), selected.len(), times.len())?;
+    ensure_free_space(
+        &args.output_root,
+        args.minimum_free_bytes,
+        estimated_staging_bytes,
+    )?;
     let snapshot = Arc::new(OmDataSnapshot::load(&args.data_root)?);
     let decoder = Arc::new(OfficialDecoder::load(&args.decoder_lib)?);
     let release_root = args.output_root.join("releases").join(format!(
@@ -435,13 +701,30 @@ fn main() -> Result<()> {
     }
     let total_invalid = std::sync::atomic::AtomicUsize::new(0);
     for (block_index, block_times) in times.chunks(args.series_block_hours).enumerate() {
-        let rendered = pool
-            .install(|| render_series_block(&snapshot, &decoder, &grid, &selected, block_times))?;
+        let rendered = pool.install(|| {
+            with_weather_model(args.scope.weather_model(), || {
+                with_ecmwf_request_cache(|| {
+                    render_series_block(
+                        &snapshot,
+                        &decoder,
+                        &grid,
+                        &selected,
+                        block_times,
+                        args.scope.tolerate_unavailable_layers(),
+                    )
+                })
+            })
+        })?;
         for (offset, layers) in rendered.into_iter().enumerate() {
             let frame_index = block_index * args.series_block_hours + offset;
             let time = block_times[offset];
             let stem = format!("{}_{}", time.timestamp(), batch);
             for layer in layers {
+                ensure_free_space(
+                    &args.output_root,
+                    args.minimum_free_bytes,
+                    layer.bytes.len() as u64,
+                )?;
                 written_bytes += layer.bytes.len() as u64;
                 fs::write(
                     product_staging
@@ -512,7 +795,7 @@ fn main() -> Result<()> {
     prune_releases(&args.output_root, args.scope, args.keep_releases.max(1))?;
 
     println!("{{\"status\":\"success\",\"scope\":\"{}\",\"release_id\":\"{}\",\"run\":\"{}\",\"layers\":{},\"frames\":{},\"grid\":\"{}x{}\",\"invalid_samples\":{},\"elapsed_seconds\":{:.3}}}",
-        args.scope.group(), ready.release_id, ready.latest_complete_run, selected.len(), times.len(), grid.manifest.width, grid.manifest.height, total_invalid.load(std::sync::atomic::Ordering::Relaxed), started.elapsed().as_secs_f64());
+        args.scope.name(), ready.release_id, ready.latest_complete_run, selected.len(), times.len(), grid.manifest.width, grid.manifest.height, total_invalid.load(std::sync::atomic::Ordering::Relaxed), started.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -670,16 +953,29 @@ fn render_series_block(
     grid: &RegionGrid,
     layers: &[Layer],
     times: &[DateTime<Utc>],
+    tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<RenderedLayer>>> {
     let (weather_layers, regular_layers): (Vec<&Layer>, Vec<&Layer>) = layers
         .iter()
         .partition(|layer| !matches!(layer.derive, Derive::None));
     let mut rendered = (0..times.len()).map(|_| Vec::new()).collect::<Vec<_>>();
     for layer in regular_layers {
-        let values = read_layer_grid_series(snapshot, decoder, layer.variable, times, grid)?;
+        let values = read_layer_grid_series(
+            snapshot,
+            decoder,
+            layer.variable,
+            times,
+            grid,
+            tolerate_unavailable,
+        )?;
         let values_v = match layer.variable_v {
             Some(variable) => Some(read_layer_grid_series(
-                snapshot, decoder, variable, times, grid,
+                snapshot,
+                decoder,
+                variable,
+                times,
+                grid,
+                tolerate_unavailable,
             )?),
             None => None,
         };
@@ -700,8 +996,14 @@ fn render_series_block(
         }
     }
     if !weather_layers.is_empty() {
-        let weather_codes =
-            read_layer_grid_series(snapshot, decoder, weather_layers[0].variable, times, grid)?;
+        let weather_codes = read_layer_grid_series(
+            snapshot,
+            decoder,
+            weather_layers[0].variable,
+            times,
+            grid,
+            tolerate_unavailable,
+        )?;
         for layer in weather_layers {
             let encoded = weather_codes
                 .par_iter()
@@ -753,6 +1055,7 @@ fn read_layer_grid_series(
     variable: &str,
     times: &[DateTime<Utc>],
     grid: &RegionGrid,
+    tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<f32>>> {
     match read_variable_grid_series(
         snapshot,
@@ -770,7 +1073,10 @@ fn read_layer_grid_series(
             }
             Ok(series)
         }
-        Err(error) if error.to_string().contains("variable/time is not available") => {
+        Err(error)
+            if tolerate_unavailable
+                && error.to_string().contains("variable/time is not available") =>
+        {
             Ok(vec![vec![f32::NAN; grid.len()]; times.len()])
         }
         Err(error) => Err(error),
@@ -875,7 +1181,7 @@ fn build_manifest(
         .collect();
     ProductManifest {
         generated_at: Utc::now().timestamp(),
-        source: scope.group().to_string(),
+        source: scope.name().to_string(),
         source_release_id: ready.release_id.clone(),
         source_run: ready.latest_complete_run.clone(),
         batch: times[0].timestamp(),
@@ -885,6 +1191,7 @@ fn build_manifest(
         files: times.iter().map(DateTime::timestamp).collect(),
         grid: grid.manifest.clone(),
         layers: layer_map,
+        data_attribution: scope.data_attribution(),
     }
 }
 
@@ -897,8 +1204,8 @@ fn publish_current(
 ) -> Result<()> {
     let current_root = output_root.join("current");
     fs::create_dir_all(&current_root)?;
-    let marker = current_root.join(format!("{}.json", scope.group()));
-    let marker_tmp = current_root.join(format!(".{}.{}.tmp", scope.group(), std::process::id()));
+    let marker = current_root.join(format!("{}.json", scope.name()));
+    let marker_tmp = current_root.join(format!(".{}.{}.tmp", scope.name(), std::process::id()));
     if let Some(public_root) = public_root {
         fs::create_dir_all(public_root)?;
         let catalog_path = public_root.join("weather_layer_catalog.json");
@@ -924,7 +1231,7 @@ fn publish_current(
     fs::write(
         &marker_tmp,
         serde_json::to_vec_pretty(
-            &serde_json::json!({"status":"complete","scope":scope.group(),"release_id":ready.release_id,"run":ready.latest_complete_run,"path":release_root}),
+            &serde_json::json!({"status":"complete","scope":scope.name(),"release_id":ready.release_id,"run":ready.latest_complete_run,"path":release_root}),
         )?,
     )?;
     fs::rename(marker_tmp, marker)?;
@@ -972,6 +1279,18 @@ fn catalog_payload() -> serde_json::Value {
                 "manifest": Scope::Cams.manifest_name(),
                 "file_pattern": "{timestamp}_{batch}.webp",
                 "layers": layers(Scope::Cams),
+            },
+            "ecmwf_ifs025": {
+                "source": "ecmwf_ifs025",
+                "manifest": Scope::EcmwfIfs025.manifest_name(),
+                "file_pattern": "{timestamp}_{batch}.webp",
+                "layers": layers(Scope::EcmwfIfs025),
+                "data_attribution": Scope::EcmwfIfs025.data_attribution(),
+                "unavailable_layers": {
+                    "vis": "not_published_by_free_ecmwf_ifs025",
+                    "uv_index": "not_published_by_free_ecmwf_ifs025",
+                    "showers": "not_published_by_free_ecmwf_ifs025",
+                },
             }
         }
     })
@@ -980,6 +1299,7 @@ fn catalog_payload() -> serde_json::Value {
 fn source_resolution(scope: Scope, name: &str) -> &'static str {
     match scope {
         Scope::Cams => "44km",
+        Scope::EcmwfIfs025 => "25km",
         Scope::Gfs => match name {
             "gust" | "vis" | "cape" | "prmsl" => "28km",
             "precip_phase" | "thunderstorm_code" | "sp" => "28km(13+28)",
@@ -1027,9 +1347,18 @@ mod tests {
     }
 
     #[test]
-    fn layer_inventory_matches_singapore() {
+    fn layer_inventory_matches_client_contract() {
         assert_eq!(GFS_LAYERS.len(), 18);
         assert_eq!(CAMS_LAYERS.len(), 4);
+        assert_eq!(ECMWF_IFS025_LAYERS.len(), 16);
+        for unavailable in ["vis", "uv_index"] {
+            assert!(
+                ECMWF_IFS025_LAYERS
+                    .iter()
+                    .all(|layer| layer.name != unavailable),
+                "free ECMWF IFS025 must not publish {unavailable}"
+            );
+        }
         let surface_pressure = GFS_LAYERS.iter().find(|layer| layer.name == "sp").unwrap();
         assert_eq!(
             (surface_pressure.vmin, surface_pressure.scale),
@@ -1051,14 +1380,17 @@ mod tests {
     }
 
     #[test]
-    fn gfs_and_cams_each_render_121_hourly_webp_frames() {
+    fn every_scope_renders_121_hourly_webp_frames() {
         let start = parse_run("2026071306").unwrap();
         let gfs = render_times(start, 121).unwrap();
         let cams = render_times(start, 121).unwrap();
+        let ecmwf = render_times(start, 121).unwrap();
 
         assert_eq!(gfs.len(), 121);
         assert_eq!(cams.len(), 121);
+        assert_eq!(ecmwf.len(), 121);
         assert_eq!(gfs, cams);
+        assert_eq!(gfs, ecmwf);
         assert_eq!(gfs[0], start);
         assert_eq!(*gfs.last().unwrap(), start + Duration::hours(120));
     }
@@ -1075,5 +1407,57 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.workers, 2);
+        assert_eq!(args.output_root, PathBuf::from("/data/om_webp"));
+        assert_eq!(args.strict_data_root, PathBuf::from("/data"));
+        assert_eq!(args.minimum_free_bytes, 10_737_418_240);
+    }
+
+    #[test]
+    fn staging_preflight_uses_uncompressed_rgba_upper_bound() {
+        assert_eq!(
+            estimate_staging_bytes(597 * 495, 16, 121).unwrap(),
+            (597_u64 * 495 * 4 * 16 * 121) + 16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn ecmwf_scope_uses_model_product_and_raw_group_contracts() {
+        let args = Args::try_parse_from([
+            "om-webp",
+            "--scope",
+            "ecmwf_ifs025",
+            "--decoder-lib",
+            "/tmp/libomfileformat.so",
+        ])
+        .unwrap();
+
+        assert_eq!(args.scope.name(), "ecmwf_ifs025");
+        assert_eq!(args.scope.group(), "ecmwf");
+        assert_eq!(args.scope.product_dir(), "ecmwf_ifs025");
+        assert_eq!(args.scope.manifest_name(), "ecmwf_ifs025_data.json");
+        assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs025);
+    }
+
+    #[test]
+    fn catalog_publishes_ecmwf_under_the_model_key() {
+        let catalog = catalog_payload();
+        let product = &catalog["products"]["ecmwf_ifs025"];
+        assert_eq!(product["source"], "ecmwf_ifs025");
+        assert_eq!(product["manifest"], "ecmwf_ifs025_data.json");
+        assert_eq!(
+            product["data_attribution"]["provider"],
+            "European Centre for Medium-Range Weather Forecasts (ECMWF)"
+        );
+        assert_eq!(product["data_attribution"]["license"], "CC-BY-4.0");
+        assert_eq!(product["data_attribution"]["modified"], true);
+        assert!(product["data_attribution"]["transformations"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(product["layers"].get("gust").is_some());
+        assert!(product["layers"].get("vis").is_none());
+        assert!(product["layers"].get("uv_index").is_none());
+        assert!(product["layers"].get("showers").is_none());
+        assert!(product["layers"].get("tp").is_some());
+        assert!(product["unavailable_layers"].get("gust").is_none());
     }
 }

@@ -121,6 +121,81 @@ def build_coverage_plan(product: ProductConfig, runs: list[OmRun], now_utc: date
     )
 
 
+def build_stitched_coverage_plan(
+    product: ProductConfig,
+    runs: list[OmRun],
+    now_utc: datetime,
+) -> CoveragePlan:
+    """Build a newest-run-first coverage whose tail may come from an older long run.
+
+    ECMWF IFS publishes 00/12Z long runs and 06/18Z short runs.  Using only the
+    latest run would therefore truncate every 06/18Z release.  This planner uses
+    the newest available run for each native valid time, while extending the end
+    to the furthest configured forecast horizon supplied by any discovered run.
+    ``history_hours`` remains part of the physical coverage so downstream hourly
+    interpolation has native frames before the public local-day boundary.
+    """
+    if not runs:
+        raise ValueError("no OM runs available")
+
+    sorted_runs = sorted(runs, key=lambda item: _as_utc(item.base_time_utc))
+    latest = sorted_runs[-1]
+    public_start = required_start_for_anchors(now_utc, product.timezone_anchors)
+    required_start = public_start - timedelta(hours=product.history_hours)
+    required_end = max(
+        _as_utc(run.base_time_utc)
+        + timedelta(hours=min(product.forecast_hour_end, run.max_forecast_hour))
+        for run in sorted_runs
+    )
+
+    slots: list[CoverageSlot] = []
+    for cursor in _target_valid_times(
+        sorted_runs,
+        required_start=required_start,
+        required_end=required_end,
+    ):
+        candidates: list[tuple[datetime, str, int]] = []
+        for run in sorted_runs:
+            forecast_hour = _forecast_hour_for(run, cursor)
+            if forecast_hour is not None:
+                candidates.append((_as_utc(run.base_time_utc), run.run_id, forecast_hour))
+        if not candidates:
+            raise ValueError(f"no source run covers valid_time={cursor.isoformat()}")
+        _base_time, source_run, forecast_hour = sorted(candidates)[-1]
+        slots.append(CoverageSlot(cursor, source_run, forecast_hour))
+
+    if not slots or slots[-1].valid_time_utc != required_end:
+        raise ValueError("stitched coverage does not reach the required long-run tail")
+
+    return CoveragePlan(
+        product=product.name,
+        required_start_utc=required_start,
+        required_end_utc=required_end,
+        latest_complete_run=latest.run_id,
+        slots=tuple(slots),
+        public_start_utc=public_start,
+    )
+
+
+def build_product_coverage_plan(
+    product: ProductConfig,
+    runs: list[OmRun],
+    now_utc: datetime,
+) -> CoveragePlan:
+    """Apply the product's declared rolling-coverage policy.
+
+    Most Open-Meteo products expose the same horizon on every release and use
+    ``latest_run``. ECMWF IFS025 alternates 00/12Z long runs with 06/18Z short
+    runs, so its rolling product explicitly opts into stitching the newest run
+    over the tail of the most recent long run.
+    """
+    if product.coverage_strategy == "latest_run":
+        return build_coverage_plan(product, runs, now_utc)
+    if product.coverage_strategy == "latest_with_long_run_tail":
+        return build_stitched_coverage_plan(product, runs, now_utc)
+    raise ValueError(f"unsupported coverage strategy: {product.coverage_strategy}")
+
+
 def build_complete_run_coverage_plan(product: ProductConfig, run: OmRun) -> CoveragePlan:
     """Build a coverage containing only one complete model run."""
     base_time = _as_utc(run.base_time_utc)

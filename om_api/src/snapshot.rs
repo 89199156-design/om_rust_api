@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub const GFS_PRODUCTS: &[&str] = &["gfs013_surface", "gfs025", "gfs_pressure_profile"];
 pub const CAMS_PRODUCTS: &[&str] = &["cams_global", "cams_global_greenhouse_gases"];
+pub const ECMWF_PRODUCTS: &[&str] = &["ecmwf_ifs025"];
 
 #[derive(Debug)]
 pub struct OmDataSnapshot {
@@ -56,6 +57,11 @@ impl OmDataSnapshot {
                 &mut historical_products,
             )?;
         }
+        load_group_products(&data_root, "ecmwf", ECMWF_PRODUCTS, &mut products)?;
+        // An ECMWF coverage already contains the explicitly selected short
+        // run and preceding long-run tail. Older group releases must not be
+        // consulted: doing so can silently fill fields absent from the frozen
+        // free-model run with values from a different model cycle.
         Ok(Self {
             data_root,
             products,

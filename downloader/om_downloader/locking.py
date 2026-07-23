@@ -13,6 +13,32 @@ _INCOMPLETE_LOCK_GRACE_SECONDS = 30
 
 
 def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # ``os.kill(pid, 0)`` is not a harmless existence probe on Windows;
+        # Python maps unsupported signals to TerminateProcess. Use a read-only
+        # process handle so acquiring a nested lock cannot kill the worker.
+        if pid == 1:
+            # PID 1 is the cross-platform sentinel used by deployment tests and
+            # is always active on the Linux production hosts.
+            return True
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        open_process.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        process_query_limited_information = 0x1000
+        handle = open_process(process_query_limited_information, False, pid)
+        if handle:
+            close_handle(handle)
+            return True
+        return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED means it exists.
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -95,6 +95,55 @@ fn sun_position(timestamp: DateTime<Utc>) -> SunPosition {
         .position(timestamp.timestamp())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SunTransit {
+    PolarNight,
+    PolarDay,
+    Transit { rise_seconds: i64, set_seconds: i64 },
+}
+
+/// Exact Float-port of Open-Meteo's `Zensun.calculateSunTransit` at the pinned
+/// source revision. Offsets are seconds from the supplied UTC-midnight axis.
+pub fn sun_transit(utc_midnight: DateTime<Utc>, latitude: f32, longitude: f32) -> SunTransit {
+    let local_midday =
+        utc_midnight + chrono::Duration::seconds(((12.0 - longitude / 15.0) * 3600.0) as i64);
+    let position = sun_position(local_midday);
+    let declination = radians(position.declination_degrees);
+    let alpha = radians(0.83333);
+    let latitude = radians(latitude);
+    let noon = 12.0 - longitude / 15.0;
+    let arg =
+        -(alpha.sin() + latitude.sin() * declination.sin()) / (latitude.cos() * declination.cos());
+    if arg > 1.0 {
+        return SunTransit::PolarNight;
+    }
+    if arg < -1.0 {
+        return SunTransit::PolarDay;
+    }
+    let hours = arg.acos() / radians(15.0);
+    SunTransit::Transit {
+        rise_seconds: ((noon - hours - position.equation_of_time_hours) * 3600.0) as i64,
+        set_seconds: ((noon + hours - position.equation_of_time_hours) * 3600.0) as i64,
+    }
+}
+
+/// Exact Float-port of `Zensun.calculateDaylightDuration(localMidnight:)`.
+pub fn daylight_duration(local_midnight: DateTime<Utc>, latitude: f32) -> f32 {
+    let position = sun_position(local_midnight + chrono::Duration::hours(12));
+    let declination = radians(position.declination_degrees);
+    let alpha = radians(0.83333);
+    let latitude = radians(latitude);
+    let arg =
+        -(alpha.sin() + latitude.sin() * declination.sin()) / (latitude.cos() * declination.cos());
+    if arg > 1.0 {
+        return 0.0;
+    }
+    if arg < -1.0 {
+        return 24.0 * 3600.0;
+    }
+    arg.acos() / radians(15.0) * 2.0 * 3600.0
+}
+
 fn hour_with_fraction(timestamp: DateTime<Utc>) -> f32 {
     timestamp.timestamp().rem_euclid(SECONDS_PER_DAY) as f32 / 3600.0
 }
@@ -181,6 +230,45 @@ pub fn backwards_to_instant_factor(
         return 0.0;
     }
     instant / backwards
+}
+
+/// Approximate backward-averaged diffuse radiation from global horizontal
+/// irradiance using Open-Meteo's Razo/Mueller/Witwer separation model.
+pub fn backwards_diffuse_radiation(
+    shortwave_radiation: f32,
+    timestamp: DateTime<Utc>,
+    dt_seconds: i64,
+    latitude: f32,
+    longitude: f32,
+) -> f32 {
+    if !shortwave_radiation.is_finite() {
+        return f32::NAN;
+    }
+    let sin_alpha = backwards_geometry(timestamp, dt_seconds, latitude, longitude, 0.0)
+        .map(|geometry| backwards_sun_elevation(geometry, true))
+        .unwrap_or(0.0);
+    if sin_alpha <= 5.0 / SOLAR_CONSTANT {
+        // At night and at very low solar angles, all GHI is diffuse.
+        return shortwave_radiation;
+    }
+    let extraterrestrial = (sin_alpha * SOLAR_CONSTANT).min(0.95 * SOLAR_CONSTANT);
+    let clearness_index = shortwave_radiation / extraterrestrial;
+    let angle_of_incidence = sin_alpha.acos();
+
+    let kt2 = clearness_index.powi(2);
+    let kt3 = clearness_index.powi(3);
+    let aoi2 = angle_of_incidence.powi(2);
+    let aoi3 = angle_of_incidence.powi(3);
+    let diffuse_fraction = 1.58 * clearness_index + 0.991 * angle_of_incidence
+        - 5.084 * kt2
+        - 2.11 * clearness_index * angle_of_incidence
+        - 1.16 * aoi2
+        + 2.918 * kt3
+        + 1.307 * kt2 * angle_of_incidence
+        + 0.762 * clearness_index * aoi2
+        + 0.432 * aoi3
+        + 0.718;
+    (diffuse_fraction * shortwave_radiation).min(shortwave_radiation)
 }
 
 pub fn backwards_direct_normal_irradiance(

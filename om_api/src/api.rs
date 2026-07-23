@@ -1,5 +1,8 @@
 use crate::official::OfficialDecoder;
-use crate::query::{forecast_for_query, route_forecast, PointQuery, RouteQuery};
+use crate::query::{
+    ecmwf_public_hourly_variables, forecast_for_query, route_forecast, PointQuery, RouteQuery,
+    ECMWF_PUBLIC_DAILY_VARIABLES,
+};
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
@@ -21,6 +24,12 @@ use tower_http::trace::TraceLayer;
 
 const SOURCE_REPOSITORY: &str = "https://github.com/89199156-design/om_weather_server";
 const SOURCE_LICENSE: &str = "AGPL-3.0-or-later";
+const BUILD_REVISION: &str = match option_env!("OM_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "development",
+};
+const AGPL_LICENSE_URL: &str = "https://www.gnu.org/licenses/agpl-3.0.html";
+const ECMWF_LICENSE_URL: &str = "https://creativecommons.org/licenses/by/4.0/";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +47,7 @@ struct SnapshotCache {
 struct SnapshotIdentity {
     gfs_ready: Option<GroupIdentity>,
     cams_ready: Option<GroupIdentity>,
+    ecmwf_ready: Option<GroupIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -81,6 +91,7 @@ impl SnapshotIdentity {
         Ok(Self {
             gfs_ready: marker(data_root, "gfs")?,
             cams_ready: marker(data_root, "cams")?,
+            ecmwf_ready: marker(data_root, "ecmwf")?,
         })
     }
 }
@@ -181,9 +192,21 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(source_offer))
+        .route("/v1/source", get(source_offer))
+        .route(
+            "/.well-known/weather-attribution.json",
+            get(weather_attribution),
+        )
         .route("/v1/forecast", get(forecast))
+        .route("/v1/ecmwf", get(ecmwf_forecast).post(ecmwf_forecast_post))
+        .route(
+            "/v1/ecmwf/forecast",
+            get(ecmwf_forecast).post(ecmwf_forecast_post),
+        )
+        .route("/v1/ecmwf/catalog", get(ecmwf_catalog))
         .route("/v1/air-quality", get(air_quality))
         .route("/v1/route", post(route))
+        .route("/v1/ecmwf/route", post(ecmwf_route))
         .with_state(state)
         .layer(middleware::map_response(source_offer_headers))
         .layer(TraceLayer::new_for_http())
@@ -191,10 +214,77 @@ pub fn router(state: AppState) -> Router {
 
 async fn source_offer() -> Json<serde_json::Value> {
     Json(json!({
+        "schema_version": 1,
+        "component": "om_weather_server",
+        "build_revision": BUILD_REVISION,
         "license": SOURCE_LICENSE,
+        "license_url": AGPL_LICENSE_URL,
         "source_code": SOURCE_REPOSITORY,
+        "source_archive_url": format!("/source/om_weather_server-{BUILD_REVISION}.tar.gz"),
+        "source_archive_sha256_url": format!("/source/om_weather_server-{BUILD_REVISION}.tar.gz.sha256"),
+        "weather_attribution_url": "/.well-known/weather-attribution.json",
         "notice": "Corresponding Source for this network service is available at source_code."
     }))
+}
+
+fn weather_attribution_payload() -> serde_json::Value {
+    json!({
+        "schema_version": 1,
+        "generated_by": "om_weather_server",
+        "build_revision": BUILD_REVISION,
+        "source_software": {
+            "name": "Open-Meteo",
+            "project_url": "https://github.com/open-meteo/open-meteo",
+            "license": SOURCE_LICENSE,
+            "license_url": AGPL_LICENSE_URL,
+            "modifications": "Separately maintained implementation over transformed local forecast products."
+        },
+        "data_sources": {
+            "ecmwf_ifs025": {
+                "provider": "European Centre for Medium-Range Weather Forecasts (ECMWF)",
+                "provider_url": "https://www.ecmwf.int/",
+                "distributor": "Open-Meteo",
+                "distributor_url": "https://open-meteo.com/",
+                "dataset": "ECMWF IFS open data",
+                "license": "CC-BY-4.0",
+                "license_url": ECMWF_LICENSE_URL,
+                "terms_url": "https://apps.ecmwf.int/datasets/licences/general/",
+                "attribution": "Weather data by Open-Meteo.com. This service is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF). Contains modified ECMWF data.",
+                "modified": true,
+                "transformations": [
+                    "spatial subsetting",
+                    "range extraction",
+                    "temporal and spatial interpolation where requested",
+                    "unit conversion and derived-variable calculation where requested",
+                    "lossless WebP encoding for map layers"
+                ],
+                "disclaimer": "ECMWF has no liability in respect of this service or its transformed outputs."
+            },
+            "gfs": {
+                "provider": "NOAA National Centers for Environmental Prediction (NCEP)",
+                "provider_url": "https://www.ncep.noaa.gov/",
+                "dataset": "Global Forecast System (GFS)",
+                "terms_url": "https://www.weather.gov/disclaimer",
+                "modified": true
+            },
+            "cams": {
+                "provider": "Copernicus Atmosphere Monitoring Service (CAMS)",
+                "provider_url": "https://atmosphere.copernicus.eu/",
+                "terms_url": "https://atmosphere.copernicus.eu/data-licence",
+                "modified": true
+            },
+            "dem": {
+                "provider": "Copernicus DEM",
+                "provider_url": "https://dataspace.copernicus.eu/explore-data/data-collections/copernicus-contributing-missions/collections-description/COP-DEM",
+                "modified": true
+            }
+        },
+        "details": "/DATA_SOURCES.md"
+    })
+}
+
+async fn weather_attribution() -> Json<serde_json::Value> {
+    Json(weather_attribution_payload())
 }
 
 async fn source_offer_headers(mut response: Response) -> Response {
@@ -257,6 +347,57 @@ async fn forecast(
     Ok(Json(payload))
 }
 
+async fn ecmwf_forecast(
+    State(state): State<AppState>,
+    Query(mut query): Query<PointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    query.models = Some("ecmwf_ifs025".to_string());
+    let snapshot = state.snapshot()?;
+    let decoder = state.decoder.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("ECMWF forecast worker failed")??;
+    Ok(Json(payload))
+}
+
+async fn ecmwf_forecast_post(
+    State(state): State<AppState>,
+    Json(mut query): Json<PointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    query.models = Some("ecmwf_ifs025".to_string());
+    let snapshot = state.snapshot()?;
+    let decoder = state.decoder.clone();
+    let payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("ECMWF POST forecast worker failed")??;
+    Ok(Json(payload))
+}
+
+async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let snapshot = state.snapshot()?;
+    let product = snapshot.require_product("ecmwf_ifs025")?;
+    let hourly = ecmwf_public_hourly_variables();
+    let daily = ECMWF_PUBLIC_DAILY_VARIABLES.to_vec();
+    let available_variables = hourly
+        .iter()
+        .map(String::as_str)
+        .chain(daily.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(Json(json!({
+        "model": "ecmwf_ifs025",
+        "coverage_id": product.manifest.coverage_id,
+        "latest_complete_run": product.manifest.latest_complete_run,
+        "public_start_utc": product.manifest.public_start_utc,
+        "available_hourly_variables": hourly,
+        "available_daily_variables": daily,
+        "available_variables": available_variables,
+    })))
+}
+
 async fn air_quality(
     State(state): State<AppState>,
     Query(query): Query<PointQuery>,
@@ -281,6 +422,20 @@ async fn route(
         tokio::task::spawn_blocking(move || route_forecast(&snapshot, decoder.as_ref(), &query))
             .await
             .context("route worker failed")??;
+    Ok(Json(serde_json::to_value(payload)?))
+}
+
+async fn ecmwf_route(
+    State(state): State<AppState>,
+    Json(mut query): Json<RouteQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    query.models = Some("ecmwf_ifs025".to_string());
+    let snapshot = state.snapshot()?;
+    let decoder = state.decoder.clone();
+    let payload =
+        tokio::task::spawn_blocking(move || route_forecast(&snapshot, decoder.as_ref(), &query))
+            .await
+            .context("ECMWF route worker failed")??;
     Ok(Json(serde_json::to_value(payload)?))
 }
 
@@ -332,6 +487,55 @@ mod tests {
                 SOURCE_REPOSITORY
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ecmwf_post_accepts_official_single_location_array_shape_with_full_catalog() {
+        let root = TempDir::new().unwrap();
+        let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
+        let body = json!({
+            "latitude": [31.2304],
+            "longitude": [121.4737],
+            "hourly": ecmwf_public_hourly_variables(),
+            "daily": ECMWF_PUBLIC_DAILY_VARIABLES,
+            "models": ["ecmwf_ifs025"],
+            "start_hour": ["2026-07-23T00:00"],
+            "end_hour": ["2026-08-07T00:00"],
+            "start_date": ["2026-07-23"],
+            "end_date": ["2026-08-06"],
+            "timezone": ["GMT"],
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "ms",
+            "precipitation_unit": "mm",
+            "timeformat": "iso8601",
+            "cell_selection": "land"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ecmwf")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // The empty fixture has neither an ECMWF product nor DEM selection
+        // data. Reaching either domain error proves the complete 197+65
+        // official JSON shape was accepted and dispatched as one location.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let error_text = error["error"].as_str().unwrap();
+        assert!(
+            error_text.contains("product is not available")
+                || error_text.contains("requires DEM/static grid selection data"),
+            "unexpected domain error after valid POST decode: {error_text}"
+        );
     }
 
     #[test]

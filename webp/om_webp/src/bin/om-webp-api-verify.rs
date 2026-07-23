@@ -1,9 +1,11 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use image::RgbaImage;
 use om_api::official::OfficialDecoder;
-use om_api::query::{read_variable_value, round_variable_output_value};
+use om_api::query::{
+    read_variable_value, round_variable_output_value, with_weather_model, WeatherModel,
+};
 use om_api::snapshot::OmDataSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,9 +18,89 @@ use std::time::Instant;
 const WIDTH: usize = 597;
 const HEIGHT: usize = 495;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Scope {
+    Gfs,
+    Cams,
+    #[value(name = "ecmwf_ifs025", alias = "ecmwf", alias = "ec")]
+    EcmwfIfs025,
+}
+
+impl Scope {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs",
+            Self::Cams => "cams",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
+        }
+    }
+
+    fn ready_group(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs",
+            Self::Cams => "cams",
+            Self::EcmwfIfs025 => "ecmwf",
+        }
+    }
+
+    fn product_dir(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs013_surface",
+            Self::Cams => "cams_global",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
+        }
+    }
+
+    fn manifest_name(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs013_surface_data.json",
+            Self::Cams => "cams_global_data.json",
+            Self::EcmwfIfs025 => "ecmwf_ifs025_data.json",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Gfs => "v1/forecast",
+            Self::Cams => "v1/air-quality",
+            Self::EcmwfIfs025 => "v1/ecmwf",
+        }
+    }
+
+    fn api_model(self) -> Option<&'static str> {
+        match self {
+            Self::Gfs => Some("gfs"),
+            Self::Cams => None,
+            Self::EcmwfIfs025 => Some("ecmwf_ifs025"),
+        }
+    }
+
+    fn weather_model(self) -> WeatherModel {
+        match self {
+            Self::Gfs | Self::Cams => WeatherModel::Gfs,
+            Self::EcmwfIfs025 => WeatherModel::EcmwfIfs025,
+        }
+    }
+
+    fn layers(self) -> &'static [LayerSpec] {
+        match self {
+            Self::Gfs => GFS_LAYERS,
+            Self::Cams => CAMS_LAYERS,
+            Self::EcmwfIfs025 => ECMWF_IFS025_LAYERS,
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Strictly compare production WebP pixels with the HTTP point API")]
 struct Args {
+    #[arg(
+        long = "scope",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "gfs,cams,ecmwf_ifs025"
+    )]
+    scopes: Vec<Scope>,
     #[arg(long, default_value = "/opt/1panel/apps/weather/data")]
     public_root: PathBuf,
     #[arg(long, default_value = "http://127.0.0.1:8088")]
@@ -112,6 +194,7 @@ struct Sample {
 struct ScopeReport {
     release_id: String,
     run: String,
+    api_model: Option<String>,
     points: usize,
     layers: usize,
     public_api_layers: usize,
@@ -165,6 +248,33 @@ const CAMS_LAYERS: &[LayerSpec] = &[
     scalar("dust", "dust"),
 ];
 
+// Free deterministic ECMWF IFS025 does not provide the GFS gust, visibility,
+// or UV-index layers. Keep all shared client encodings byte-for-byte equal.
+const ECMWF_IFS025_LAYERS: &[LayerSpec] = &[
+    scalar("cloud_total_1", "cloud_cover"),
+    scalar("cloud_high_1", "cloud_cover_high"),
+    scalar("cloud_mid_1", "cloud_cover_mid"),
+    scalar("cloud_low_1", "cloud_cover_low"),
+    scalar("t2m", "temperature_2m"),
+    scalar("d2m", "dew_point_2m"),
+    scalar("r2", "relative_humidity_2m"),
+    LayerSpec {
+        name: "wind",
+        variable: "wind_u_component_10m",
+        variable_v: Some("wind_v_component_10m"),
+        multiplier: 1.0,
+        encoding: Encoding::Wind,
+        derive: Derive::None,
+    },
+    scalar("tp", "precipitation"),
+    scaled("snod", "snow_depth", 1000.0),
+    derived("precip_phase", Derive::PrecipPhase),
+    derived("thunderstorm_code", Derive::ThunderstormCode),
+    scalar("cape", "cape"),
+    scaled("prmsl", "pressure_msl", 100.0),
+    scaled("sp", "surface_pressure", 100.0),
+];
+
 const fn scalar(name: &'static str, variable: &'static str) -> LayerSpec {
     scaled(name, variable, 1.0)
 }
@@ -196,54 +306,59 @@ fn main() -> Result<()> {
     if args.points == 0 || args.points > WIDTH * HEIGHT {
         bail!("points must be between 1 and {}", WIDTH * HEIGHT);
     }
+    if args.scopes.is_empty() {
+        bail!("at least one --scope is required");
+    }
     let started = Instant::now();
     let snapshot = OmDataSnapshot::load(&args.raw_root)?;
     let decoder = OfficialDecoder::load(&args.decoder_lib)?;
-    let gfs_link = args.public_root.join("gfs013_surface");
-    let gfs_root = gfs_link.canonicalize()?;
-    let gfs_manifest = load_manifest(&gfs_root.join("gfs013_surface_data.json"))?;
-    let gfs_release_id = gfs_manifest.source_release_id.clone();
-    ensure_current_release(&args.raw_root, "gfs", &gfs_release_id)?;
-    let samples = sample_points(&gfs_manifest.grid, args.points)?;
+    let mut samples: Option<Vec<Sample>> = None;
     let mut scopes = BTreeMap::new();
-    let gfs = verify_scope(
-        "gfs",
-        "v1/forecast",
-        &gfs_root,
-        gfs_manifest,
-        GFS_LAYERS,
-        &samples,
-        &args.api_base,
-        &snapshot,
-        &decoder,
-    )?;
-    ensure_current_release(&args.raw_root, "gfs", &gfs_release_id)?;
-    if gfs_link.canonicalize()? != gfs_root {
-        bail!("GFS public release changed during verification");
+    for scope in &args.scopes {
+        if scopes.contains_key(scope.name()) {
+            bail!("duplicate --scope {}", scope.name());
+        }
+        let product_link = args.public_root.join(scope.product_dir());
+        let product_root = product_link.canonicalize().with_context(|| {
+            format!(
+                "resolve {} public product {}",
+                scope.name(),
+                product_link.display()
+            )
+        })?;
+        let manifest = load_manifest(&product_root.join(scope.manifest_name()))?;
+        let release_id = manifest.source_release_id.clone();
+        ensure_current_release(&args.raw_root, scope.ready_group(), &release_id)?;
+        if let Some(existing_samples) = samples.as_ref() {
+            ensure_same_grid(existing_samples, &manifest.grid)?;
+        } else {
+            samples = Some(sample_points(&manifest.grid, args.points)?);
+        }
+        let scope_samples = samples.as_ref().expect("samples initialized");
+        let scope_report = with_weather_model(scope.weather_model(), || {
+            verify_scope(
+                scope.name(),
+                scope.endpoint(),
+                scope.api_model(),
+                &product_root,
+                manifest,
+                scope.layers(),
+                scope_samples,
+                &args.api_base,
+                &snapshot,
+                &decoder,
+            )
+        })?;
+        ensure_current_release(&args.raw_root, scope.ready_group(), &release_id)?;
+        if product_link.canonicalize()? != product_root {
+            bail!(
+                "{} public release changed during verification",
+                scope.name()
+            );
+        }
+        scopes.insert(scope.name().to_string(), scope_report);
     }
-    scopes.insert("gfs".to_string(), gfs);
-    let cams_link = args.public_root.join("cams_global");
-    let cams_root = cams_link.canonicalize()?;
-    let cams_manifest = load_manifest(&cams_root.join("cams_global_data.json"))?;
-    let cams_release_id = cams_manifest.source_release_id.clone();
-    ensure_current_release(&args.raw_root, "cams", &cams_release_id)?;
-    ensure_same_grid(&samples, &cams_manifest.grid)?;
-    let cams = verify_scope(
-        "cams",
-        "v1/air-quality",
-        &cams_root,
-        cams_manifest,
-        CAMS_LAYERS,
-        &samples,
-        &args.api_base,
-        &snapshot,
-        &decoder,
-    )?;
-    ensure_current_release(&args.raw_root, "cams", &cams_release_id)?;
-    if cams_link.canonicalize()? != cams_root {
-        bail!("CAMS public release changed during verification");
-    }
-    scopes.insert("cams".to_string(), cams);
+    let samples = samples.expect("at least one scope has samples");
     let total_pixel_comparisons = scopes.values().map(|scope| scope.comparisons).sum();
     let report = Report {
         status: "success",
@@ -302,7 +417,7 @@ fn sample_points(grid: &GridManifest, count: usize) -> Result<Vec<Sample>> {
         || grid.sample_bounds.lon_min != round6(-180.0 + x0 as f64 * dx)
         || grid.sample_bounds.lat_max != round6(lat_origin + y1 as f64 * dy)
     {
-        bail!("production manifest grid does not match the GFS013 grid contract");
+        bail!("production manifest grid does not match the client WebP grid contract");
     }
     let mut indices = Vec::with_capacity(count);
     let mut state = 0xd1b5_4a32_d192_ed03_u64;
@@ -333,14 +448,14 @@ fn sample_points(grid: &GridManifest, count: usize) -> Result<Vec<Sample>> {
 
 fn ensure_same_grid(_samples: &[Sample], grid: &GridManifest) -> Result<()> {
     if (grid.width, grid.height) != (WIDTH, HEIGHT) {
-        bail!("CAMS grid dimensions differ from GFS");
+        bail!("WebP product grid dimensions differ from the sampled product");
     }
     if grid.sample_bounds.lon_min != 70.078125
         || grid.sample_bounds.lat_max != 57.930354
         || grid.dx != 0.117188
         || grid.dy != 0.117149
     {
-        bail!("CAMS and GFS manifest grids differ");
+        bail!("WebP product manifest grids differ");
     }
     Ok(())
 }
@@ -349,6 +464,7 @@ fn ensure_same_grid(_samples: &[Sample], grid: &GridManifest) -> Result<()> {
 fn verify_scope(
     scope: &str,
     endpoint: &str,
+    api_model: Option<&str>,
     product_root: &Path,
     manifest: Manifest,
     layers: &[LayerSpec],
@@ -374,7 +490,14 @@ fn verify_scope(
         if frame_samples.is_empty() {
             continue;
         }
-        let responses = fetch_api(api_base, endpoint, layers, *timestamp, &frame_samples)?;
+        let responses = fetch_api(
+            api_base,
+            endpoint,
+            api_model,
+            layers,
+            *timestamp,
+            &frame_samples,
+        )?;
         api_requests += 1;
         if responses.len() != frame_samples.len() {
             bail!(
@@ -413,6 +536,7 @@ fn verify_scope(
     Ok(ScopeReport {
         release_id: manifest.source_release_id,
         run: manifest.source_run,
+        api_model: api_model.map(str::to_string),
         points: samples.len(),
         layers: layers.len(),
         public_api_layers: layers
@@ -431,6 +555,7 @@ fn verify_scope(
 fn fetch_api(
     api_base: &str,
     endpoint: &str,
+    api_model: Option<&str>,
     layers: &[LayerSpec],
     timestamp: i64,
     samples: &[Sample],
@@ -464,7 +589,8 @@ fn fetch_api(
         .context("manifest timestamp is out of range")?
         .format("%Y-%m-%dT%H:00")
         .to_string();
-    let output = Command::new("/usr/bin/curl")
+    let mut command = Command::new("/usr/bin/curl");
+    command
         .args([
             "-sS",
             "--fail-with-body",
@@ -477,8 +603,11 @@ fn fetch_api(
         .args(["--data", &format!("elevation={elevation}")])
         .args(["--data", &format!("hourly={}", variables.join(","))])
         .args(["--data", &format!("start_hour={hour}")])
-        .args(["--data", &format!("end_hour={hour}")])
-        .output()?;
+        .args(["--data", &format!("end_hour={hour}")]);
+    if let Some(api_model) = api_model {
+        command.args(["--data", &format!("models={api_model}")]);
+    }
+    let output = command.output()?;
     if !output.status.success() {
         bail!(
             "API request failed at {}: stderr={} body={}",
@@ -630,4 +759,62 @@ fn derive_value(value: f32, derive: Derive) -> f32 {
 
 fn round6(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_verification_includes_all_scopes() {
+        let args = Args::try_parse_from(["om-webp-api-verify"]).unwrap();
+        assert_eq!(
+            args.scopes,
+            vec![Scope::Gfs, Scope::Cams, Scope::EcmwfIfs025]
+        );
+        assert_eq!(args.points, 5000);
+    }
+
+    #[test]
+    fn ecmwf_verification_is_model_pinned_and_omits_unavailable_layers() {
+        let args = Args::try_parse_from([
+            "om-webp-api-verify",
+            "--scope",
+            "ecmwf_ifs025",
+            "--points",
+            "5000",
+        ])
+        .unwrap();
+        assert_eq!(args.scopes, vec![Scope::EcmwfIfs025]);
+        let scope = args.scopes[0];
+        assert_eq!(scope.ready_group(), "ecmwf");
+        assert_eq!(scope.product_dir(), "ecmwf_ifs025");
+        assert_eq!(scope.api_model(), Some("ecmwf_ifs025"));
+        assert_eq!(scope.weather_model(), WeatherModel::EcmwfIfs025);
+        assert_eq!(scope.layers().len(), 15);
+        for unavailable in ["gust", "vis", "uv_index"] {
+            assert!(scope.layers().iter().all(|layer| layer.name != unavailable));
+        }
+    }
+
+    #[test]
+    fn deterministic_samples_are_unique() {
+        let grid = GridManifest {
+            width: WIDTH,
+            height: HEIGHT,
+            sample_bounds: Bounds {
+                lon_min: 70.078125,
+                lat_max: 57.930354,
+            },
+            dx: 0.117188,
+            dy: 0.117149,
+        };
+        let samples = sample_points(&grid, 256).unwrap();
+        let unique = samples
+            .iter()
+            .map(|sample| sample.flat_index)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(samples.len(), 256);
+        assert_eq!(unique.len(), samples.len());
+    }
 }

@@ -2,6 +2,13 @@
 
 Silicon Valley is a generic download gateway, not an Open-Meteo runtime. It must not run Open-Meteo containers, Swift services, WebP builders, Shanghai package builders, or business parsers.
 
+Pinned model-elevation grids such as ECMWF/GFS `HSURF.om` are fixed API
+installation assets, not cycle payloads. Group manifests record their URL,
+size, checksum, `storage=external_env`, and
+`environment=OM_MODEL_STATIC_ROOT`; downloader and mirror workflows do not
+copy those files into `/data`. The API installer verifies and stores them on
+the system disk.
+
 Local test command:
 
 ```powershell
@@ -37,6 +44,7 @@ cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.c
 cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog gfs025 --config config/models.json
 cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog gfs_pressure_profile --config config/models.json
 cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog cams_global --config config/models.json
+cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog ecmwf_ifs025 --config config/models.json
 ```
 
 These are validation commands, not the final scheduled download commands. Do not create 1Panel scheduled jobs until the product command downloads ranged `.om` data and publishes a complete `latest.json`.
@@ -150,6 +158,7 @@ Open-Meteo public catalog inspection example:
 ```bash
 cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-openmeteo-model ncep_gfs025
 cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog gfs025 --config config/models.json
+cd /opt/1panel/apps/weather_om_downloader && /usr/bin/python3 -m om_downloader.cli --inspect-product-catalog ecmwf_ifs025 --config config/models.json --now 2026-07-19T03:00:00Z --reference-time 2026-07-18T18:00:00Z
 ```
 
 `--inspect-openmeteo-model` reads `data_spatial/<model>/latest.json`. `--inspect-product-catalog` compares a configured product against actual Open-Meteo variables and reports missing required or optional variables. When `--now` is supplied, it also walks previous `meta.json` files as needed and prints the coverage source runs that fill UTC+8/UTC+6 local-day midnight gaps.

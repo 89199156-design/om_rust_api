@@ -23,7 +23,20 @@ Deployment boundary:
 
 Compliance note:
 
-Open-Meteo `om-file-format` includes TurboPFor source files whose headers mention GPL v2. Before production use in a commercial deployment, confirm whether compiling and using this native decoder on the server is acceptable for the product's licensing posture. Do not redistribute the native library or bundled source without legal review.
+The downloader build selects TurboPFor source files whose upstream headers
+state GPL version 2 or later from the exact revision pinned in
+`downloader/scripts/build_turbopfor_decoder.sh`. Keep this library on the
+server only. Do not include it in a client, SDK, container sent to a third
+party, or other native distribution without preserving upstream source and
+notices and completing a release-specific review.
+
+The point API uses a different native artifact: it compiles the complete
+`om-file-format` C library, whose upstream FFI package declares
+`GPL-2.0-only`. Compatibility between that artifact and the API's
+`AGPL-3.0-or-later` code is unresolved. Dynamic loading and documentation do
+not resolve the question. Client or third-party distribution of that artifact
+is prohibited by project policy pending upstream clarification or qualified
+legal review. See `THIRD_PARTY_NOTICES.md`.
 
 Suggested build flow:
 

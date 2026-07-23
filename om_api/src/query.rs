@@ -3,14 +3,14 @@ use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
-    backwards_direct_normal_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
-    extra_terrestrial_radiation_backwards, extra_terrestrial_radiation_factor_backwards, is_day,
-    SOLAR_CONSTANT,
+    backwards_diffuse_radiation, backwards_direct_normal_irradiance, backwards_sunshine_duration,
+    backwards_to_instant_factor, daylight_duration, extra_terrestrial_radiation_backwards,
+    extra_terrestrial_radiation_factor_backwards, is_day, sun_transit, SunTransit, SOLAR_CONSTANT,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -30,8 +30,95 @@ const GFS025_STATIC_CHUNKS: &[u64] = &[20, 20];
 const GFS025_STATIC_LUT_OFFSET: u64 = 404_885;
 const GFS025_STATIC_LUT_SIZE: u64 = 3_444;
 const GFS025_STATIC_FILE_SIZE: u64 = 408_440;
-type GfsElevationCache = HashMap<(PathBuf, u64, u64), f32>;
-static GFS_ELEVATION_CACHE: OnceLock<Mutex<GfsElevationCache>> = OnceLock::new();
+const ECMWF025_STATIC_ELEVATION_PATH: &str = "static/ecmwf_ifs025/HSURF.om";
+const ECMWF025_STATIC_DIMENSIONS: &[u64] = &[721, 1440];
+const ECMWF025_STATIC_CHUNKS: &[u64] = &[20, 20];
+const ECMWF025_STATIC_LUT_OFFSET: u64 = 430_052;
+const ECMWF025_STATIC_LUT_SIZE: u64 = 3_486;
+const ECMWF025_STATIC_FILE_SIZE: u64 = 433_648;
+type ElevationCache = HashMap<(PathBuf, u64, u64), f32>;
+static ELEVATION_CACHE: OnceLock<Mutex<ElevationCache>> = OnceLock::new();
+
+pub const ECMWF_UPSTREAM_BASELINE: &str = "acfe608b825da1a8b42a755297eb61121986e9da";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeatherModel {
+    Gfs,
+    EcmwfIfs025,
+}
+
+impl WeatherModel {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        let value = value.unwrap_or("gfs").trim().to_ascii_lowercase();
+        match value.as_str() {
+            "" | "gfs" | "ncep_gfs" | "ncep_gfs013" => Ok(Self::Gfs),
+            "ec" | "ecmwf" | "ecmwf_ifs025" => Ok(Self::EcmwfIfs025),
+            _ => bail!("unsupported weather model: {value}"),
+        }
+    }
+
+    fn primary_product(self) -> &'static str {
+        match self {
+            Self::Gfs => "gfs013_surface",
+            Self::EcmwfIfs025 => "ecmwf_ifs025",
+        }
+    }
+
+    fn static_elevation_spec(self) -> StaticElevationSpec {
+        match self {
+            Self::Gfs => GFS013_STATIC_SPEC,
+            Self::EcmwfIfs025 => ECMWF025_STATIC_SPEC,
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Gfs => "GFS013",
+            Self::EcmwfIfs025 => "ECMWF IFS025",
+        }
+    }
+}
+
+thread_local! {
+    static REQUEST_WEATHER_MODEL: RefCell<WeatherModel> = const { RefCell::new(WeatherModel::Gfs) };
+    static ECMWF_REQUEST_REGULAR_CACHE: RefCell<Option<HashMap<EcmwfRegularCacheKey, Arc<EcmwfRegularSeries>>>> = const { RefCell::new(None) };
+}
+
+pub fn with_weather_model<T>(
+    model: WeatherModel,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let previous = REQUEST_WEATHER_MODEL.with(|current| current.replace(model));
+    let result = operation();
+    REQUEST_WEATHER_MODEL.with(|current| current.replace(previous));
+    result
+}
+
+/// Reuse the quantized regular three-hour ECMWF intermediate within one API
+/// request (or one WebP render block). Request decoding stays on one blocking
+/// worker, so a thread-local cache has no cross-request synchronization cost.
+pub fn with_ecmwf_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owns_cache = ECMWF_REQUEST_REGULAR_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_some() {
+            false
+        } else {
+            *cache = Some(HashMap::new());
+            true
+        }
+    });
+    let result = operation();
+    if owns_cache {
+        ECMWF_REQUEST_REGULAR_CACHE.with(|cache| {
+            cache.borrow_mut().take();
+        });
+    }
+    result
+}
+
+fn current_weather_model() -> WeatherModel {
+    REQUEST_WEATHER_MODEL.with(|current| *current.borrow())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GridSelectionMode {
@@ -63,6 +150,7 @@ struct ModelSampling {
 struct RequestSampling {
     gfs013: Option<ModelSampling>,
     gfs025: Option<ModelSampling>,
+    ecmwf025: Option<ModelSampling>,
     response_elevation: f32,
 }
 
@@ -88,6 +176,7 @@ fn current_product_sampling(product: &str) -> Option<ModelSampling> {
             .and_then(|sampling| match product {
                 "gfs013_surface" => sampling.gfs013,
                 "gfs025" | "gfs_pressure_profile" => sampling.gfs025,
+                "ecmwf_ifs025" => sampling.ecmwf025,
                 _ => None,
             })
     })
@@ -98,19 +187,21 @@ pub const OPENMETEO_IMAGE_BASELINE: &str = "weather-forecast-openmeteo:9849315";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct PointQuery {
+    #[serde(deserialize_with = "deserialize_csv_field")]
     pub latitude: String,
+    #[serde(deserialize_with = "deserialize_csv_field")]
     pub longitude: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub hourly: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub daily: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub start_hour: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub end_hour: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub start_date: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub end_date: Option<String>,
     #[serde(default)]
     pub forecast_hours: Option<usize>,
@@ -118,18 +209,60 @@ pub struct PointQuery {
     pub past_days: Option<usize>,
     #[serde(default)]
     pub forecast_days: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub timezone: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub cell_selection: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_csv_field")]
     pub elevation: Option<String>,
+    #[serde(
+        default,
+        alias = "model",
+        deserialize_with = "deserialize_optional_csv_field"
+    )]
+    pub models: Option<String>,
+}
+
+fn csv_scalar(value: serde_json::Value) -> std::result::Result<String, String> {
+    match value {
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(csv_scalar)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|values| values.join(",")),
+        serde_json::Value::Null => Err("CSV field must not be null".to_string()),
+        serde_json::Value::Object(_) => {
+            Err("CSV field must be a scalar or an array of scalars".to_string())
+        }
+    }
+}
+
+fn deserialize_csv_field<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    csv_scalar(serde_json::Value::deserialize(deserializer)?).map_err(D::Error::custom)
+}
+
+fn deserialize_optional_csv_field<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    value.map(csv_scalar).transpose().map_err(D::Error::custom)
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteQuery {
     pub points: Vec<RoutePoint>,
     pub hourly: Vec<String>,
+    #[serde(default, alias = "model")]
+    pub models: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -199,9 +332,163 @@ pub fn parse_variables(value: Option<&str>) -> Vec<String> {
 }
 
 const PUBLIC_PRESSURE_LEVELS: &[u16] = &[
-    50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 925,
-    950, 975, 1000,
+    10, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900,
+    925, 950, 975, 1000,
 ];
+pub const ECMWF_PUBLIC_PRESSURE_LEVELS: &[u16] = &[
+    1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10,
+];
+pub const ECMWF_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
+    "temperature_2m",
+    "temperature_2m_min",
+    "temperature_2m_max",
+    "relative_humidity_2m",
+    "dew_point_2m",
+    "apparent_temperature",
+    "wet_bulb_temperature_2m",
+    "pressure_msl",
+    "surface_pressure",
+    "cloud_cover",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "precipitation",
+    "rain",
+    "snowfall",
+    "snowfall_water_equivalent",
+    "precipitation_type",
+    "runoff",
+    "snow_depth",
+    "snow_depth_water_equivalent",
+    "cape",
+    "shortwave_radiation",
+    "shortwave_radiation_instant",
+    "direct_radiation",
+    "direct_radiation_instant",
+    "diffuse_radiation",
+    "diffuse_radiation_instant",
+    "direct_normal_irradiance",
+    "direct_normal_irradiance_instant",
+    "global_tilted_irradiance",
+    "global_tilted_irradiance_instant",
+    "sunshine_duration",
+    "et0_fao_evapotranspiration",
+    "vapor_pressure_deficit",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "wind_gusts_10m",
+    "wind_speed_100m",
+    "wind_direction_100m",
+    "surface_temperature",
+    "skin_temperature",
+    "soil_temperature_0cm",
+    "soil_temperature_0_to_7cm",
+    "soil_temperature_7_to_28cm",
+    "soil_temperature_28_to_100cm",
+    "soil_temperature_100_to_255cm",
+    "soil_temperature_0_to_100cm",
+    "soil_moisture_0_to_7cm",
+    "soil_moisture_7_to_28cm",
+    "soil_moisture_28_to_100cm",
+    "soil_moisture_100_to_255cm",
+    "soil_moisture_0_to_100cm",
+    "total_column_integrated_water_vapour",
+    "growing_degree_days_base_0_limit_50",
+    "weather_code",
+    "is_day",
+];
+pub const ECMWF_PUBLIC_PRESSURE_VARIABLE_TYPES: &[&str] = &[
+    "temperature",
+    "relative_humidity",
+    "geopotential_height",
+    "wind_u_component",
+    "wind_v_component",
+    "wind_speed",
+    "wind_direction",
+    "vertical_velocity",
+    "dew_point",
+    "cloud_cover",
+];
+pub const ECMWF_PUBLIC_DAILY_VARIABLES: &[&str] = &[
+    "apparent_temperature_max",
+    "apparent_temperature_mean",
+    "apparent_temperature_min",
+    "cape_max",
+    "cape_mean",
+    "cape_min",
+    "cloud_cover_max",
+    "cloud_cover_mean",
+    "cloud_cover_min",
+    "dew_point_2m_max",
+    "dew_point_2m_mean",
+    "dew_point_2m_min",
+    "et0_fao_evapotranspiration_sum",
+    "growing_degree_days_base_0_limit_50",
+    "precipitation_hours",
+    "precipitation_sum",
+    "pressure_msl_max",
+    "pressure_msl_mean",
+    "pressure_msl_min",
+    "rain_sum",
+    "relative_humidity_2m_max",
+    "relative_humidity_2m_mean",
+    "relative_humidity_2m_min",
+    "shortwave_radiation_sum",
+    "snowfall_sum",
+    "snowfall_water_equivalent_sum",
+    "snow_depth_max",
+    "snow_depth_mean",
+    "snow_depth_min",
+    "soil_moisture_0_to_7cm_mean",
+    "soil_moisture_7_to_28cm_mean",
+    "soil_moisture_28_to_100cm_mean",
+    "soil_moisture_100_to_255cm_mean",
+    "soil_moisture_0_to_100cm_mean",
+    "soil_temperature_0_to_7cm_mean",
+    "soil_temperature_7_to_28cm_mean",
+    "soil_temperature_28_to_100cm_mean",
+    "soil_temperature_100_to_255cm_mean",
+    "soil_temperature_0_to_100cm_mean",
+    "sunrise",
+    "sunset",
+    "daylight_duration",
+    "sunshine_duration",
+    "surface_pressure_max",
+    "surface_pressure_mean",
+    "surface_pressure_min",
+    "temperature_2m_max",
+    "temperature_2m_mean",
+    "temperature_2m_min",
+    "vapor_pressure_deficit_max",
+    "weather_code",
+    "wind_direction_10m_dominant",
+    "wind_gusts_10m_max",
+    "wind_gusts_10m_mean",
+    "wind_gusts_10m_min",
+    "wind_speed_10m_max",
+    "wind_speed_10m_mean",
+    "wind_speed_10m_min",
+    "wet_bulb_temperature_2m_max",
+    "wet_bulb_temperature_2m_mean",
+    "wet_bulb_temperature_2m_min",
+    "wind_direction_100m_dominant",
+    "wind_speed_100m_max",
+    "wind_speed_100m_mean",
+    "wind_speed_100m_min",
+];
+
+pub fn ecmwf_public_hourly_variables() -> Vec<String> {
+    let mut variables = ECMWF_PUBLIC_SURFACE_VARIABLES
+        .iter()
+        .map(|variable| (*variable).to_string())
+        .collect::<Vec<_>>();
+    for level in ECMWF_PUBLIC_PRESSURE_LEVELS {
+        for variable_type in ECMWF_PUBLIC_PRESSURE_VARIABLE_TYPES {
+            variables.push(format!("{variable_type}_{level}hPa"));
+        }
+    }
+    variables
+}
 
 fn is_public_pressure_variable(variable: &str) -> bool {
     let Some((name, level_text)) = variable.rsplit_once('_') else {
@@ -244,9 +531,17 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "wet_bulb_temperature_2m"
             | "surface_temperature"
             | "soil_temperature_0_to_10cm"
+            | "soil_temperature_0_to_7cm"
+            | "soil_temperature_7_to_28cm"
+            | "soil_temperature_28_to_100cm"
+            | "soil_temperature_100_to_255cm"
             | "soil_temperature_10_to_40cm"
             | "soil_temperature_40_to_100cm"
             | "soil_temperature_100_to_200cm"
+            | "soil_moisture_0_to_7cm"
+            | "soil_moisture_7_to_28cm"
+            | "soil_moisture_28_to_100cm"
+            | "soil_moisture_100_to_255cm"
             | "soil_moisture_0_to_10cm"
             | "soil_moisture_10_to_40cm"
             | "soil_moisture_40_to_100cm"
@@ -296,6 +591,9 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "uv_index"
             | "uv_index_clear_sky"
             | "sunshine_duration"
+            | "et0_fao_evapotranspiration"
+            | "vapour_pressure_deficit"
+            | "vapor_pressure_deficit"
             | "aerosol_optical_depth"
             | "pm2_5"
             | "pm10"
@@ -318,10 +616,114 @@ fn is_public_hourly_variable(variable: &str) -> bool {
     ) || is_public_pressure_variable(variable)
 }
 
+fn is_ecmwf_public_pressure_variable(variable: &str) -> bool {
+    let Some((name, level_text)) = variable.rsplit_once('_') else {
+        return false;
+    };
+    let Some(level) = level_text
+        .strip_suffix("hPa")
+        .and_then(|value| value.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    ECMWF_PUBLIC_PRESSURE_LEVELS.contains(&level)
+        && ECMWF_PUBLIC_PRESSURE_VARIABLE_TYPES.contains(&name)
+}
+
+fn is_ecmwf_public_hourly_variable(variable: &str) -> bool {
+    ECMWF_PUBLIC_SURFACE_VARIABLES.contains(&variable)
+        || is_ecmwf_public_pressure_variable(variable)
+}
+
+fn is_gfs_public_daily_variable(variable: &str) -> bool {
+    matches!(
+        variable,
+        "temperature_2m_max"
+            | "temperature_2m_min"
+            | "temperature_2m_mean"
+            | "apparent_temperature_max"
+            | "apparent_temperature_min"
+            | "apparent_temperature_mean"
+            | "precipitation_sum"
+            | "rain_sum"
+            | "showers_sum"
+            | "snowfall_sum"
+            | "snowfall_water_equivalent_sum"
+            | "weather_code"
+            | "weathercode"
+            | "wind_speed_10m_max"
+            | "windspeed_10m_max"
+            | "wind_speed_10m_min"
+            | "windspeed_10m_min"
+            | "wind_speed_10m_mean"
+            | "windspeed_10m_mean"
+            | "wind_gusts_10m_max"
+            | "windgusts_10m_max"
+            | "wind_gusts_10m_min"
+            | "windgusts_10m_min"
+            | "wind_gusts_10m_mean"
+            | "windgusts_10m_mean"
+            | "wind_direction_10m_dominant"
+            | "winddirection_10m_dominant"
+            | "precipitation_hours"
+            | "visibility_max"
+            | "visibility_min"
+            | "visibility_mean"
+            | "pressure_msl_max"
+            | "pressure_msl_min"
+            | "pressure_msl_mean"
+            | "surface_pressure_max"
+            | "surface_pressure_min"
+            | "surface_pressure_mean"
+            | "cloud_cover_max"
+            | "cloudcover_max"
+            | "cloud_cover_min"
+            | "cloudcover_min"
+            | "cloud_cover_mean"
+            | "cloudcover_mean"
+            | "dew_point_2m_max"
+            | "dewpoint_2m_max"
+            | "dew_point_2m_min"
+            | "dewpoint_2m_min"
+            | "dew_point_2m_mean"
+            | "dewpoint_2m_mean"
+            | "relative_humidity_2m_max"
+            | "relative_humidity_2m_min"
+            | "relative_humidity_2m_mean"
+            | "snow_depth_max"
+            | "snow_depth_min"
+            | "snow_depth_mean"
+            | "uv_index_max"
+            | "uv_index_clear_sky_max"
+    )
+}
+
 fn validate_public_hourly_variables(variables: &[String]) -> Result<()> {
     for variable in variables {
-        if !is_public_hourly_variable(variable) {
+        let supported = match current_weather_model() {
+            WeatherModel::Gfs => is_public_hourly_variable(variable),
+            WeatherModel::EcmwfIfs025 => is_ecmwf_public_hourly_variable(variable),
+        };
+        if !supported {
             bail!("unsupported public hourly variable: {variable}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_daily_variables(variables: &[String]) -> Result<()> {
+    for variable in variables {
+        if current_weather_model() == WeatherModel::EcmwfIfs025 {
+            if !ECMWF_PUBLIC_DAILY_VARIABLES.contains(&variable.as_str()) {
+                bail!("unsupported ECMWF daily variable: {variable}");
+            }
+        } else {
+            if !is_gfs_public_daily_variable(variable) {
+                bail!(
+                    "unsupported daily weather variable: {variable}; this server only exposes official aggregations backed by locally downloaded fields"
+                );
+            }
+            daily_weather_aggregation(variable)?;
         }
     }
     Ok(())
@@ -447,6 +849,20 @@ pub fn forecast_for_query(
     decoder: Option<&OfficialDecoder>,
     query: &PointQuery,
 ) -> Result<serde_json::Value> {
+    let model = WeatherModel::parse(query.models.as_deref())?;
+    with_weather_model(model, || match model {
+        WeatherModel::EcmwfIfs025 => {
+            with_ecmwf_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
+        }
+        WeatherModel::Gfs => forecast_for_query_for_model(snapshot, decoder, query),
+    })
+}
+
+fn forecast_for_query_for_model(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    query: &PointQuery,
+) -> Result<serde_json::Value> {
     let latitudes = parse_csv_f64(&query.latitude, "latitude")?;
     let longitudes = parse_csv_f64(&query.longitude, "longitude")?;
     if latitudes.len() != longitudes.len() {
@@ -465,6 +881,12 @@ pub fn forecast_for_query(
         parse_variables(query.hourly.as_deref())
     };
     validate_public_hourly_variables(&variables)?;
+    if !daily_variables
+        .iter()
+        .any(|variable| is_chinese_air_quality_daily_variable(variable))
+    {
+        validate_public_daily_variables(&daily_variables)?;
+    }
     let timezones = parse_query_timezones(query.timezone.as_deref(), latitudes.len())?;
     let daily_has_air_quality = daily_variables
         .iter()
@@ -473,7 +895,7 @@ pub fn forecast_for_query(
         && daily_variables
             .iter()
             .all(|variable| is_chinese_air_quality_daily_variable(variable));
-    let has_gfs_weather = variables
+    let has_weather = variables
         .iter()
         .any(|variable| !is_air_quality_variable(variable))
         || (!daily_variables.is_empty() && !daily_is_air_quality);
@@ -491,8 +913,8 @@ pub fn forecast_for_query(
         let latitude = latitudes[index];
         let longitude = longitudes[index];
         let timezone = &timezones[index];
-        let start = parse_hour_with_timezone(query.start_hour.as_deref(), &timezone)?;
-        let end = parse_hour_with_timezone(query.end_hour.as_deref(), &timezone)?;
+        let start = parse_hour_with_timezone(query.start_hour.as_deref(), timezone)?;
+        let end = parse_hour_with_timezone(query.end_hour.as_deref(), timezone)?;
         let sampling = match decoder {
             Some(_) => Some(resolve_request_sampling(
                 snapshot,
@@ -527,7 +949,7 @@ pub fn forecast_for_query(
                 end,
                 query.forecast_hours,
             )?;
-            apply_response_timezone(&mut response, &timezone)?;
+            apply_response_timezone(&mut response, timezone)?;
             if daily_is_air_quality {
                 attach_daily_chinese_air_quality(
                     &mut response,
@@ -551,12 +973,16 @@ pub fn forecast_for_query(
                     query.end_date.as_deref(),
                     query.past_days,
                     query.forecast_days,
-                    &timezone,
+                    timezone,
                 )?;
             }
-            if has_gfs_weather {
+            if has_weather {
                 if let Some(sampling) = sampling {
-                    if let Some(model) = sampling.gfs013 {
+                    let model = match current_weather_model() {
+                        WeatherModel::Gfs => sampling.gfs013,
+                        WeatherModel::EcmwfIfs025 => sampling.ecmwf025,
+                    };
+                    if let Some(model) = model {
                         response.latitude = model.latitude;
                         response.longitude = model.longitude;
                         response.elevation = Some(sampling.response_elevation as f64);
@@ -619,6 +1045,20 @@ pub fn route_forecast(
     decoder: Option<&OfficialDecoder>,
     query: &RouteQuery,
 ) -> Result<RouteResponse> {
+    let model = WeatherModel::parse(query.models.as_deref())?;
+    with_weather_model(model, || match model {
+        WeatherModel::EcmwfIfs025 => {
+            with_ecmwf_request_cache(|| route_forecast_for_model(snapshot, decoder, query))
+        }
+        WeatherModel::Gfs => route_forecast_for_model(snapshot, decoder, query),
+    })
+}
+
+fn route_forecast_for_model(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    query: &RouteQuery,
+) -> Result<RouteResponse> {
     if query.points.is_empty() {
         bail!("points must not be empty");
     }
@@ -630,16 +1070,32 @@ pub fn route_forecast(
     let mut points = Vec::with_capacity(query.points.len());
     for point in &query.points {
         let start = point.time;
-        let response = point_forecast(
-            snapshot,
-            decoder,
-            point.latitude,
-            point.longitude,
-            &query.hourly,
-            start,
-            start,
-            Some(1),
-        )?;
+        let build_response = || {
+            point_forecast(
+                snapshot,
+                decoder,
+                point.latitude,
+                point.longitude,
+                &query.hourly,
+                start,
+                start,
+                Some(1),
+            )
+        };
+        let response = match decoder {
+            Some(_) => {
+                let sampling = resolve_request_sampling(
+                    snapshot,
+                    decoder,
+                    point.latitude,
+                    point.longitude,
+                    None,
+                    GridSelectionMode::Land,
+                )?;
+                with_request_sampling(sampling, build_response)?
+            }
+            None => build_response()?,
+        };
         points.push(RoutePointResponse {
             latitude: point.latitude,
             longitude: point.longitude,
@@ -654,6 +1110,7 @@ pub fn route_forecast(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn point_forecast(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -741,8 +1198,16 @@ enum DailyWeatherAggregation {
     Min(&'static str),
     Mean(&'static str),
     Sum(&'static str),
+    RadiationSum(&'static str),
     PrecipitationHours(&'static str),
-    DominantWindDirection,
+    DominantWindDirection {
+        u: &'static str,
+        v: &'static str,
+        output: &'static str,
+    },
+    Sunrise,
+    Sunset,
+    DaylightDuration,
 }
 
 impl DailyWeatherAggregation {
@@ -752,8 +1217,10 @@ impl DailyWeatherAggregation {
             | Self::Min(variable)
             | Self::Mean(variable)
             | Self::Sum(variable)
+            | Self::RadiationSum(variable)
             | Self::PrecipitationHours(variable) => variable,
-            Self::DominantWindDirection => "wind_u_component_10m",
+            Self::DominantWindDirection { u, .. } => u,
+            Self::Sunrise | Self::Sunset | Self::DaylightDuration => "temperature_2m",
         }
     }
 
@@ -762,9 +1229,13 @@ impl DailyWeatherAggregation {
             Self::Max(variable)
             | Self::Min(variable)
             | Self::Mean(variable)
-            | Self::Sum(variable) => variable,
+            | Self::Sum(variable)
+            | Self::RadiationSum(variable) => variable,
             Self::PrecipitationHours(_) => "precipitation",
-            Self::DominantWindDirection => "wind_direction_10m",
+            Self::DominantWindDirection { output, .. } => output,
+            Self::Sunrise => "sunrise",
+            Self::Sunset => "sunset",
+            Self::DaylightDuration => "daylight_duration",
         }
     }
 }
@@ -782,6 +1253,17 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "showers_sum" => DailyWeatherAggregation::Sum("showers"),
         "snowfall_sum" => DailyWeatherAggregation::Sum("snowfall"),
         "snowfall_water_equivalent_sum" => DailyWeatherAggregation::Sum("snowfall_water_equivalent"),
+        "shortwave_radiation_sum" => DailyWeatherAggregation::RadiationSum("shortwave_radiation"),
+        "et0_fao_evapotranspiration" | "et0_fao_evapotranspiration_sum" => {
+            DailyWeatherAggregation::Sum("et0_fao_evapotranspiration")
+        }
+        "sunshine_duration" => DailyWeatherAggregation::Sum("sunshine_duration"),
+        "growing_degree_days_base_0_limit_50" => {
+            DailyWeatherAggregation::Sum("growing_degree_days_base_0_limit_50")
+        }
+        "sunrise" => DailyWeatherAggregation::Sunrise,
+        "sunset" => DailyWeatherAggregation::Sunset,
+        "daylight_duration" => DailyWeatherAggregation::DaylightDuration,
         "weather_code" | "weathercode" => DailyWeatherAggregation::Max("weather_code"),
         "wind_speed_10m_max" | "windspeed_10m_max" => DailyWeatherAggregation::Max("wind_speed_10m"),
         "wind_speed_10m_min" | "windspeed_10m_min" => DailyWeatherAggregation::Min("wind_speed_10m"),
@@ -789,7 +1271,21 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "wind_gusts_10m_max" | "windgusts_10m_max" => DailyWeatherAggregation::Max("wind_gusts_10m"),
         "wind_gusts_10m_min" | "windgusts_10m_min" => DailyWeatherAggregation::Min("wind_gusts_10m"),
         "wind_gusts_10m_mean" | "windgusts_10m_mean" => DailyWeatherAggregation::Mean("wind_gusts_10m"),
-        "wind_direction_10m_dominant" | "winddirection_10m_dominant" => DailyWeatherAggregation::DominantWindDirection,
+        "wind_speed_100m_max" => DailyWeatherAggregation::Max("wind_speed_100m"),
+        "wind_speed_100m_min" => DailyWeatherAggregation::Min("wind_speed_100m"),
+        "wind_speed_100m_mean" => DailyWeatherAggregation::Mean("wind_speed_100m"),
+        "wind_direction_10m_dominant" | "winddirection_10m_dominant" => {
+            DailyWeatherAggregation::DominantWindDirection {
+                u: "wind_u_component_10m",
+                v: "wind_v_component_10m",
+                output: "wind_direction_10m",
+            }
+        }
+        "wind_direction_100m_dominant" => DailyWeatherAggregation::DominantWindDirection {
+            u: "wind_u_component_100m",
+            v: "wind_v_component_100m",
+            output: "wind_direction_100m",
+        },
         "precipitation_hours" => DailyWeatherAggregation::PrecipitationHours("precipitation"),
         "visibility_max" => DailyWeatherAggregation::Max("visibility"),
         "visibility_min" => DailyWeatherAggregation::Min("visibility"),
@@ -800,6 +1296,9 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "surface_pressure_max" => DailyWeatherAggregation::Max("surface_pressure"),
         "surface_pressure_min" => DailyWeatherAggregation::Min("surface_pressure"),
         "surface_pressure_mean" => DailyWeatherAggregation::Mean("surface_pressure"),
+        "cape_max" => DailyWeatherAggregation::Max("cape"),
+        "cape_min" => DailyWeatherAggregation::Min("cape"),
+        "cape_mean" => DailyWeatherAggregation::Mean("cape"),
         "cloud_cover_max" | "cloudcover_max" => DailyWeatherAggregation::Max("cloud_cover"),
         "cloud_cover_min" | "cloudcover_min" => DailyWeatherAggregation::Min("cloud_cover"),
         "cloud_cover_mean" | "cloudcover_mean" => DailyWeatherAggregation::Mean("cloud_cover"),
@@ -809,6 +1308,48 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "relative_humidity_2m_max" => DailyWeatherAggregation::Max("relative_humidity_2m"),
         "relative_humidity_2m_min" => DailyWeatherAggregation::Min("relative_humidity_2m"),
         "relative_humidity_2m_mean" => DailyWeatherAggregation::Mean("relative_humidity_2m"),
+        "wet_bulb_temperature_2m_max" => {
+            DailyWeatherAggregation::Max("wet_bulb_temperature_2m")
+        }
+        "wet_bulb_temperature_2m_min" => {
+            DailyWeatherAggregation::Min("wet_bulb_temperature_2m")
+        }
+        "wet_bulb_temperature_2m_mean" => {
+            DailyWeatherAggregation::Mean("wet_bulb_temperature_2m")
+        }
+        "vapour_pressure_deficit_max" | "vapor_pressure_deficit_max" => {
+            DailyWeatherAggregation::Max("vapour_pressure_deficit")
+        }
+        "soil_moisture_0_to_7cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_moisture_0_to_7cm")
+        }
+        "soil_moisture_7_to_28cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_moisture_7_to_28cm")
+        }
+        "soil_moisture_28_to_100cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_moisture_28_to_100cm")
+        }
+        "soil_moisture_100_to_255cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_moisture_100_to_255cm")
+        }
+        "soil_moisture_0_to_100cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_moisture_0_to_100cm")
+        }
+        "soil_temperature_0_to_7cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_temperature_0_to_7cm")
+        }
+        "soil_temperature_7_to_28cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_temperature_7_to_28cm")
+        }
+        "soil_temperature_28_to_100cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_temperature_28_to_100cm")
+        }
+        "soil_temperature_100_to_255cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_temperature_100_to_255cm")
+        }
+        "soil_temperature_0_to_100cm_mean" => {
+            DailyWeatherAggregation::Mean("soil_temperature_0_to_100cm")
+        }
         "snow_depth_max" => DailyWeatherAggregation::Max("snow_depth"),
         "snow_depth_min" => DailyWeatherAggregation::Min("snow_depth"),
         "snow_depth_mean" => DailyWeatherAggregation::Mean("snow_depth"),
@@ -867,6 +1408,25 @@ fn attach_daily_weather(
     );
 
     for (variable, aggregation) in variables.iter().zip(aggregations) {
+        if matches!(
+            aggregation,
+            DailyWeatherAggregation::Sunrise | DailyWeatherAggregation::Sunset
+        ) {
+            let use_rise = matches!(aggregation, DailyWeatherAggregation::Sunrise);
+            let values = dates
+                .iter()
+                .map(|date| {
+                    daily_sun_event(*date, timezone, latitude, longitude, use_rise).map(|time| {
+                        time.with_timezone(&timezone.offset)
+                            .format("%Y-%m-%dT%H:%M")
+                            .to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            daily_units.insert(variable.clone(), "iso8601".to_string());
+            daily.insert(variable.clone(), serde_json::to_value(values)?);
+            continue;
+        }
         let values = dates
             .iter()
             .map(|date| {
@@ -895,6 +1455,48 @@ fn attach_daily_weather(
     Ok(())
 }
 
+fn daily_model_coordinates(latitude: f64, longitude: f64) -> (f32, f32) {
+    current_product_sampling(current_weather_model().primary_product())
+        .map(|sampling| (sampling.latitude as f32, sampling.longitude as f32))
+        .unwrap_or((latitude as f32, longitude as f32))
+}
+
+fn daily_sun_event(
+    date: NaiveDate,
+    timezone: &QueryTimezone,
+    latitude: f64,
+    longitude: f64,
+    rise: bool,
+) -> Result<DateTime<Utc>> {
+    let local_midnight = date
+        .and_hms_opt(0, 0, 0)
+        .context("invalid daily local midnight")?;
+    let real_midnight = timezone
+        .offset
+        .from_local_datetime(&local_midnight)
+        .single()
+        .context("invalid daily local midnight")?
+        .with_timezone(&Utc);
+    let offset = Duration::seconds(timezone.offset.local_minus_utc() as i64);
+    let display_midnight = real_midnight + offset;
+    let (latitude, longitude) = daily_model_coordinates(latitude, longitude);
+    let shifted_event = match sun_transit(display_midnight, latitude, longitude) {
+        SunTransit::PolarNight => display_midnight,
+        SunTransit::PolarDay => {
+            if rise {
+                display_midnight
+            } else {
+                display_midnight + Duration::days(1)
+            }
+        }
+        SunTransit::Transit {
+            rise_seconds,
+            set_seconds,
+        } => display_midnight + Duration::seconds(if rise { rise_seconds } else { set_seconds }),
+    };
+    Ok(shifted_event - offset)
+}
+
 fn select_weather_dates(
     snapshot: &OmDataSnapshot,
     seed_variable: &str,
@@ -911,7 +1513,14 @@ fn select_weather_dates(
         bail!("past_days and forecast_days cannot be combined with start_date and end_date");
     }
 
-    let raw_seed = seed_variable_for_times(seed_variable);
+    let raw_seed = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        // The free IFS025 product always requires temperature_2m. Use that
+        // stable axis so an unavailable first daily field cannot change the
+        // response window or make variable order affect request success.
+        "temperature_2m".to_string()
+    } else {
+        seed_variable_for_times(seed_variable)
+    };
     let (product_name, raw_variable) = product_for_variable(snapshot, &raw_seed)?;
     let mut times = snapshot
         .product_snapshots(product_name)
@@ -1011,47 +1620,61 @@ fn daily_weather_value(
         .context("invalid daily local end")?
         .with_timezone(&Utc);
 
-    if matches!(aggregation, DailyWeatherAggregation::DominantWindDirection) {
-        let mut u_sum = 0.0_f32;
-        let mut v_sum = 0.0_f32;
-        let mut time = start;
-        while time < end {
-            let u = read_daily_hour(
-                snapshot,
-                decoder,
-                "wind_u_component_10m",
-                time,
-                latitude,
-                longitude,
-            )?;
-            let v = read_daily_hour(
-                snapshot,
-                decoder,
-                "wind_v_component_10m",
-                time,
-                latitude,
-                longitude,
-            )?;
-            if !u.is_finite() || !v.is_finite() {
-                return Ok(f32::NAN);
-            }
-            u_sum += u;
-            v_sum += v;
-            time += Duration::hours(1);
+    if matches!(aggregation, DailyWeatherAggregation::DaylightDuration) {
+        let display_midnight = start + Duration::seconds(timezone.offset.local_minus_utc() as i64);
+        let (latitude, _) = daily_model_coordinates(latitude, longitude);
+        return Ok(daylight_duration(display_midnight, latitude));
+    }
+
+    if let DailyWeatherAggregation::DominantWindDirection { u, v, .. } = aggregation {
+        let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+            3
+        } else {
+            1
+        };
+        let times = daily_sample_times(start, end, step_hours);
+        let u_values = read_daily_series(snapshot, decoder, u, &times, latitude, longitude)?;
+        let v_values = read_daily_series(snapshot, decoder, v, &times, latitude, longitude)?;
+        if u_values
+            .iter()
+            .chain(&v_values)
+            .any(|value| !value.is_finite())
+        {
+            return Ok(f32::NAN);
         }
+        let u_sum = u_values.iter().sum::<f32>();
+        let v_sum = v_values.iter().sum::<f32>();
         return Ok(wind_direction(u_sum, v_sum));
     }
 
     let source = aggregation.seed_variable();
-    let mut values = Vec::new();
-    let mut time = start;
-    while time < end {
-        values.push(read_daily_hour(
-            snapshot, decoder, source, time, latitude, longitude,
-        )?);
-        time += Duration::hours(1);
-    }
+    let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025
+        && matches!(
+            aggregation,
+            DailyWeatherAggregation::Mean(_)
+                | DailyWeatherAggregation::Sum(_)
+                | DailyWeatherAggregation::RadiationSum(_)
+                | DailyWeatherAggregation::PrecipitationHours(_)
+        ) {
+        3
+    } else {
+        1
+    };
+    let times = daily_sample_times(start, end, step_hours);
+    let values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
 
+    Ok(aggregate_daily_weather_values(
+        aggregation,
+        &values,
+        step_hours,
+    ))
+}
+
+fn aggregate_daily_weather_values(
+    aggregation: DailyWeatherAggregation,
+    values: &[f32],
+    step_hours: i64,
+) -> f32 {
     let finite_extreme = |take_max: bool| {
         values
             .iter()
@@ -1077,18 +1700,83 @@ fn daily_weather_value(
             values.iter().sum::<f32>() / values.len() as f32
         }
         DailyWeatherAggregation::Sum(_) if complete => values.iter().sum(),
+        DailyWeatherAggregation::RadiationSum(_) if complete => {
+            values.iter().sum::<f32>() * (step_hours * 3600) as f32 / 1_000_000.0
+        }
         DailyWeatherAggregation::PrecipitationHours(_) => values
             .iter()
             .filter(|value| value.is_finite())
-            .map(|value| if *value > 0.001 { 1.0 } else { 0.0 })
+            .map(|value| {
+                if *value > 0.001 {
+                    step_hours as f32
+                } else {
+                    0.0
+                }
+            })
             .sum(),
         DailyWeatherAggregation::Max(_)
         | DailyWeatherAggregation::Min(_)
         | DailyWeatherAggregation::Mean(_)
-        | DailyWeatherAggregation::Sum(_) => f32::NAN,
-        DailyWeatherAggregation::DominantWindDirection => unreachable!("handled above"),
+        | DailyWeatherAggregation::Sum(_)
+        | DailyWeatherAggregation::RadiationSum(_) => f32::NAN,
+        DailyWeatherAggregation::DominantWindDirection { .. }
+        | DailyWeatherAggregation::DaylightDuration
+        | DailyWeatherAggregation::Sunrise
+        | DailyWeatherAggregation::Sunset => unreachable!("handled above"),
     };
-    Ok(value)
+    value
+}
+
+fn daily_sample_times(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    step_hours: i64,
+) -> Vec<DateTime<Utc>> {
+    let mut times = Vec::new();
+    let mut time = start;
+    while time < end {
+        times.push(time);
+        time += Duration::hours(step_hours);
+    }
+    times
+}
+
+fn read_daily_series(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+) -> Result<Vec<f32>> {
+    if let Some(decoder) = decoder {
+        match read_variable_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            &[latitude],
+            &[longitude],
+        ) {
+            Ok(frames) => {
+                return frames
+                    .into_iter()
+                    .map(|mut frame| {
+                        if frame.len() != 1 {
+                            bail!("daily point series returned {} grid values", frame.len());
+                        }
+                        Ok(frame.remove(0))
+                    })
+                    .collect()
+            }
+            Err(error) if error.to_string().contains("variable/time is not available") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    times
+        .iter()
+        .map(|time| read_daily_hour(snapshot, decoder, variable, *time, latitude, longitude))
+        .collect()
 }
 
 fn read_daily_hour(
@@ -1109,10 +1797,14 @@ fn read_daily_hour(
 fn daily_weather_unit(variable: &str, aggregation: DailyWeatherAggregation) -> &'static str {
     match variable {
         "precipitation_hours" => "h",
+        "shortwave_radiation_sum" => "MJ/m\u{00B2}",
+        "sunrise" | "sunset" => "iso8601",
+        "daylight_duration" | "sunshine_duration" => "s",
         _ => unit_for_variable(aggregation.output_variable()),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_daily_chinese_air_quality(
     response: &mut ForecastResponse,
     snapshot: &OmDataSnapshot,
@@ -1231,10 +1923,18 @@ fn select_times(
     end: Option<DateTime<Utc>>,
     limit: Option<usize>,
 ) -> Result<Vec<DateTime<Utc>>> {
-    let seed_var = variables
-        .first()
-        .map(|value| seed_variable_for_times(value))
-        .unwrap_or_else(|| "temperature_2m".to_string());
+    let contains_weather = variables.is_empty()
+        || variables
+            .iter()
+            .any(|variable| !is_air_quality_variable(variable));
+    let seed_var = if current_weather_model() == WeatherModel::EcmwfIfs025 && contains_weather {
+        "temperature_2m".to_string()
+    } else {
+        variables
+            .first()
+            .map(|value| seed_variable_for_times(value))
+            .unwrap_or_else(|| "temperature_2m".to_string())
+    };
     let (product_name, raw_var) = product_for_variable(snapshot, &seed_var)?;
     let product = snapshot.require_product(product_name)?;
     let mut times: Vec<DateTime<Utc>> = snapshot
@@ -1352,10 +2052,11 @@ pub fn read_variable_value(
             )?;
             let pressure_msl =
                 read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
-            let elevation = current_product_sampling("gfs013_surface")
+            let product = current_weather_model().primary_product();
+            let elevation = current_product_sampling(product)
                 .map(surface_pressure_elevation)
                 .or_else(|| {
-                    gfs013_model_location(snapshot, decoder, latitude, longitude)
+                    weather_model_location(snapshot, decoder, latitude, longitude)
                         .ok()
                         .flatten()
                         .map(|(_, _, elevation)| elevation)
@@ -1465,7 +2166,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let sampling = gfs013_sampling(snapshot, decoder, latitude, longitude)?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
             let extraterrestrial = extra_terrestrial_radiation_backwards(
                 time,
                 3600,
@@ -1492,6 +2193,11 @@ pub fn read_variable_value(
                 longitude,
             )? * 0.7);
         }
+        "showers" if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+            // Open-Meteo's EcmwfReader exposes zero convective precipitation
+            // for deterministic IFS. The raw showers field is AIFS-only.
+            return Ok(0.0);
+        }
         "rain" => {
             let swe = read_direct(
                 snapshot,
@@ -1509,7 +2215,11 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let showers = read_direct(snapshot, decoder, "showers", time, latitude, longitude)?;
+            let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                0.0
+            } else {
+                read_direct(snapshot, decoder, "showers", time, latitude, longitude)?
+            };
             if !precipitation.is_finite() || !swe.is_finite() || !showers.is_finite() {
                 return Ok(f32::NAN);
             }
@@ -1614,6 +2324,9 @@ pub fn read_variable_value(
         | "winddirection_100m"
         | "wind_direction_120m"
         | "winddirection_120m" => {
+            if current_weather_model() == WeatherModel::EcmwfIfs025 && variable.contains("120m") {
+                bail!("variable/time is not available for ECMWF IFS025: {variable} {time}");
+            }
             let u = read_direct(
                 snapshot,
                 decoder,
@@ -1633,6 +2346,9 @@ pub fn read_variable_value(
             return Ok(wind_direction(u, v));
         }
         "wind_speed_120m" | "windspeed_120m" => {
+            if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                bail!("variable/time is not available for ECMWF IFS025: {variable} {time}");
+            }
             let u = read_direct(
                 snapshot,
                 decoder,
@@ -1652,6 +2368,9 @@ pub fn read_variable_value(
             return Ok((u * u + v * v).sqrt() * wind_scale_factor(100.0, 120.0));
         }
         "temperature_120m" => {
+            if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                bail!("variable/time is not available for ECMWF IFS025: {variable} {time}");
+            }
             return read_direct(
                 snapshot,
                 decoder,
@@ -1659,7 +2378,25 @@ pub fn read_variable_value(
                 time,
                 latitude,
                 longitude,
-            )
+            );
+        }
+        "diffuse_radiation" if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+            let shortwave = read_direct(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
+            return Ok(backwards_diffuse_radiation(
+                shortwave,
+                time,
+                3600,
+                sampling.latitude as f32,
+                sampling.longitude as f32,
+            ));
         }
         "direct_radiation" => {
             let shortwave = read_direct(
@@ -1670,14 +2407,25 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let diffuse = read_direct(
-                snapshot,
-                decoder,
-                "diffuse_radiation",
-                time,
-                latitude,
-                longitude,
-            )?;
+            let diffuse = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
+                backwards_diffuse_radiation(
+                    shortwave,
+                    time,
+                    3600,
+                    sampling.latitude as f32,
+                    sampling.longitude as f32,
+                )
+            } else {
+                read_direct(
+                    snapshot,
+                    decoder,
+                    "diffuse_radiation",
+                    time,
+                    latitude,
+                    longitude,
+                )?
+            };
             return Ok(shortwave - diffuse);
         }
         "shortwave_radiation_instant"
@@ -1693,7 +2441,7 @@ pub fn read_variable_value(
                     latitude,
                     longitude,
                 )?,
-                "diffuse_radiation_instant" => read_direct(
+                "diffuse_radiation_instant" => read_variable_value(
                     snapshot,
                     decoder,
                     "diffuse_radiation",
@@ -1710,7 +2458,7 @@ pub fn read_variable_value(
                     longitude,
                 )?,
             };
-            let sampling = gfs013_sampling(snapshot, decoder, latitude, longitude)?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
             return Ok(raw
                 * backwards_to_instant_factor(
                     time,
@@ -1728,7 +2476,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let sampling = gfs013_sampling(snapshot, decoder, latitude, longitude)?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
             return Ok(backwards_direct_normal_irradiance(
                 direct,
                 time,
@@ -1757,7 +2505,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let sampling = gfs013_sampling(snapshot, decoder, latitude, longitude)?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
             return Ok(backwards_sunshine_duration(
                 direct,
                 time,
@@ -1767,7 +2515,7 @@ pub fn read_variable_value(
             ));
         }
         "is_day" => {
-            let sampling = gfs013_sampling(snapshot, decoder, latitude, longitude)?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
             return Ok(is_day(
                 time,
                 sampling.latitude as f32,
@@ -1845,13 +2593,12 @@ fn read_derived_pressure(
     let Some((name, level_text)) = variable.rsplit_once('_') else {
         return Ok(None);
     };
-    if level_text
+    let Some(level) = level_text
         .strip_suffix("hPa")
         .and_then(|value| value.parse::<u16>().ok())
-        .is_none()
-    {
+    else {
         return Ok(None);
-    }
+    };
     let raw = |prefix: &str| format!("{prefix}_{level_text}");
     let value = match name {
         "wind_speed" | "windspeed" => {
@@ -1911,6 +2658,20 @@ fn read_derived_pressure(
             )?;
             Some(dew_point(temperature, relative_humidity))
         }
+        "cloudcover" | "cloud_cover" if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+            let relative_humidity = read_direct(
+                snapshot,
+                decoder,
+                &raw("relative_humidity"),
+                time,
+                latitude,
+                longitude,
+            )?;
+            Some(relative_humidity_to_cloud_cover(
+                relative_humidity,
+                level as f32,
+            ))
+        }
         "cloudcover" => Some(read_direct(
             snapshot,
             decoder,
@@ -1947,6 +2708,11 @@ pub fn read_variable_grid(
 ) -> Result<Vec<f32>> {
     if latitudes.is_empty() || longitudes.is_empty() {
         bail!("regional grid dimensions must not be empty");
+    }
+    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        let mut frames =
+            read_variable_grid_series(snapshot, decoder, variable, &[time], latitudes, longitudes)?;
+        return Ok(frames.remove(0));
     }
     let combine2 = |left: Vec<f32>, right: Vec<f32>, op: fn(f32, f32) -> f32| {
         left.into_iter().zip(right).map(|(a, b)| op(a, b)).collect()
@@ -1993,7 +2759,7 @@ pub fn read_variable_grid(
                 true,
             )?;
             let elevation =
-                read_gfs_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?;
+                read_weather_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?;
             Ok(temperature
                 .into_iter()
                 .zip(pressure)
@@ -2018,6 +2784,48 @@ pub fn read_variable_grid(
         .into_iter()
         .map(|value| value * 0.7)
         .collect()),
+        "showers" if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+            Ok(vec![0.0; latitudes.len() * longitudes.len()])
+        }
+        "rain" => {
+            let precipitation = read_direct_grid(
+                snapshot,
+                decoder,
+                "precipitation",
+                time,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let snowfall = read_direct_grid(
+                snapshot,
+                decoder,
+                "snowfall_water_equivalent",
+                time,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                vec![0.0; precipitation.len()]
+            } else {
+                read_direct_grid(
+                    snapshot, decoder, "showers", time, latitudes, longitudes, true,
+                )?
+            };
+            Ok(precipitation
+                .into_iter()
+                .zip(snowfall)
+                .zip(showers)
+                .map(|((precipitation, snowfall), showers)| {
+                    if precipitation.is_finite() && snowfall.is_finite() && showers.is_finite() {
+                        (precipitation - snowfall - showers).max(0.0)
+                    } else {
+                        f32::NAN
+                    }
+                })
+                .collect())
+        }
         "cloudcover" => read_direct_grid(
             snapshot,
             decoder,
@@ -2069,6 +2877,15 @@ pub fn read_variable_grid(
     }
 }
 
+fn series_dt_seconds(times: &[DateTime<Utc>]) -> i64 {
+    times
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).num_seconds())
+        .filter(|seconds| *seconds > 0)
+        .min()
+        .unwrap_or(3600)
+}
+
 /// Read several regional output hours while allowing native 3D OM files to be
 /// decoded as one time slab. Open-Meteo stores the complete run time axis in a
 /// single chunk, so decoding one hour at a time repeatedly inflates the same
@@ -2084,12 +2901,29 @@ pub fn read_variable_grid_series(
     if times.is_empty() || latitudes.is_empty() || longitudes.is_empty() {
         bail!("regional grid series dimensions must not be empty");
     }
+    let ecmwf_latitudes;
+    let ecmwf_longitudes;
+    let (latitudes, longitudes) = if current_weather_model() == WeatherModel::EcmwfIfs025
+        && latitudes.len() == 1
+        && longitudes.len() == 1
+    {
+        if let Some(sampling) = current_product_sampling("ecmwf_ifs025") {
+            ecmwf_latitudes = [sampling.latitude];
+            ecmwf_longitudes = [sampling.longitude];
+            (&ecmwf_latitudes[..], &ecmwf_longitudes[..])
+        } else {
+            (latitudes, longitudes)
+        }
+    } else {
+        (latitudes, longitudes)
+    };
     let combine2 = |left: Vec<Vec<f32>>, right: Vec<Vec<f32>>, op: fn(f32, f32) -> f32| {
         left.into_iter()
             .zip(right)
             .map(|(left, right)| left.into_iter().zip(right).map(|(a, b)| op(a, b)).collect())
             .collect()
     };
+    let dt_seconds = series_dt_seconds(times);
     if let Some((name, level_text)) = variable.rsplit_once('_') {
         if level_text
             .strip_suffix("hPa")
@@ -2167,6 +3001,31 @@ pub fn read_variable_grid_series(
                         dew_point,
                     ));
                 }
+                "cloudcover" | "cloud_cover"
+                    if current_weather_model() == WeatherModel::EcmwfIfs025 =>
+                {
+                    let level = level_text
+                        .strip_suffix("hPa")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .context("invalid ECMWF pressure level")?;
+                    return Ok(read_direct_grid_series(
+                        snapshot,
+                        decoder,
+                        &raw("relative_humidity"),
+                        times,
+                        latitudes,
+                        longitudes,
+                        true,
+                    )?
+                    .into_iter()
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .map(|rh| relative_humidity_to_cloud_cover(rh, level))
+                            .collect()
+                    })
+                    .collect());
+                }
                 "cloudcover" => {
                     return read_direct_grid_series(
                         snapshot,
@@ -2215,6 +3074,125 @@ pub fn read_variable_grid_series(
             )?,
             dew_point,
         )),
+        "wet_bulb_temperature_2m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "relative_humidity_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            wet_bulb_temperature,
+        )),
+        "vapour_pressure_deficit" | "vapor_pressure_deficit" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "relative_humidity_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            |temperature, humidity| {
+                vapor_pressure_deficit(temperature, dew_point(temperature, humidity))
+            },
+        )),
+        "skin_temperature" | "soil_temperature_0cm" => read_direct_grid_series(
+            snapshot,
+            decoder,
+            "surface_temperature",
+            times,
+            latitudes,
+            longitudes,
+            true,
+        ),
+        "soil_temperature_0_to_100cm" | "soil_moisture_0_to_100cm" => {
+            let prefix = if variable.starts_with("soil_temperature") {
+                "soil_temperature"
+            } else {
+                "soil_moisture"
+            };
+            let shallow = read_direct_grid_series(
+                snapshot,
+                decoder,
+                &format!("{prefix}_0_to_7cm"),
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let middle = read_direct_grid_series(
+                snapshot,
+                decoder,
+                &format!("{prefix}_7_to_28cm"),
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let deep = read_direct_grid_series(
+                snapshot,
+                decoder,
+                &format!("{prefix}_28_to_100cm"),
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            Ok(shallow
+                .into_iter()
+                .zip(middle)
+                .zip(deep)
+                .map(|((shallow, middle), deep)| {
+                    shallow
+                        .into_iter()
+                        .zip(middle)
+                        .zip(deep)
+                        .map(|((shallow, middle), deep)| {
+                            shallow * 0.07 + middle * 0.21 + deep * 0.72
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "growing_degree_days_base_0_limit_50" => Ok(read_direct_grid_series(
+            snapshot,
+            decoder,
+            "temperature_2m",
+            times,
+            latitudes,
+            longitudes,
+            true,
+        )?
+        .into_iter()
+        .map(|frame| {
+            frame
+                .into_iter()
+                .map(|temperature| temperature.clamp(0.0, 50.0) / 24.0)
+                .collect()
+        })
+        .collect()),
         "surface_pressure" => {
             let temperature = read_direct_grid_series(
                 snapshot,
@@ -2234,10 +3212,11 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?;
-            let elevation = if let Some(sampling) = current_product_sampling("gfs013_surface") {
+            let primary_product = current_weather_model().primary_product();
+            let elevation = if let Some(sampling) = current_product_sampling(primary_product) {
                 vec![surface_pressure_elevation(sampling); latitudes.len() * longitudes.len()]
             } else {
-                read_gfs_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?
+                read_weather_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?
             };
             Ok(temperature
                 .into_iter()
@@ -2328,6 +3307,257 @@ pub fn read_variable_grid_series(
                 })
                 .collect())
         }
+        "diffuse_radiation" => {
+            let shortwave = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let width = longitudes.len();
+            Ok(shortwave
+                .into_iter()
+                .zip(times)
+                .map(|(frame, time)| {
+                    frame
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            backwards_diffuse_radiation(
+                                value,
+                                *time,
+                                dt_seconds,
+                                latitudes[index / width] as f32,
+                                longitudes[index % width] as f32,
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "direct_radiation" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_variable_grid_series(
+                snapshot,
+                decoder,
+                "diffuse_radiation",
+                times,
+                latitudes,
+                longitudes,
+            )?,
+            |shortwave, diffuse| shortwave - diffuse,
+        )),
+        "shortwave_radiation_instant"
+        | "direct_radiation_instant"
+        | "diffuse_radiation_instant"
+        | "global_tilted_irradiance_instant" => {
+            let source = match variable {
+                "direct_radiation_instant" => "direct_radiation",
+                "diffuse_radiation_instant" => "diffuse_radiation",
+                _ => "shortwave_radiation",
+            };
+            let values =
+                read_variable_grid_series(snapshot, decoder, source, times, latitudes, longitudes)?;
+            let width = longitudes.len();
+            Ok(values
+                .into_iter()
+                .zip(times)
+                .map(|(frame, time)| {
+                    frame
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            value
+                                * backwards_to_instant_factor(
+                                    *time,
+                                    dt_seconds,
+                                    latitudes[index / width] as f32,
+                                    longitudes[index % width] as f32,
+                                )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "direct_normal_irradiance" | "direct_normal_irradiance_instant" => {
+            let direct = read_variable_grid_series(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                times,
+                latitudes,
+                longitudes,
+            )?;
+            let instant = variable.ends_with("_instant");
+            let width = longitudes.len();
+            Ok(direct
+                .into_iter()
+                .zip(times)
+                .map(|(frame, time)| {
+                    frame
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            backwards_direct_normal_irradiance(
+                                value,
+                                *time,
+                                dt_seconds,
+                                latitudes[index / width] as f32,
+                                longitudes[index % width] as f32,
+                                instant,
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "global_tilted_irradiance" => read_direct_grid_series(
+            snapshot,
+            decoder,
+            "shortwave_radiation",
+            times,
+            latitudes,
+            longitudes,
+            true,
+        ),
+        "sunshine_duration" => {
+            let direct = read_variable_grid_series(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                times,
+                latitudes,
+                longitudes,
+            )?;
+            let width = longitudes.len();
+            Ok(direct
+                .into_iter()
+                .zip(times)
+                .map(|(frame, time)| {
+                    frame
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            backwards_sunshine_duration(
+                                value,
+                                *time,
+                                dt_seconds,
+                                latitudes[index / width] as f32,
+                                longitudes[index % width] as f32,
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "is_day" => {
+            let width = longitudes.len();
+            Ok(times
+                .iter()
+                .map(|time| {
+                    (0..latitudes.len() * longitudes.len())
+                        .map(|index| {
+                            is_day(
+                                *time,
+                                latitudes[index / width] as f32,
+                                longitudes[index % width] as f32,
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+        "et0_fao_evapotranspiration" => {
+            let temperature = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let humidity = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "relative_humidity_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let shortwave = read_direct_grid_series(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?;
+            let wind = read_variable_grid_series(
+                snapshot,
+                decoder,
+                "wind_speed_10m",
+                times,
+                latitudes,
+                longitudes,
+            )?;
+            let elevation = if let Some(sampling) =
+                current_product_sampling(current_weather_model().primary_product())
+            {
+                vec![sampling.target_elevation; latitudes.len() * longitudes.len()]
+            } else {
+                read_weather_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?
+            };
+            let width = longitudes.len();
+            Ok(temperature
+                .into_iter()
+                .zip(humidity)
+                .zip(shortwave)
+                .zip(wind)
+                .zip(times)
+                .map(|((((temperature, humidity), shortwave), wind), time)| {
+                    temperature
+                        .into_iter()
+                        .zip(humidity)
+                        .zip(shortwave)
+                        .zip(wind)
+                        .zip(elevation.iter().copied())
+                        .enumerate()
+                        .map(
+                            |(index, ((((temperature, humidity), shortwave), wind), elevation))| {
+                                et0_evapotranspiration(
+                                    temperature,
+                                    wind,
+                                    dew_point(temperature, humidity),
+                                    shortwave,
+                                    elevation,
+                                    extra_terrestrial_radiation_backwards(
+                                        *time,
+                                        dt_seconds,
+                                        latitudes[index / width] as f32,
+                                        longitudes[index % width] as f32,
+                                    ),
+                                    dt_seconds,
+                                )
+                            },
+                        )
+                        .collect()
+                })
+                .collect())
+        }
         "rain" => {
             let precipitation = read_direct_grid_series(
                 snapshot,
@@ -2347,9 +3577,13 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?;
-            let showers = read_direct_grid_series(
-                snapshot, decoder, "showers", times, latitudes, longitudes, true,
-            )?;
+            let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                vec![vec![0.0; latitudes.len() * longitudes.len()]; times.len()]
+            } else {
+                read_direct_grid_series(
+                    snapshot, decoder, "showers", times, latitudes, longitudes, true,
+                )?
+            };
             Ok(precipitation
                 .into_iter()
                 .zip(snowfall)
@@ -2373,6 +3607,10 @@ pub fn read_variable_grid_series(
                 })
                 .collect())
         }
+        "showers" if current_weather_model() == WeatherModel::EcmwfIfs025 => Ok(vec![
+            vec![0.0; latitudes.len() * longitudes.len()];
+            times.len()
+        ]),
         "wind_speed_10m" | "windspeed_10m" => Ok(combine2(
             read_direct_grid_series(
                 snapshot,
@@ -2408,6 +3646,48 @@ pub fn read_variable_grid_series(
                 snapshot,
                 decoder,
                 "wind_v_component_10m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            wind_direction,
+        )),
+        "wind_speed_100m" | "windspeed_100m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_100m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_100m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            |u, v| (u * u + v * v).sqrt(),
+        )),
+        "wind_direction_100m" | "winddirection_100m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_100m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_100m",
                 times,
                 latitudes,
                 longitudes,
@@ -2488,6 +3768,28 @@ fn read_variable_point_series(
 ) -> Result<Option<Vec<f32>>> {
     let seed = seed_variable_for_times(variable);
     let (product, _) = product_for_variable(snapshot, &seed)?;
+    if product == "ecmwf_ifs025" {
+        let values = read_variable_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            &[latitude],
+            &[longitude],
+        )?
+        .into_iter()
+        .map(|mut values| {
+            if values.len() != 1 {
+                bail!(
+                    "point time-slab decode returned {} grid values",
+                    values.len()
+                );
+            }
+            Ok(values.remove(0))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(values));
+    }
     if !is_gfs_product(product) {
         return Ok(None);
     }
@@ -3357,7 +4659,7 @@ fn finite_max(values: &[f32]) -> f32 {
 fn surface_pressure(temperature: f32, pressure_msl: f32, elevation: f32) -> f32 {
     let elevation = if elevation.is_nan() { 0.0 } else { elevation };
     let t0 = temperature + 273.15 + 0.0065 * elevation;
-    let factor = (1.0 - (0.0065 * elevation) / t0).powf(-5.255_781_3);
+    let factor = (1.0 - (0.0065 * elevation) / t0).powf(-5.255_781);
     pressure_msl / factor
 }
 
@@ -3369,20 +4671,21 @@ fn surface_pressure_elevation(sampling: ModelSampling) -> f32 {
     }
 }
 
-fn read_gfs_surface_elevation_grid(
+fn read_weather_surface_elevation_grid(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     latitudes: &[f64],
     longitudes: &[f64],
 ) -> Result<Vec<f32>> {
-    let product = snapshot.require_product("gfs013_surface")?;
+    let model = current_weather_model();
+    let product = snapshot.require_product(model.primary_product())?;
     let mut values = if let Some(entry) = product.static_entries.get("surface_elevation") {
         read_entry_grid(&product, entry, decoder, latitudes, longitudes)?
     } else {
         read_static_elevation_grid_for_coordinates(
             snapshot,
             decoder,
-            GFS013_STATIC_SPEC,
+            model.static_elevation_spec(),
             latitudes,
             longitudes,
         )?
@@ -3466,6 +4769,18 @@ fn read_direct_grid(
 ) -> Result<Vec<f32>> {
     if variable == "carbon_monoxide" {
         bail!("regional carbon_monoxide mixing is not implemented");
+    }
+    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        let mut frames = read_direct_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            &[time],
+            latitudes,
+            longitudes,
+            round_values,
+        )?;
+        return Ok(frames.remove(0));
     }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     let products = snapshot.product_snapshots(product_name);
@@ -3608,6 +4923,27 @@ fn read_direct_grid_series(
         (latitudes, longitudes)
     };
     let products = snapshot.product_snapshots(product_name);
+    if product_name == "ecmwf_ifs025" {
+        let product = products
+            .first()
+            .context("ECMWF IFS025 product snapshot is not available")?;
+        let mut values = read_ecmwf_product_grid_series(
+            product,
+            decoder,
+            variable,
+            &raw_variable,
+            times,
+            latitudes,
+            longitudes,
+        )?
+        .with_context(|| format!("variable/time is not available: {raw_variable}"))?;
+        for frame in &mut values {
+            for value in frame {
+                *value = apply_elevation_correction(product_name, variable, *value);
+            }
+        }
+        return Ok(values);
+    }
     if is_gfs_product(product_name) {
         let full_products = products
             .iter()
@@ -4125,6 +5461,587 @@ fn read_exact_native_grid_series(
     Ok(Some(output))
 }
 
+#[derive(Debug)]
+struct EcmwfRegularRun {
+    source_run: String,
+    start: DateTime<Utc>,
+    frames: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EcmwfRegularCacheKey {
+    coverage_id: String,
+    raw_variable: String,
+    latitudes: Vec<u64>,
+    longitudes: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct EcmwfRegularSeries {
+    times: Vec<DateTime<Utc>>,
+    frames: Vec<Vec<f32>>,
+}
+
+#[cfg(test)]
+static ECMWF_REGULAR_SERIES_BUILD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn interpolate_ecmwf_backwards_in_place(values: &mut [f32], is_summation: bool) {
+    let mut first_valid = values.len();
+    for (index, value) in values.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if first_valid == values.len() {
+            first_valid = index;
+            continue;
+        }
+        first_valid = first_valid.saturating_sub(index - first_valid - 1);
+        break;
+    }
+    if first_valid >= values.len() {
+        return;
+    }
+
+    let mut previous_index = first_valid as isize - 1;
+    for index in first_valid..values.len() {
+        if !values[index].is_nan() {
+            previous_index = index as isize;
+            continue;
+        }
+        let Some(next) = (index..values.len()).find(|next| !values[*next].is_nan()) else {
+            break;
+        };
+        let value = values[next];
+        let divisor = (next as isize - previous_index) as f32;
+        for target in values.iter_mut().take(next + 1).skip(index) {
+            *target = if is_summation { value / divisor } else { value };
+        }
+    }
+}
+
+fn interpolate_ecmwf_linear_in_place(values: &mut [f32]) {
+    let mut previous_value = f32::NAN;
+    let mut previous_index = 0usize;
+    for index in 0..values.len() {
+        if !values[index].is_nan() {
+            previous_value = values[index];
+            previous_index = index;
+            continue;
+        }
+        let Some(next) = (index..values.len()).find(|next| !values[*next].is_nan()) else {
+            break;
+        };
+        let next_value = values[next];
+        for (offset, target_value) in values[index..next].iter_mut().enumerate() {
+            let target = index + offset;
+            let fraction = (target - previous_index) as f32 / (next - previous_index) as f32;
+            *target_value = next_value * fraction + previous_value * (1.0 - fraction);
+        }
+    }
+}
+
+fn interpolate_ecmwf_hermite_in_place(values: &mut [f32], bounds: Option<(f32, f32)>) {
+    let mut width = 0usize;
+    for index in 0..values.len() {
+        if !values[index].is_nan() {
+            continue;
+        }
+        let mut c = f32::NAN;
+        let mut d = f32::NAN;
+        let mut pos_c = 0usize;
+        let mut pos_d = 0usize;
+        for (next, &value) in values.iter().enumerate().skip(index) {
+            if value.is_nan() {
+                continue;
+            }
+            if c.is_nan() {
+                c = value;
+                pos_c = next;
+            } else {
+                d = value;
+                pos_d = next;
+                break;
+            }
+        }
+        if c.is_nan() {
+            break;
+        }
+        if d.is_nan() {
+            d = c;
+        } else {
+            width = pos_d - pos_c;
+        }
+        let pos_b = pos_c.saturating_sub(width);
+        let pos_a = pos_b.checked_sub(width).unwrap_or(pos_b);
+        let b = values[pos_b];
+        let a = values[pos_a];
+        let coefficient_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+        let coefficient_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+        let coefficient_c = -a / 2.0 + c / 2.0;
+        for (offset, target_value) in values[index..pos_c].iter_mut().enumerate() {
+            if pos_c == pos_b {
+                break;
+            }
+            let target = index + offset;
+            let fraction = (target - pos_b) as f32 / (pos_c - pos_b) as f32;
+            let mut interpolated = coefficient_a * fraction * fraction * fraction
+                + coefficient_b * fraction * fraction
+                + coefficient_c * fraction
+                + b;
+            if let Some((lower, upper)) = bounds {
+                interpolated = interpolated.clamp(lower, upper);
+            }
+            *target_value = interpolated;
+        }
+    }
+}
+
+fn ecmwf_clear_sky_factor(time: DateTime<Utc>, latitude: f32, longitude: f32) -> f32 {
+    let solar = extra_terrestrial_radiation_factor_backwards(time, 3 * 3600, latitude, longitude);
+    if solar <= 0.0 {
+        0.0
+    } else {
+        solar * (-0.09_f32 / solar).exp()
+    }
+}
+
+fn interpolate_ecmwf_solar_first_stage(
+    values: &mut [f32],
+    start: DateTime<Utc>,
+    latitude: f32,
+    longitude: f32,
+) {
+    if !values.iter().any(|value| value.is_nan()) {
+        return;
+    }
+    let mut first_valid = values.len();
+    for (index, value) in values.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        if first_valid == values.len() {
+            first_valid = index;
+            continue;
+        }
+        first_valid = first_valid.saturating_sub(index - first_valid - 1);
+        break;
+    }
+    if first_valid >= values.len() {
+        return;
+    }
+    let solar = (0..values.len())
+        .map(|index| {
+            ecmwf_clear_sky_factor(
+                start + Duration::hours(index as i64 * 3),
+                latitude,
+                longitude,
+            )
+        })
+        .collect::<Vec<_>>();
+    let radiation_limit = SOLAR_CONSTANT * 0.95;
+    let radiation_minimum = 5.0 / SOLAR_CONSTANT;
+    for missing in first_valid..values.len() {
+        if !values[missing].is_nan() || missing == 0 {
+            continue;
+        }
+        let pos_b = missing - 1;
+        let search_end = (missing + 6).min(values.len());
+        let Some(pos_c) = ((missing + 1)..search_end).find(|index| !values[*index].is_nan()) else {
+            break;
+        };
+        let width = pos_c - pos_b;
+        let solar_average = solar[(pos_b + 1)..=pos_c].iter().sum::<f32>() / width as f32;
+        let kt_c = if solar_average <= radiation_minimum || values[pos_c] <= 0.0 {
+            f32::NAN
+        } else {
+            (values[pos_c] / solar_average).min(radiation_limit)
+        };
+        let kt = if kt_c.is_nan() { 0.0 } else { kt_c.max(0.0) };
+        for target in missing..pos_c {
+            values[target] = kt * solar[target];
+        }
+        values[pos_c] = kt * solar[pos_c];
+    }
+}
+
+fn ecmwf_first_stage_point(
+    values: &mut [f32],
+    kind: InterpolationKind,
+    start: DateTime<Utc>,
+    latitude: f32,
+    longitude: f32,
+) {
+    match kind {
+        InterpolationKind::Direct => {}
+        InterpolationKind::BackwardsSum { .. } => {
+            interpolate_ecmwf_backwards_in_place(values, true)
+        }
+        InterpolationKind::Backwards { .. } => interpolate_ecmwf_backwards_in_place(values, false),
+        InterpolationKind::Linear { .. } => interpolate_ecmwf_linear_in_place(values),
+        InterpolationKind::Hermite { bounds, .. } => {
+            interpolate_ecmwf_hermite_in_place(values, bounds)
+        }
+        InterpolationKind::SolarBackwardsAveraged { .. } => {
+            interpolate_ecmwf_solar_first_stage(values, start, latitude, longitude)
+        }
+    }
+    let scalefactor = match kind {
+        InterpolationKind::Direct => return,
+        InterpolationKind::BackwardsSum { scalefactor }
+        | InterpolationKind::Backwards { scalefactor }
+        | InterpolationKind::Linear { scalefactor }
+        | InterpolationKind::Hermite { scalefactor, .. }
+        | InterpolationKind::SolarBackwardsAveraged { scalefactor } => scalefactor,
+    };
+    for value in values.iter_mut().filter(|value| value.is_finite()) {
+        *value = round_to_scalefactor(*value, scalefactor);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ecmwf_regularize_source_run(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    source_run: &str,
+    raw_variable: &str,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<EcmwfRegularRun>> {
+    let mut entries = product
+        .entries_by_source_run
+        .get(source_run)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.variable == raw_variable)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    entries.sort_by_key(|entry| entry.coverage_forecast_hour.unwrap_or(entry.forecast_hour));
+    let logical_hour =
+        |entry: &BundleEntry| entry.coverage_forecast_hour.unwrap_or(entry.forecast_hour);
+    let min_hour = entries
+        .iter()
+        .map(|entry| logical_hour(entry))
+        .min()
+        .unwrap();
+    let max_hour = entries
+        .iter()
+        .map(|entry| logical_hour(entry))
+        .max()
+        .unwrap();
+    if min_hour < 0 || min_hour % 3 != 0 || max_hour % 3 != 0 {
+        bail!("ECMWF native forecast hours are not aligned to the 3-hour conversion axis");
+    }
+    let base = entries[0].valid_time_utc - Duration::hours(logical_hour(entries[0]));
+    if entries
+        .iter()
+        .any(|entry| entry.valid_time_utc - Duration::hours(logical_hour(entry)) != base)
+    {
+        bail!("ECMWF logical source run has inconsistent reference times: {source_run}");
+    }
+    let start = base + Duration::hours(min_hour);
+    let count = usize::try_from((max_hour - min_hour) / 3 + 1)?;
+    let grid_len = latitudes.len() * longitudes.len();
+    let mut frames = vec![vec![f32::NAN; grid_len]; count];
+    for entry in entries {
+        let index = usize::try_from((logical_hour(entry) - min_hour) / 3)?;
+        frames[index] = read_entry_grid(product, entry, decoder, latitudes, longitudes)?;
+    }
+
+    let kind = ecmwf_interpolation_kind(raw_variable);
+    let width = longitudes.len();
+    for point in 0..grid_len {
+        let mut values = frames.iter().map(|frame| frame[point]).collect::<Vec<_>>();
+        ecmwf_first_stage_point(
+            &mut values,
+            kind,
+            start,
+            latitudes[point / width] as f32,
+            longitudes[point % width] as f32,
+        );
+        for (frame, value) in frames.iter_mut().zip(values) {
+            frame[point] = value;
+        }
+    }
+    Ok(Some(EcmwfRegularRun {
+        source_run: source_run.to_string(),
+        start,
+        frames,
+    }))
+}
+
+fn ecmwf_second_stage_value(
+    values: &[f32],
+    regular_times: &[DateTime<Utc>],
+    kind: InterpolationKind,
+    time: DateTime<Utc>,
+    latitude: f32,
+    longitude: f32,
+    output_dt_seconds: i64,
+) -> f32 {
+    if values.is_empty() || time < regular_times[0] || time > regular_times[regular_times.len() - 1]
+    {
+        return f32::NAN;
+    }
+    let elapsed = (time - regular_times[0]).num_seconds();
+    let output_dt_seconds = output_dt_seconds.max(1);
+    let regular_dt_seconds = regular_times
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).num_seconds())
+        .find(|seconds| *seconds > 0)
+        .unwrap_or(3 * 3600);
+    let scalefactor = match kind {
+        InterpolationKind::Direct => 1.0,
+        InterpolationKind::BackwardsSum { scalefactor }
+        | InterpolationKind::Backwards { scalefactor }
+        | InterpolationKind::Linear { scalefactor }
+        | InterpolationKind::Hermite { scalefactor, .. }
+        | InterpolationKind::SolarBackwardsAveraged { scalefactor } => scalefactor,
+    };
+    match kind {
+        InterpolationKind::Direct => {
+            if elapsed % regular_dt_seconds == 0 {
+                usize::try_from(elapsed / regular_dt_seconds)
+                    .ok()
+                    .and_then(|index| values.get(index))
+                    .copied()
+                    .unwrap_or(f32::NAN)
+            } else {
+                f32::NAN
+            }
+        }
+        InterpolationKind::BackwardsSum { .. } | InterpolationKind::Backwards { .. } => {
+            let index = (elapsed - output_dt_seconds).div_euclid(regular_dt_seconds) + 1;
+            let index = index.clamp(0, values.len() as i64 - 1) as usize;
+            let multiply = if matches!(kind, InterpolationKind::BackwardsSum { .. }) {
+                output_dt_seconds as f32 / regular_dt_seconds as f32
+            } else {
+                1.0
+            };
+            round_to_scalefactor(values[index] * multiply, scalefactor)
+        }
+        InterpolationKind::Linear { .. } => {
+            let index =
+                usize::try_from(elapsed.div_euclid(regular_dt_seconds)).unwrap_or(usize::MAX);
+            if index >= values.len() {
+                return f32::NAN;
+            }
+            let fraction =
+                elapsed.rem_euclid(regular_dt_seconds) as f32 / regular_dt_seconds as f32;
+            let b = values.get(index + 1).copied().unwrap_or(values[index]);
+            round_to_scalefactor(values[index] * (1.0 - fraction) + b * fraction, scalefactor)
+        }
+        InterpolationKind::Hermite { bounds, .. } => {
+            let index =
+                usize::try_from(elapsed.div_euclid(regular_dt_seconds)).unwrap_or(usize::MAX);
+            if index >= values.len() || values[index].is_nan() {
+                return f32::NAN;
+            }
+            let fraction =
+                elapsed.rem_euclid(regular_dt_seconds) as f32 / regular_dt_seconds as f32;
+            let b = values[index];
+            let a = if index == 0 || values[index - 1].is_nan() {
+                b
+            } else {
+                values[index - 1]
+            };
+            let c = values
+                .get(index + 1)
+                .copied()
+                .filter(|value| !value.is_nan())
+                .unwrap_or(b);
+            let d = values
+                .get(index + 2)
+                .copied()
+                .filter(|value| !value.is_nan())
+                .unwrap_or(b);
+            let coefficient_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+            let coefficient_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+            let coefficient_c = -a / 2.0 + c / 2.0;
+            let value = coefficient_a * fraction * fraction * fraction
+                + coefficient_b * fraction * fraction
+                + coefficient_c * fraction
+                + b;
+            let value = round_to_scalefactor(value, scalefactor);
+            bounds.map_or(value, |(lower, upper)| value.clamp(lower, upper))
+        }
+        InterpolationKind::SolarBackwardsAveraged { .. } => {
+            let Some(position) =
+                solar_interpolation_position(regular_times, time, output_dt_seconds)
+            else {
+                return f32::NAN;
+            };
+            interpolate_solar_backwards_value(
+                [
+                    values[position.a],
+                    values[position.b],
+                    values[position.c],
+                    values[position.d],
+                ],
+                regular_times,
+                position,
+                time,
+                latitude,
+                longitude,
+                scalefactor,
+                true,
+                output_dt_seconds,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ecmwf_regular_series(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<EcmwfRegularSeries>> {
+    if product.product != "ecmwf_ifs025" {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    ECMWF_REGULAR_SERIES_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut source_runs = product
+        .entries_by_source_run
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    source_runs.sort();
+    let mut runs = Vec::new();
+    for source_run in source_runs {
+        if let Some(run) = ecmwf_regularize_source_run(
+            product,
+            decoder,
+            &source_run,
+            raw_variable,
+            latitudes,
+            longitudes,
+        )? {
+            runs.push(run);
+        }
+    }
+    if runs.is_empty() {
+        return Ok(None);
+    }
+
+    // Oldest-to-newest insertion reproduces Open-Meteo's rolling database:
+    // newer runs overwrite only their own regular 3-hour horizon.
+    runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
+    let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
+    for run in runs {
+        for (index, frame) in run.frames.into_iter().enumerate() {
+            stitched.insert(run.start + Duration::hours(index as i64 * 3), frame);
+        }
+    }
+    let first = *stitched
+        .keys()
+        .next()
+        .context("ECMWF regular series is empty")?;
+    let last = *stitched
+        .keys()
+        .next_back()
+        .context("ECMWF regular series is empty")?;
+    let count = usize::try_from((last - first).num_hours() / 3 + 1)?;
+    let grid_len = latitudes.len() * longitudes.len();
+    let mut regular_times = Vec::with_capacity(count);
+    let mut regular_frames = Vec::with_capacity(count);
+    for index in 0..count {
+        let time = first + Duration::hours(index as i64 * 3);
+        regular_times.push(time);
+        regular_frames.push(
+            stitched
+                .remove(&time)
+                .unwrap_or_else(|| vec![f32::NAN; grid_len]),
+        );
+    }
+    Ok(Some(EcmwfRegularSeries {
+        times: regular_times,
+        frames: regular_frames,
+    }))
+}
+
+fn ecmwf_cached_regular_series(
+    key: EcmwfRegularCacheKey,
+    build: impl FnOnce() -> Result<Option<EcmwfRegularSeries>>,
+) -> Result<Option<Arc<EcmwfRegularSeries>>> {
+    let cached = ECMWF_REQUEST_REGULAR_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&key).cloned())
+    });
+    if cached.is_some() {
+        return Ok(cached);
+    }
+    let Some(built) = build()? else {
+        return Ok(None);
+    };
+    let built = Arc::new(built);
+    ECMWF_REQUEST_REGULAR_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(key, built.clone());
+        }
+    });
+    Ok(Some(built))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_ecmwf_product_grid_series(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    _variable: &str,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<Vec<Vec<f32>>>> {
+    if product.product != "ecmwf_ifs025" {
+        return Ok(None);
+    }
+    let key = EcmwfRegularCacheKey {
+        coverage_id: product.manifest.coverage_id.clone(),
+        raw_variable: raw_variable.to_string(),
+        latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
+        longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
+    };
+    let Some(regular) = ecmwf_cached_regular_series(key, || {
+        build_ecmwf_regular_series(product, decoder, raw_variable, latitudes, longitudes)
+    })?
+    else {
+        return Ok(None);
+    };
+    let regular_times = &regular.times;
+    let regular_frames = &regular.frames;
+    let kind = ecmwf_interpolation_kind(raw_variable);
+    let output_dt_seconds = series_dt_seconds(times);
+    let grid_len = latitudes.len() * longitudes.len();
+    let width = longitudes.len();
+    let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
+    for point in 0..grid_len {
+        let values = regular_frames
+            .iter()
+            .map(|frame| frame[point])
+            .collect::<Vec<_>>();
+        for (output_frame, time) in output.iter_mut().zip(times) {
+            output_frame[point] = ecmwf_second_stage_value(
+                &values,
+                regular_times,
+                kind,
+                *time,
+                latitudes[point / width] as f32,
+                longitudes[point % width] as f32,
+                output_dt_seconds,
+            );
+        }
+    }
+    Ok(Some(output))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_gfs_product_grid_series(
     product: &ProductSnapshot,
@@ -4530,6 +6447,7 @@ fn product_covers_time(product: &ProductSnapshot, raw_variable: &str, time: Date
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_product_value_with_rounding(
     product: &ProductSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -4620,6 +6538,160 @@ fn read_product_value_with_rounding(
     read_entry_value(product, entry, decoder, latitude, longitude)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SolarInterpolationPosition {
+    a: usize,
+    b: usize,
+    c: usize,
+    d: usize,
+    fraction: f32,
+}
+
+/// Match Open-Meteo's `interpolateSolarBackwards`: native radiation values
+/// are backward averages centred half a native interval before their valid
+/// time, while the requested value is centred half its output timestep before
+/// its timestamp.
+fn solar_interpolation_position(
+    native_times: &[DateTime<Utc>],
+    time: DateTime<Utc>,
+    output_dt_seconds: i64,
+) -> Option<SolarInterpolationPosition> {
+    if native_times.is_empty() || time > *native_times.last()? {
+        return None;
+    }
+    let centers = native_times
+        .iter()
+        .enumerate()
+        .map(|(index, native_time)| {
+            *native_time - Duration::seconds(native_dt_seconds_at(native_times, index) / 2)
+        })
+        .collect::<Vec<_>>();
+    let target_center = time - Duration::seconds(output_dt_seconds.max(1) / 2);
+    if target_center < centers[0] {
+        return None;
+    }
+    let next = centers.partition_point(|center| *center <= target_center);
+    let (b, c, fraction) = if next < centers.len() {
+        let b = next.saturating_sub(1);
+        let c = next;
+        let span = (centers[c] - centers[b]).num_seconds();
+        let fraction = if span <= 0 {
+            0.0
+        } else {
+            (target_center - centers[b]).num_seconds() as f32 / span as f32
+        };
+        (b, c, fraction)
+    } else {
+        let b = centers.len() - 1;
+        let span = native_dt_seconds_at(native_times, b).max(1);
+        let fraction = (target_center - centers[b]).num_seconds() as f32 / span as f32;
+        (b, b, fraction)
+    };
+    Some(SolarInterpolationPosition {
+        a: b.saturating_sub(1),
+        b,
+        c,
+        d: (c + 1).min(native_times.len() - 1),
+        fraction,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpolate_solar_backwards_value(
+    values: [f32; 4],
+    native_times: &[DateTime<Utc>],
+    position: SolarInterpolationPosition,
+    time: DateTime<Utc>,
+    latitude: f32,
+    longitude: f32,
+    scalefactor: f32,
+    round_values: bool,
+    output_dt_seconds: i64,
+) -> f32 {
+    const SOLAR_CONSTANT: f32 = 1367.7;
+    let [a_value, b_value, c_value, d_value] = values;
+    if b_value.is_nan() {
+        return f32::NAN;
+    }
+    let output_solar =
+        extra_terrestrial_radiation_backwards(time, output_dt_seconds.max(1), latitude, longitude)
+            / SOLAR_CONSTANT;
+    if output_solar == 0.0 {
+        return 0.0;
+    }
+    let sample_solar = |index: usize| {
+        extra_terrestrial_radiation_backwards(
+            native_times[index],
+            native_dt_seconds_at(native_times, index),
+            latitude,
+            longitude,
+        ) / SOLAR_CONSTANT
+    };
+    let minimum_solar = 5.0 / SOLAR_CONSTANT;
+    let radiation_limit = SOLAR_CONSTANT * 0.95;
+    let clearness = |value: f32, solar: f32| {
+        if solar <= minimum_solar {
+            f32::NAN
+        } else {
+            (value / solar).min(radiation_limit)
+        }
+    };
+    let mut kt_a = clearness(a_value, sample_solar(position.a));
+    let mut kt_b = clearness(b_value, sample_solar(position.b));
+    let mut kt_c = clearness(c_value, sample_solar(position.c));
+    let mut kt_d = clearness(d_value, sample_solar(position.d));
+    if kt_a.is_nan() {
+        kt_a = if !kt_b.is_nan() {
+            kt_b
+        } else if !kt_c.is_nan() {
+            kt_c
+        } else {
+            kt_d
+        };
+    }
+    if kt_b.is_nan() {
+        kt_b = if !kt_a.is_nan() {
+            kt_a
+        } else if !kt_c.is_nan() {
+            kt_c
+        } else {
+            kt_d
+        };
+    }
+    if kt_c.is_nan() {
+        kt_c = if !kt_b.is_nan() {
+            kt_b
+        } else if !kt_d.is_nan() {
+            kt_d
+        } else {
+            kt_a
+        };
+    }
+    if kt_d.is_nan() {
+        kt_d = if !kt_c.is_nan() {
+            kt_c
+        } else if !kt_b.is_nan() {
+            kt_b
+        } else {
+            kt_a
+        };
+    }
+    let fraction = position.fraction;
+    let coefficient_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
+    let coefficient_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
+    let coefficient_c = -kt_a / 2.0 + kt_c / 2.0;
+    let mut value = (coefficient_a * fraction * fraction * fraction
+        + coefficient_b * fraction * fraction
+        + coefficient_c * fraction
+        + kt_b)
+        * output_solar;
+    if value < 0.0 && b_value >= 0.0 && c_value >= 0.0 {
+        value = (kt_b * (1.0 - fraction) + kt_c * fraction) * output_solar;
+    }
+    maybe_round_to_scalefactor(value, scalefactor, round_values)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_backwards_value(
     product: &ProductSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -4999,6 +7071,7 @@ fn read_solar_backwards_grid(
         .collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_linear_value(
     product: &ProductSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -5251,6 +7324,9 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
     if is_cams_variable(variable) {
         return cams_interpolation_kind(variable);
     }
+    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        return ecmwf_interpolation_kind(variable);
+    }
     if variable.ends_with("hPa") {
         return pressure_interpolation_kind(variable);
     }
@@ -5344,6 +7420,95 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
     }
 }
 
+/// Port of `EcmwfVariable.interpolation` and `scalefactor` from the pinned
+/// Open-Meteo ECMWF source baseline. Unlike GFS, every non-accumulated ECMWF
+/// field defaults to Hermite interpolation.
+fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
+    let scalefactor = if let Some((name, level)) = pressure_variable_name_and_level(variable) {
+        match name {
+            "temperature" => interpolate_range(2.0, 10.0, fraction_in_range(300.0, 1000.0, level)),
+            "wind_u_component" | "wind_v_component" => {
+                interpolate_range(3.0, 10.0, fraction_in_range(500.0, 1000.0, level))
+            }
+            "geopotential_height" => {
+                interpolate_range(0.05, 1.0, fraction_in_range(0.0, 500.0, level))
+            }
+            "relative_humidity" => {
+                interpolate_range(0.2, 1.0, fraction_in_range(0.0, 800.0, level))
+            }
+            "vertical_velocity" => {
+                interpolate_range(20.0, 100.0, fraction_in_range(0.0, 500.0, level))
+            }
+            _ => 1.0,
+        }
+    } else {
+        match variable {
+            "precipitation_type" => 1.0,
+            "precipitation" | "showers" | "snowfall_water_equivalent" | "runoff" => 10.0,
+            "snow_depth" => 100.0,
+            "snow_depth_water_equivalent" => 1.0,
+            "temperature_2m"
+            | "temperature_2m_min"
+            | "temperature_2m_max"
+            | "surface_temperature"
+            | "soil_temperature_0_to_10cm"
+            | "soil_temperature_0_to_7cm"
+            | "soil_temperature_7_to_28cm"
+            | "soil_temperature_28_to_100cm"
+            | "soil_temperature_100_to_255cm" => 20.0,
+            "pressure_msl"
+            | "total_column_integrated_water_vapour"
+            | "wind_u_component_10m"
+            | "wind_v_component_10m"
+            | "wind_u_component_100m"
+            | "wind_v_component_100m"
+            | "wind_gusts_10m" => 10.0,
+            "cloud_cover"
+            | "cloud_cover_low"
+            | "cloud_cover_mid"
+            | "cloud_cover_high"
+            | "relative_humidity_2m"
+            | "shortwave_radiation" => 1.0,
+            "soil_moisture_0_to_7cm"
+            | "soil_moisture_7_to_28cm"
+            | "soil_moisture_28_to_100cm"
+            | "soil_moisture_100_to_255cm" => 1000.0,
+            "cape" => 0.1,
+            _ => 1.0,
+        }
+    };
+
+    match variable {
+        "precipitation" | "showers" | "snowfall_water_equivalent" | "runoff" => {
+            InterpolationKind::BackwardsSum { scalefactor }
+        }
+        "shortwave_radiation" => InterpolationKind::SolarBackwardsAveraged { scalefactor },
+        "temperature_2m_min" | "temperature_2m_max" => InterpolationKind::Backwards { scalefactor },
+        "cloud_cover"
+        | "cloud_cover_low"
+        | "cloud_cover_mid"
+        | "cloud_cover_high"
+        | "relative_humidity_2m" => InterpolationKind::Hermite {
+            scalefactor,
+            bounds: Some((0.0, 100.0)),
+        },
+        "wind_gusts_10m" => InterpolationKind::Hermite {
+            scalefactor,
+            bounds: Some((0.0, 10e9)),
+        },
+        _ if variable.starts_with("relative_humidity_") && variable.ends_with("hPa") => {
+            InterpolationKind::Hermite {
+                scalefactor,
+                bounds: Some((0.0, 100.0)),
+            }
+        }
+        _ => InterpolationKind::Hermite {
+            scalefactor,
+            bounds: None,
+        },
+    }
+}
+
 fn cams_interpolation_kind(variable: &str) -> InterpolationKind {
     let scalefactor = match variable {
         "pm10" | "pm2_5" | "nitrogen_dioxide" | "sulphur_dioxide" => 10.0,
@@ -5424,6 +7589,8 @@ fn product_for_variable(
         &["cams_global_greenhouse_gases", "cams_global"]
     } else if is_cams_variable(variable) {
         &["cams_global"]
+    } else if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        &["ecmwf_ifs025"]
     } else if is_gfs025_variable(variable) {
         &["gfs025"]
     } else if is_pressure_variable(variable) {
@@ -5431,9 +7598,21 @@ fn product_for_variable(
     } else {
         &["gfs013_surface"]
     };
+    let raw_variable = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        match variable {
+            // These compatibility aliases are the same aliases exposed by
+            // Open-Meteo's official EcmwfReader.
+            "soil_temperature_0_to_10cm" => "soil_temperature_0_to_7cm",
+            "soil_moisture_0_to_10cm" => "soil_moisture_0_to_7cm",
+            "skin_temperature" | "soil_temperature_0cm" => "surface_temperature",
+            _ => variable,
+        }
+    } else {
+        variable
+    };
     for product in candidates {
         if snapshot.product(product).is_some() {
-            return Ok((product, variable.to_string()));
+            return Ok((product, raw_variable.to_string()));
         }
     }
     bail!(
@@ -5455,7 +7634,13 @@ fn seed_variable_for_times(variable: &str) -> String {
                     Some("wind_u_component")
                 }
                 "dew_point" | "dewpoint" => Some("temperature"),
-                "cloudcover" => Some("cloud_cover"),
+                "cloudcover" | "cloud_cover" => {
+                    Some(if current_weather_model() == WeatherModel::EcmwfIfs025 {
+                        "relative_humidity"
+                    } else {
+                        "cloud_cover"
+                    })
+                }
                 "relativehumidity" => Some("relative_humidity"),
                 _ => None,
             };
@@ -5472,7 +7657,11 @@ fn seed_variable_for_times(variable: &str) -> String {
         | "vapour_pressure_deficit"
         | "vapor_pressure_deficit"
         | "et0_fao_evapotranspiration"
+        | "growing_degree_days_base_0_limit_50"
         | "is_day" => "temperature_2m",
+        "skin_temperature" | "soil_temperature_0cm" => "surface_temperature",
+        "soil_temperature_0_to_100cm" => "soil_temperature_0_to_7cm",
+        "soil_moisture_0_to_100cm" => "soil_moisture_0_to_7cm",
         "evapotranspiration" => "latent_heat_flux",
         "direct_radiation"
         | "shortwave_radiation_instant"
@@ -5574,17 +7763,30 @@ fn is_pressure_variable(variable: &str) -> bool {
 }
 
 fn is_elevation_correctable(variable: &str) -> bool {
-    matches!(
-        variable,
-        "temperature_2m"
-            | "temperature_80m"
-            | "temperature_100m"
-            | "surface_temperature"
-            | "soil_temperature_0_to_10cm"
-            | "soil_temperature_10_to_40cm"
-            | "soil_temperature_40_to_100cm"
-            | "soil_temperature_100_to_200cm"
-    )
+    match current_weather_model() {
+        WeatherModel::EcmwfIfs025 => matches!(
+            variable,
+            "temperature_2m"
+                | "temperature_2m_min"
+                | "temperature_2m_max"
+                | "soil_temperature_0_to_10cm"
+                | "soil_temperature_0_to_7cm"
+                | "soil_temperature_7_to_28cm"
+                | "soil_temperature_28_to_100cm"
+                | "soil_temperature_100_to_255cm"
+        ),
+        WeatherModel::Gfs => matches!(
+            variable,
+            "temperature_2m"
+                | "temperature_80m"
+                | "temperature_100m"
+                | "surface_temperature"
+                | "soil_temperature_0_to_10cm"
+                | "soil_temperature_10_to_40cm"
+                | "soil_temperature_40_to_100cm"
+                | "soil_temperature_100_to_200cm"
+        ),
+    }
 }
 
 fn apply_elevation_correction(product: &str, variable: &str, value: f32) -> f32 {
@@ -6005,6 +8207,15 @@ const GFS025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
     file_size: GFS025_STATIC_FILE_SIZE,
 };
 
+const ECMWF025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
+    relative_path: ECMWF025_STATIC_ELEVATION_PATH,
+    dimensions: ECMWF025_STATIC_DIMENSIONS,
+    chunks: ECMWF025_STATIC_CHUNKS,
+    lut_offset: ECMWF025_STATIC_LUT_OFFSET,
+    lut_size: ECMWF025_STATIC_LUT_SIZE,
+    file_size: ECMWF025_STATIC_FILE_SIZE,
+};
+
 fn resolve_request_sampling(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -6015,6 +8226,9 @@ fn resolve_request_sampling(
 ) -> Result<RequestSampling> {
     let decoder =
         decoder.context("official OM decoder library is required for DEM and grid selection")?;
+    // Copernicus DEM is a shared asset, not part of the selected weather-model
+    // release. `read_dem90` gives OM_DEM_ROOT precedence; these legacy GFS
+    // product roots are only fallbacks for older layouts that colocated DEM.
     let dem_root = snapshot
         .product("gfs013_surface")
         .or_else(|| snapshot.product("gfs025"))
@@ -6025,7 +8239,9 @@ fn resolve_request_sampling(
         Some(value) => value,
         None => read_dem90(decoder, &dem_root, latitude, longitude)?,
     };
-    let gfs013 = if snapshot.product("gfs013_surface").is_some() {
+    let gfs013 = if current_weather_model() == WeatherModel::Gfs
+        && snapshot.product("gfs013_surface").is_some()
+    {
         Some(resolve_model_sampling(
             snapshot,
             decoder,
@@ -6039,8 +8255,9 @@ fn resolve_request_sampling(
     } else {
         None
     };
-    let gfs025 = if snapshot.product("gfs025").is_some()
-        || snapshot.product("gfs_pressure_profile").is_some()
+    let gfs025 = if current_weather_model() == WeatherModel::Gfs
+        && (snapshot.product("gfs025").is_some()
+            || snapshot.product("gfs_pressure_profile").is_some())
     {
         Some(resolve_model_sampling(
             snapshot,
@@ -6059,8 +8276,26 @@ fn resolve_request_sampling(
     } else {
         None
     };
+    let ecmwf025 = if current_weather_model() == WeatherModel::EcmwfIfs025
+        && snapshot.product("ecmwf_ifs025").is_some()
+    {
+        Some(resolve_model_sampling(
+            snapshot,
+            decoder,
+            "ecmwf_ifs025",
+            ECMWF025_STATIC_SPEC,
+            latitude,
+            longitude,
+            target,
+            mode,
+        )?)
+    } else {
+        None
+    };
     let response_elevation = if target.is_nan() {
         gfs013
+            .or(gfs025)
+            .or(ecmwf025)
             .map(|sampling| sampling.model_elevation)
             .unwrap_or(f32::NAN)
     } else {
@@ -6069,6 +8304,7 @@ fn resolve_request_sampling(
     Ok(RequestSampling {
         gfs013,
         gfs025,
+        ecmwf025,
         response_elevation,
     })
 }
@@ -6238,7 +8474,13 @@ fn read_static_elevation_grid(
     height: u64,
     width: u64,
 ) -> Result<Vec<f32>> {
-    let path = snapshot.data_root.join(spec.relative_path);
+    let static_root = std::env::var_os("OM_MODEL_STATIC_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| snapshot.data_root.clone());
+    if !static_root.is_absolute() {
+        bail!("OM_MODEL_STATIC_ROOT must be absolute");
+    }
+    let path = static_root.join(spec.relative_path);
     let file =
         Arc::new(File::open(&path).with_context(|| format!("failed to open {}", path.display()))?);
     if file.metadata()?.len() != spec.file_size {
@@ -6335,20 +8577,23 @@ fn elevation_numeric(value: f32) -> f32 {
     }
 }
 
-fn gfs013_model_location(
+fn weather_model_location(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
     latitude: f64,
     longitude: f64,
 ) -> Result<Option<(f64, f64, f32)>> {
-    if let Some(sampling) = current_product_sampling("gfs013_surface") {
+    let model = current_weather_model();
+    let product_name = model.primary_product();
+    let spec = model.static_elevation_spec();
+    if let Some(sampling) = current_product_sampling(product_name) {
         return Ok(Some((
             sampling.latitude,
             sampling.longitude,
             sampling.model_elevation,
         )));
     }
-    let Some(product) = snapshot.product("gfs013_surface") else {
+    let Some(product) = snapshot.product(product_name) else {
         return Ok(None);
     };
     let entry = product
@@ -6356,7 +8601,7 @@ fn gfs013_model_location(
         .values()
         .find(|entry| entry.variable == "temperature_2m")
         .or_else(|| product.entries.values().next())
-        .context("gfs013_surface has no grid entries")?;
+        .with_context(|| format!("{product_name} has no grid entries"))?;
     let (y, x) = grid_index_for_lat_lon(
         &entry.array,
         entry.native_grid.as_ref(),
@@ -6377,18 +8622,19 @@ fn gfs013_model_location(
     let Some(decoder) = decoder else {
         return Ok(None);
     };
-    let static_path = snapshot.data_root.join(GFS013_STATIC_ELEVATION_PATH);
+    let static_path = snapshot.data_root.join(spec.relative_path);
     if !static_path.exists() {
         bail!(
-            "required official GFS013 static elevation file is missing: {}",
+            "required official {} static elevation file is missing: {}",
+            model.display_name(),
             static_path.display()
         );
     }
     let cache_key = (static_path.clone(), y, x);
-    let cache = GFS_ELEVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = ELEVATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(elevation) = cache
         .lock()
-        .map_err(|_| anyhow!("GFS elevation cache poisoned"))?
+        .map_err(|_| anyhow!("weather-model elevation cache poisoned"))?
         .get(&cache_key)
         .copied()
     {
@@ -6398,17 +8644,20 @@ fn gfs013_model_location(
         File::open(&static_path)
             .with_context(|| format!("failed to open {}", static_path.display()))?,
     );
-    if file.metadata()?.len() != GFS013_STATIC_FILE_SIZE {
-        bail!("official GFS013 static elevation file size is invalid");
+    if file.metadata()?.len() != spec.file_size {
+        bail!(
+            "official {} static elevation file size is invalid",
+            model.display_name()
+        );
     }
     let metadata = build_v3_array_metadata_blob(
         "",
         20,
         0,
-        GFS013_STATIC_DIMENSIONS,
-        GFS013_STATIC_CHUNKS,
-        GFS013_STATIC_LUT_SIZE,
-        GFS013_STATIC_LUT_OFFSET,
+        spec.dimensions,
+        spec.chunks,
+        spec.lut_size,
+        spec.lut_offset,
         1.0,
         0.0,
     );
@@ -6419,7 +8668,7 @@ fn gfs013_model_location(
     };
     cache
         .lock()
-        .map_err(|_| anyhow!("GFS elevation cache poisoned"))?
+        .map_err(|_| anyhow!("weather-model elevation cache poisoned"))?
         .insert(cache_key, elevation);
     Ok(Some((model_latitude, model_longitude, elevation)))
 }
@@ -6696,13 +8945,10 @@ mod tests {
 
     #[test]
     fn model_coordinates_use_official_shortest_float_representation() {
-        assert_eq!(official_f32_json_number(131.953125).unwrap(), 131.95312);
-        assert_eq!(official_f32_json_number(75.5859375).unwrap(), 75.58594);
+        assert_eq!(official_f32_json_number(131.953_13).unwrap(), 131.95312);
+        assert_eq!(official_f32_json_number(75.585_94).unwrap(), 75.58594);
         assert_eq!(official_f32_json_number(82.734375).unwrap(), 82.734375);
-        assert_eq!(
-            official_f32_json_number(39.06932067871094).unwrap(),
-            39.06932
-        );
+        assert_eq!(official_f32_json_number(39.069_32).unwrap(), 39.06932);
     }
 
     #[test]
@@ -6725,6 +8971,7 @@ mod tests {
                 model_elevation: 0.0,
                 target_elevation: 0.0,
             }),
+            ecmwf025: None,
             response_elevation: 0.0,
         };
         let selected_latitude = with_request_sampling(sampling, || {
@@ -6870,6 +9117,78 @@ mod tests {
             round_variable_output_value("aerosol_optical_depth", 0.126),
             0.13
         );
+    }
+
+    #[test]
+    fn weather_model_aliases_and_context_are_isolated() {
+        assert_eq!(WeatherModel::parse(None).unwrap(), WeatherModel::Gfs);
+        assert_eq!(
+            WeatherModel::parse(Some("ecmwf_ifs025")).unwrap(),
+            WeatherModel::EcmwfIfs025
+        );
+        with_weather_model(WeatherModel::EcmwfIfs025, || {
+            assert_eq!(current_weather_model(), WeatherModel::EcmwfIfs025);
+            assert_eq!(
+                seed_variable_for_times("cloud_cover_850hPa"),
+                "relative_humidity_850hPa"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(current_weather_model(), WeatherModel::Gfs);
+        assert!(WeatherModel::parse(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn ecmwf_interpolation_contract_matches_pinned_official_source() {
+        with_weather_model(WeatherModel::EcmwfIfs025, || {
+            assert!(matches!(
+                interpolation_kind_for_variable("precipitation"),
+                InterpolationKind::BackwardsSum { scalefactor: 10.0 }
+            ));
+            assert!(matches!(
+                interpolation_kind_for_variable("shortwave_radiation"),
+                InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 }
+            ));
+            assert!(matches!(
+                interpolation_kind_for_variable("snow_depth"),
+                InterpolationKind::Hermite {
+                    scalefactor: 100.0,
+                    bounds: None
+                }
+            ));
+            assert!(matches!(
+                interpolation_kind_for_variable("relative_humidity_850hPa"),
+                InterpolationKind::Hermite {
+                    bounds: Some((0.0, 100.0)),
+                    ..
+                }
+            ));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ecmwf_solar_interpolation_uses_backwards_average_centres() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 18, 0, 0, 0).unwrap();
+        let native = (0..4)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let at_native_time = solar_interpolation_position(&native, start, 3600).unwrap();
+        assert_eq!((at_native_time.b, at_native_time.c), (0, 1));
+        assert!((at_native_time.fraction - 1.0 / 3.0).abs() < 1e-6);
+        let two_hours_later =
+            solar_interpolation_position(&native, start + Duration::hours(2), 3600).unwrap();
+        assert_eq!((two_hours_later.b, two_hours_later.c), (1, 2));
+        assert_eq!(two_hours_later.fraction, 0.0);
+    }
+
+    #[test]
+    fn ecmwf_pressure_cloud_cover_matches_sundqvist_reference() {
+        let cloud_cover = relative_humidity_to_cloud_cover(80.0, 500.0);
+        assert!((cloud_cover - 18.35034).abs() < 0.0001);
+        assert_eq!(relative_humidity_to_cloud_cover(80.0, 1000.0), 0.0);
     }
 }
 
@@ -7022,7 +9341,8 @@ fn point_weather_code_model_latitudes(latitudes: &[f64], longitudes: &[f64]) -> 
     if latitudes.len() != 1 || longitudes.len() != 1 {
         return None;
     }
-    current_product_sampling("gfs013_surface").map(|sampling| vec![sampling.latitude as f32])
+    current_product_sampling(current_weather_model().primary_product())
+        .map(|sampling| vec![sampling.latitude as f32])
 }
 
 fn read_weather_code_grid_series(
@@ -7059,60 +9379,89 @@ fn read_weather_code_grid_series(
         longitudes,
         true,
     )?;
-    let showers = read_direct_grid_series(
-        snapshot, decoder, "showers", times, latitudes, longitudes, true,
-    )?;
+    let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        None
+    } else {
+        Some(read_direct_grid_series(
+            snapshot, decoder, "showers", times, latitudes, longitudes, true,
+        )?)
+    };
     let cape = read_optional_direct_grid_series_rounded(
         snapshot, decoder, "cape", times, latitudes, longitudes,
     )?;
-    let gusts = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "wind_gusts_10m",
-        times,
-        latitudes,
-        longitudes,
-    )?;
-    let visibility = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "visibility",
-        times,
-        latitudes,
-        longitudes,
-    )?;
-    let freezing_rain = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "categorical_freezing_rain",
-        times,
-        latitudes,
-        longitudes,
-    )?;
-    let lifted_index = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "lifted_index",
-        times,
-        latitudes,
-        longitudes,
-    )?;
-    let cin = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "convective_inhibition",
-        times,
-        latitudes,
-        longitudes,
-    )?;
-    let pbl = read_optional_direct_grid_series_rounded(
-        snapshot,
-        decoder,
-        "boundary_layer_height",
-        times,
-        latitudes,
-        longitudes,
-    )?;
+    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    let gusts = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "wind_gusts_10m",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let visibility = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "visibility",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let freezing_rain = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "categorical_freezing_rain",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let lifted_index = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "lifted_index",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let cin = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "convective_inhibition",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let pbl = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_series_rounded(
+            snapshot,
+            decoder,
+            "boundary_layer_height",
+            times,
+            latitudes,
+            longitudes,
+        )?
+    };
 
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
     let products = snapshot.product_snapshots(product_name);
@@ -7162,7 +9511,7 @@ fn read_weather_code_grid_series(
                 weather_code(
                     cloudcover[time_index][index],
                     precipitation[time_index][index],
-                    Some(showers[time_index][index]),
+                    showers.as_ref().map(|showers| showers[time_index][index]),
                     snowfall[time_index][index] * 0.7,
                     optional(&gusts),
                     optional(&cape),
@@ -7232,59 +9581,88 @@ fn read_weather_code_grid(
         longitudes,
         true,
     )?;
-    let showers = read_direct_grid(
-        snapshot, decoder, "showers", time, latitudes, longitudes, true,
-    )?;
+    let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        None
+    } else {
+        Some(read_direct_grid(
+            snapshot, decoder, "showers", time, latitudes, longitudes, true,
+        )?)
+    };
     let cape =
         read_optional_direct_grid_rounded(snapshot, decoder, "cape", time, latitudes, longitudes)?;
-    let gusts = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "wind_gusts_10m",
-        time,
-        latitudes,
-        longitudes,
-    )?;
-    let visibility = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "visibility",
-        time,
-        latitudes,
-        longitudes,
-    )?;
-    let freezing_rain = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "categorical_freezing_rain",
-        time,
-        latitudes,
-        longitudes,
-    )?;
-    let lifted_index = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "lifted_index",
-        time,
-        latitudes,
-        longitudes,
-    )?;
-    let cin = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "convective_inhibition",
-        time,
-        latitudes,
-        longitudes,
-    )?;
-    let pbl = read_optional_direct_grid_rounded(
-        snapshot,
-        decoder,
-        "boundary_layer_height",
-        time,
-        latitudes,
-        longitudes,
-    )?;
+    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    let gusts = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "wind_gusts_10m",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let visibility = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "visibility",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let freezing_rain = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "categorical_freezing_rain",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let lifted_index = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "lifted_index",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let cin = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "convective_inhibition",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
+    let pbl = if ecmwf {
+        None
+    } else {
+        read_optional_direct_grid_rounded(
+            snapshot,
+            decoder,
+            "boundary_layer_height",
+            time,
+            latitudes,
+            longitudes,
+        )?
+    };
     let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
     let products = snapshot.product_snapshots(product_name);
     let entry = products
@@ -7319,7 +9697,7 @@ fn read_weather_code_grid(
             weather_code(
                 cloudcover[index],
                 precipitation[index],
-                Some(showers[index]),
+                showers.as_ref().map(|showers| showers[index]),
                 snowfall[index] * 0.7,
                 optional(&gusts),
                 optional(&cape),
@@ -7363,48 +9741,77 @@ fn read_weather_code(
         latitude,
         longitude,
     )? * 0.7;
-    let showers = read_direct(snapshot, decoder, "showers", time, latitude, longitude)?;
+    let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        None
+    } else {
+        Some(read_direct(
+            snapshot, decoder, "showers", time, latitude, longitude,
+        )?)
+    };
     let cape = read_optional_direct(snapshot, decoder, "cape", time, latitude, longitude)?;
-    let gusts = read_optional_direct(
-        snapshot,
-        decoder,
-        "wind_gusts_10m",
-        time,
-        latitude,
-        longitude,
-    )?;
-    let visibility =
-        read_optional_direct(snapshot, decoder, "visibility", time, latitude, longitude)?;
-    let freezing_rain = read_optional_direct(
-        snapshot,
-        decoder,
-        "categorical_freezing_rain",
-        time,
-        latitude,
-        longitude,
-    )?;
-    let lifted_index =
-        read_optional_direct(snapshot, decoder, "lifted_index", time, latitude, longitude)?;
-    let cin = read_optional_direct(
-        snapshot,
-        decoder,
-        "convective_inhibition",
-        time,
-        latitude,
-        longitude,
-    )?;
-    let pbl = read_optional_direct(
-        snapshot,
-        decoder,
-        "boundary_layer_height",
-        time,
-        latitude,
-        longitude,
-    )?;
+    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    let gusts = if ecmwf {
+        None
+    } else {
+        read_optional_direct(
+            snapshot,
+            decoder,
+            "wind_gusts_10m",
+            time,
+            latitude,
+            longitude,
+        )?
+    };
+    let visibility = if ecmwf {
+        None
+    } else {
+        read_optional_direct(snapshot, decoder, "visibility", time, latitude, longitude)?
+    };
+    let freezing_rain = if ecmwf {
+        None
+    } else {
+        read_optional_direct(
+            snapshot,
+            decoder,
+            "categorical_freezing_rain",
+            time,
+            latitude,
+            longitude,
+        )?
+    };
+    let lifted_index = if ecmwf {
+        None
+    } else {
+        read_optional_direct(snapshot, decoder, "lifted_index", time, latitude, longitude)?
+    };
+    let cin = if ecmwf {
+        None
+    } else {
+        read_optional_direct(
+            snapshot,
+            decoder,
+            "convective_inhibition",
+            time,
+            latitude,
+            longitude,
+        )?
+    };
+    let pbl = if ecmwf {
+        None
+    } else {
+        read_optional_direct(
+            snapshot,
+            decoder,
+            "boundary_layer_height",
+            time,
+            latitude,
+            longitude,
+        )?
+    };
     Ok(weather_code(
         cloudcover,
         precipitation,
-        Some(showers),
+        showers,
         snowfall,
         gusts,
         cape,
@@ -7629,7 +10036,7 @@ fn wind_direction(u: f32, v: f32) -> f32 {
     let polynomial = x_sq.mul_add(
         x_sq.mul_add(
             x_sq.mul_add(
-                x_sq.mul_add(x_sq.mul_add(-0.01172120, 0.05265332), -0.11643287),
+                x_sq.mul_add(x_sq.mul_add(-0.011_721_2, 0.05265332), -0.11643287),
                 0.19354346,
             ),
             -0.33262347,
@@ -7652,18 +10059,19 @@ fn wind_scale_factor(from: f32, to: f32) -> f32 {
     factor_from / factor_to
 }
 
-fn gfs013_sampling(
+fn weather_model_sampling(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
     latitude: f64,
     longitude: f64,
 ) -> Result<ModelSampling> {
-    if let Some(sampling) = current_product_sampling("gfs013_surface") {
+    let model = current_weather_model();
+    if let Some(sampling) = current_product_sampling(model.primary_product()) {
         return Ok(sampling);
     }
     let (latitude, longitude, elevation) =
-        gfs013_model_location(snapshot, decoder, latitude, longitude)?
-            .context("GFS013 sampling is not available")?;
+        weather_model_location(snapshot, decoder, latitude, longitude)?
+            .with_context(|| format!("{} sampling is not available", model.display_name()))?;
     Ok(ModelSampling {
         latitude,
         longitude,
@@ -7679,6 +10087,17 @@ fn precip_phase(code: f32) -> f32 {
         56 | 57 | 66 | 67 => 4.0,
         _ => 0.0,
     }
+}
+
+/// Open-Meteo/ECMWF Sundqvist cloud-cover parameterisation used when IFS
+/// exposes relative humidity, but no cloud-cover field, on pressure levels.
+fn relative_humidity_to_cloud_cover(relative_humidity: f32, pressure_hpa: f32) -> f32 {
+    if !relative_humidity.is_finite() || !pressure_hpa.is_finite() || pressure_hpa <= 0.0 {
+        return f32::NAN;
+    }
+    let rh_critical = 0.7 + (0.9 - 0.7) * (1.0 - (1013.25_f32 / pressure_hpa).powf(4.0)).exp();
+    (1.0 - ((1.0 - relative_humidity / 100.0).max(0.0) / (1.0 - rh_critical)).sqrt()).max(0.0)
+        * 100.0
 }
 
 fn dew_point(temperature: f32, relative_humidity: f32) -> f32 {
@@ -7799,6 +10218,8 @@ fn unit_for_variable(variable: &str) -> &'static str {
     }
     match variable {
         "temperature_2m"
+        | "temperature_2m_min"
+        | "temperature_2m_max"
         | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
@@ -7807,7 +10228,14 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "dewpoint_2m"
         | "wet_bulb_temperature_2m"
         | "surface_temperature"
+        | "skin_temperature"
+        | "soil_temperature_0cm"
         | "soil_temperature_0_to_10cm"
+        | "soil_temperature_0_to_7cm"
+        | "soil_temperature_7_to_28cm"
+        | "soil_temperature_28_to_100cm"
+        | "soil_temperature_100_to_255cm"
+        | "soil_temperature_0_to_100cm"
         | "soil_temperature_10_to_40cm"
         | "soil_temperature_40_to_100cm"
         | "soil_temperature_100_to_200cm" => "°C",
@@ -7821,7 +10249,12 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "cloudcover_mid"
         | "cloud_cover_high"
         | "cloudcover_high" => "%",
-        "precipitation" | "showers" | "rain" | "snowfall_water_equivalent" => "mm",
+        "precipitation"
+        | "showers"
+        | "rain"
+        | "snowfall_water_equivalent"
+        | "snow_depth_water_equivalent"
+        | "runoff" => "mm",
         "snowfall" => "cm",
         "wind_u_component_10m"
         | "wind_v_component_10m"
@@ -7850,6 +10283,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
         "visibility" => "m",
         "freezing_level_height" | "boundary_layer_height" | "snow_depth" => "m",
         "weather_code" | "weathercode" => "wmo code",
+        "precipitation_type" => "",
         "precip_phase" | "thunderstorm_code" => "",
         "pm2_5"
         | "pm10"
@@ -7918,10 +10352,16 @@ fn unit_for_variable(variable: &str) -> &'static str {
         "evapotranspiration" | "et0_fao_evapotranspiration" => "mm",
         "vapour_pressure_deficit" | "vapor_pressure_deficit" => "kPa",
         "soil_moisture_0_to_10cm"
+        | "soil_moisture_0_to_7cm"
+        | "soil_moisture_7_to_28cm"
+        | "soil_moisture_28_to_100cm"
+        | "soil_moisture_100_to_255cm"
+        | "soil_moisture_0_to_100cm"
         | "soil_moisture_10_to_40cm"
         | "soil_moisture_40_to_100cm"
         | "soil_moisture_100_to_200cm" => "m\u{00B3}/m\u{00B3}",
         "total_column_integrated_water_vapour" => "kg/m\u{00B2}",
+        "growing_degree_days_base_0_limit_50" => "°C",
         _ => "unknown",
     }
 }
@@ -7931,6 +10371,14 @@ fn json_array_for_daily_variable(
     aggregation: DailyWeatherAggregation,
     values: Vec<f32>,
 ) -> serde_json::Value {
+    if matches!(aggregation, DailyWeatherAggregation::RadiationSum(_)) {
+        return serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(|value| json_value_with_decimals(value, 2))
+                .collect(),
+        );
+    }
     let decimals = match variable {
         "wind_gusts_10m_mean" | "windgusts_10m_mean" | "visibility_mean" => Some(2),
         _ => None,
@@ -8014,6 +10462,9 @@ mod output_tests {
             "temperature_2m",
             "apparent_temperature",
             "sunshine_duration",
+            "et0_fao_evapotranspiration",
+            "vapour_pressure_deficit",
+            "vapor_pressure_deficit",
             "uv_index",
             "is_day",
             "wind_speed_850hPa",
@@ -8027,7 +10478,6 @@ mod output_tests {
         for variable in [
             "shortwave_radiation",
             "direct_normal_irradiance",
-            "et0_fao_evapotranspiration",
             "wind_u_component_10m",
             "wind_u_component_850hPa",
             "temperature_875hPa",
@@ -8038,10 +10488,23 @@ mod output_tests {
     }
 
     #[test]
-    fn removed_daily_radiation_and_cape_are_rejected() {
-        assert!(daily_weather_aggregation("shortwave_radiation_sum").is_err());
-        assert!(daily_weather_aggregation("cape_max").is_err());
+    fn official_daily_radiation_and_cape_aggregations_are_supported() {
+        assert!(daily_weather_aggregation("shortwave_radiation_sum").is_ok());
+        assert!(daily_weather_aggregation("cape_max").is_ok());
         assert!(daily_weather_aggregation("uv_index_max").is_ok());
+    }
+
+    #[test]
+    fn daily_radiation_uses_megajoules_and_two_decimal_output() {
+        let aggregation = DailyWeatherAggregation::RadiationSum("shortwave_radiation");
+        assert_eq!(
+            daily_weather_unit("shortwave_radiation_sum", aggregation),
+            "MJ/m²"
+        );
+        assert_eq!(
+            json_array_for_daily_variable("shortwave_radiation_sum", aggregation, vec![12.345]),
+            serde_json::json!([12.35])
+        );
     }
 
     #[test]
@@ -8060,6 +10523,170 @@ mod output_tests {
             json_array_for_variable("snow_depth", vec![0.006]),
             serde_json::json!([0.01])
         );
+    }
+
+    #[test]
+    fn ecmwf_native_soil_moisture_keeps_three_decimal_precision() {
+        for variable in [
+            "soil_moisture_0_to_7cm",
+            "soil_moisture_7_to_28cm",
+            "soil_moisture_28_to_100cm",
+            "soil_moisture_100_to_255cm",
+        ] {
+            assert_eq!(
+                json_array_for_variable(variable, vec![0.1434]),
+                serde_json::json!([0.143]),
+                "{variable}"
+            );
+        }
+    }
+
+    #[test]
+    fn ecmwf_public_pressure_scope_includes_available_ten_hectopascal_level() {
+        assert!(is_public_hourly_variable("temperature_10hPa"));
+        assert!(is_public_hourly_variable("wind_speed_10hPa"));
+        assert!(is_public_hourly_variable("cloud_cover_10hPa"));
+    }
+
+    #[test]
+    fn ecmwf_two_stage_interpolation_quantizes_the_regular_three_hour_axis() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap();
+        let kind = InterpolationKind::Hermite {
+            scalefactor: 20.0,
+            bounds: None,
+        };
+        let raw = vec![0.93, 0.22, 2.17, f32::NAN, -1.64, f32::NAN, -1.01];
+        let mut staged = raw.clone();
+        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5);
+        assert_eq!(staged, vec![0.95, 0.2, 2.15, 0.3, -1.65, -1.55, -1.0]);
+
+        let regular_times = (0..staged.len())
+            .map(|index| start + Duration::hours(index as i64 * 3))
+            .collect::<Vec<_>>();
+        let staged_hour = ecmwf_second_stage_value(
+            &staged,
+            &regular_times,
+            kind,
+            start + Duration::hours(7),
+            31.25,
+            121.5,
+            3600,
+        );
+        let mut unquantized = raw;
+        interpolate_ecmwf_hermite_in_place(&mut unquantized, None);
+        let direct_hour = ecmwf_second_stage_value(
+            &unquantized,
+            &regular_times,
+            kind,
+            start + Duration::hours(7),
+            31.25,
+            121.5,
+            3600,
+        );
+        assert_eq!(staged_hour, 1.8);
+        assert_eq!(direct_hour, 1.85);
+    }
+
+    #[test]
+    fn ecmwf_daily_accumulations_keep_regular_three_hour_buckets() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap();
+        let regular_times = (0..8)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let regular_buckets = vec![0.0, 0.3, 0.0, 0.6, 0.9, 0.0, 1.2, 1.5];
+        let kind = InterpolationKind::BackwardsSum { scalefactor: 10.0 };
+        let daily_buckets = regular_times
+            .iter()
+            .map(|time| {
+                ecmwf_second_stage_value(
+                    &regular_buckets,
+                    &regular_times,
+                    kind,
+                    *time,
+                    31.25,
+                    121.5,
+                    10_800,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(daily_buckets, regular_buckets);
+        assert_eq!(
+            aggregate_daily_weather_values(
+                DailyWeatherAggregation::Sum("precipitation"),
+                &daily_buckets,
+                3,
+            ),
+            4.5
+        );
+        assert_eq!(
+            aggregate_daily_weather_values(
+                DailyWeatherAggregation::PrecipitationHours("precipitation"),
+                &daily_buckets,
+                3,
+            ),
+            15.0
+        );
+
+        let hourly_at_three = ecmwf_second_stage_value(
+            &regular_buckets,
+            &regular_times,
+            kind,
+            start + Duration::hours(3),
+            31.25,
+            121.5,
+            3600,
+        );
+        assert_eq!(hourly_at_three, 0.1);
+    }
+
+    #[test]
+    fn ecmwf_daily_derived_series_uses_native_three_hour_dt() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap();
+        let daily = (0..8)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let hourly = (0..24)
+            .map(|index| start + Duration::hours(index))
+            .collect::<Vec<_>>();
+        assert_eq!(series_dt_seconds(&daily), 10_800);
+        assert_eq!(series_dt_seconds(&hourly), 3_600);
+        let daily_sunshine =
+            backwards_sunshine_duration(200.0, daily[4], series_dt_seconds(&daily), 31.25, 121.5);
+        let wrongly_hourly = backwards_sunshine_duration(200.0, daily[4], 3_600, 31.25, 121.5);
+        assert_ne!(daily_sunshine.to_bits(), wrongly_hourly.to_bits());
+        assert!(daily_sunshine <= 10_800.0);
+    }
+
+    #[test]
+    fn ecmwf_regular_cache_builds_each_raw_stream_once_per_request() {
+        use std::cell::Cell;
+
+        let builds = Cell::new(0usize);
+        let key = EcmwfRegularCacheKey {
+            coverage_id: "ecmwf_ifs025_2026072300".to_string(),
+            raw_variable: "temperature_2m".to_string(),
+            latitudes: vec![31.25_f64.to_bits()],
+            longitudes: vec![121.5_f64.to_bits()],
+        };
+        with_ecmwf_request_cache(|| {
+            let first = ecmwf_cached_regular_series(key.clone(), || {
+                builds.set(builds.get() + 1);
+                Ok(Some(EcmwfRegularSeries {
+                    times: vec![Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap()],
+                    frames: vec![vec![20.0]],
+                }))
+            })?
+            .unwrap();
+            let second = ecmwf_cached_regular_series(key, || {
+                builds.set(builds.get() + 1);
+                Ok(None)
+            })?
+            .unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(builds.get(), 1);
     }
 }
 
@@ -8127,6 +10754,7 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "chinese_aqi_carbon_monoxide" => OutputDecimals::Integer,
         "weather_code"
         | "weathercode"
+        | "precipitation_type"
         | "relative_humidity_2m"
         | "relativehumidity_2m"
         | "cloud_cover"
@@ -8164,6 +10792,11 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "vertical_velocity"
         | "aerosol_optical_depth" => OutputDecimals::Fixed(2),
         "soil_moisture_0_to_10cm"
+        | "soil_moisture_0_to_7cm"
+        | "soil_moisture_7_to_28cm"
+        | "soil_moisture_28_to_100cm"
+        | "soil_moisture_100_to_255cm"
+        | "soil_moisture_0_to_100cm"
         | "soil_moisture_10_to_40cm"
         | "soil_moisture_40_to_100cm"
         | "soil_moisture_100_to_200cm" => OutputDecimals::Fixed(3),
@@ -8185,6 +10818,8 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "global_tilted_irradiance"
         | "global_tilted_irradiance_instant" => OutputDecimals::Fixed(1),
         "temperature_2m"
+        | "temperature_2m_min"
+        | "temperature_2m_max"
         | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
@@ -8193,7 +10828,14 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "dewpoint_2m"
         | "wet_bulb_temperature_2m"
         | "surface_temperature"
+        | "skin_temperature"
+        | "soil_temperature_0cm"
         | "soil_temperature_0_to_10cm"
+        | "soil_temperature_0_to_7cm"
+        | "soil_temperature_7_to_28cm"
+        | "soil_temperature_28_to_100cm"
+        | "soil_temperature_100_to_255cm"
+        | "soil_temperature_0_to_100cm"
         | "soil_temperature_10_to_40cm"
         | "soil_temperature_40_to_100cm"
         | "soil_temperature_100_to_200cm"

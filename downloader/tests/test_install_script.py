@@ -29,6 +29,7 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("native_decoder_ok", content)
         self.assertIn("--inspect-product-catalog gfs025", content)
         self.assertIn("--inspect-product-catalog cams_global", content)
+        self.assertIn("--inspect-product-catalog ecmwf_ifs025", content)
         self.assertNotIn("crontab", content)
         self.assertNotIn("systemctl", content)
         self.assertNotIn("systemd", content)
@@ -61,6 +62,7 @@ class InstallScriptTests(unittest.TestCase):
                     "OM_CAMS_DOWNLOAD",
                     "10 * * * *&&30 * * * *&&50 * * * *",
                 ),
+                ("OM_ECMWF_DOWNLOAD", "20 14 * * *"),
             ],
         )
         for name, _spec, script in publisher_tasks:
@@ -108,6 +110,7 @@ class InstallScriptTests(unittest.TestCase):
                 "OM_CAMS_DOWNLOAD",
                 "OM_GFS_SOURCE_SYNC",
                 "OM_CAMS_SOURCE_SYNC",
+                "OM_ECMWF_DOWNLOAD",
             ],
         )
         self.assertEqual(
@@ -117,6 +120,7 @@ class InstallScriptTests(unittest.TestCase):
                 "5,15,25,35,45,55 * * * *",
                 "2-59/5 * * * *",
                 "2-59/5 * * * *",
+                "20 14 * * *",
             ],
         )
         scripts = {name: script for name, _spec, script in tasks}

@@ -2,6 +2,15 @@
 
 License: `AGPL-3.0-or-later`.
 
+Public release metadata:
+
+- `GET /v1/source` returns the compile-time Git revision, exact tracked-source
+  archive URL, SHA-256 URL, and project license URL.
+- `GET /.well-known/weather-attribution.json` returns the provider, terms,
+  modification, and transformation summary for served model data.
+- `scripts/install_om_api.sh` refuses a dirty Git tree, archives the exact
+  revision, and supplies `OM_BUILD_REVISION` at compile time.
+
 This Rust server is the client-facing point API. It reads published
 Open-Meteo `.omranges` bundles from `/data/om_raw` and returns point JSON
 directly. Clients do not fetch `latest.json` or any manifest before requesting
@@ -45,9 +54,10 @@ If an exact approved `om-file-format` source checkout is available, pass it with
 `OM_FILE_FORMAT_SRC=/path/to/om-file-format`. This keeps the decoder aligned with
 the Singapore/Open-Meteo baseline instead of silently mixing source versions.
 
-GFS model coordinates, model elevation, and `surface_pressure` require the
+GFS/ECMWF model coordinates, model elevation, and `surface_pressure` require the
 official `ncep_gfs013/static/HSURF.om` and
-`ncep_gfs025/static/HSURF.om` files. `scripts/install_om_api.sh` downloads the
+`ncep_gfs025/static/HSURF.om` files, plus
+`ecmwf_ifs025/static/HSURF.om`. `scripts/install_om_api.sh` downloads the
 baseline-pinned objects from the official Open-Meteo bucket, verifies their
 SHA-256 checksums, stages them beside their final paths, and publishes each with
 an atomic rename. A failed download or checksum never publishes a partial file;
@@ -59,14 +69,21 @@ Pinned production assets:
   `203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0`
 - `ncep_gfs025/static/HSURF.om`: 408,440 bytes, SHA-256
   `fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d`
+- `ecmwf_ifs025/static/HSURF.om`: 433,648 bytes, SHA-256
+  `935d56ba000b438b61504fbc271bfaa8f70db2acb541d58d5b466a24d294a9fb`
 
-They are installed under `/data/om_raw/static/<model>/HSURF.om`. The API rejects
-requests that require a missing or structurally invalid static elevation file.
+They are installed under the system-disk path
+`/opt/1panel/apps/weather_om_api/static/<model>/HSURF.om` and resolved through
+`OM_MODEL_STATIC_ROOT=/opt/1panel/apps/weather_om_api`. They are never copied
+into `/data`; the API rejects requests that require a missing or structurally
+invalid static elevation file.
 
 Example:
 
 ```bash
 OM_DATA_ROOT=/data/om_raw \
+OM_DEM_ROOT=/opt/1panel/apps/weather_om_api/static \
+OM_MODEL_STATIC_ROOT=/opt/1panel/apps/weather_om_api \
 OM_OMFILE_LIB=/opt/1panel/apps/weather_om_api/native/libomfileformat.so \
 /opt/1panel/apps/weather_om_api/om-api --bind 127.0.0.1:8088
 ```
@@ -131,8 +148,16 @@ DEM and grid-cell selection:
 - Point requests without an explicit `elevation` read Copernicus DEM90 from
   `OM_DEM_ROOT` before selecting model cells and applying elevation correction.
 - `scripts/install_om_api.sh` accepts the deployment input
-  `OM_API_DEM_ROOT` (default `/data/om_static`), requires an absolute path, and
-  writes the resolved value to the service environment as `OM_DEM_ROOT`.
+  `OM_API_DEM_ROOT` (default `/opt/1panel/apps/weather_om_api/static`), requires
+  an absolute path, and writes the resolved value to the service environment as
+  `OM_DEM_ROOT`. DEM90 is immutable installation data on the system disk;
+  generated model cycles, WebP releases, and validation snapshots stay on
+  `/data`.
+- The installer also accepts `OM_API_MODEL_STATIC_ROOT` (default
+  `/opt/1panel/apps/weather_om_api`) and writes it as
+  `OM_MODEL_STATIC_ROOT`. Pinned GFS/ECMWF `HSURF.om` grids live below its
+  `static/` directory on the system filesystem; downloader/mirror releases
+  carry only their immutable identity and external-storage contract.
 - Before downloading assets, building, or changing the service, the installer
   verifies the product-region contract: non-empty
   `copernicus_dem90/static/lat_0.om` through `lat_58.om` (59 files). Missing or

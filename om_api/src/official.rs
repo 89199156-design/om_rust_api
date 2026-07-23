@@ -422,6 +422,7 @@ impl OfficialDecoder {
         bail!(message)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_array_writer(
         &self,
         path: impl AsRef<Path>,
@@ -773,6 +774,7 @@ impl Drop for OfficialArrayWriter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_v3_array_metadata_blob(
     name: &str,
     data_type: u8,
@@ -801,7 +803,7 @@ pub fn build_v3_array_metadata_blob(
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes.extend_from_slice(name.as_bytes());
-    let words = (bytes.len() + 7) / 8;
+    let words = bytes.len().div_ceil(8);
     let mut aligned = vec![0_u64; words];
     let aligned_bytes =
         unsafe { std::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, words * 8) };

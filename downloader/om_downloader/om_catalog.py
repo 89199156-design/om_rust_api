@@ -213,16 +213,25 @@ def discover_openmeteo_spatial_runs(
     bucket_url: str = DEFAULT_OPENMETEO_BUCKET_URL,
     required_start_utc: datetime,
     run_cadence_hours: int,
+    required_long_run_forecast_hour: int | None = None,
+    max_additional_runs: int = 8,
     timeout: int = 30,
     fetch=None,
 ) -> list[OmRun]:
+    if required_long_run_forecast_hour is not None and required_long_run_forecast_hour < 0:
+        raise ValueError("required_long_run_forecast_hour must not be negative")
+    if max_additional_runs < 0:
+        raise ValueError("max_additional_runs must not be negative")
+
     fetch = fetch or (lambda url: _fetch_url(url, timeout))
-    runs: list[OmRun] = []
-    for reference_time in required_reference_times_for_coverage(
+    reference_times = list(required_reference_times_for_coverage(
         latest_catalog,
         required_start_utc=required_start_utc,
         run_cadence_hours=run_cadence_hours,
-    ):
+    ))
+    catalogs: dict[datetime, OpenMeteoSpatialCatalog] = {}
+
+    def load_reference_time(reference_time: datetime) -> OpenMeteoSpatialCatalog:
         if reference_time == latest_catalog.reference_time_utc:
             catalog = latest_catalog
         else:
@@ -234,8 +243,43 @@ def discover_openmeteo_spatial_runs(
                 )
             )
             catalog = parse_openmeteo_spatial_latest(latest_catalog.model, payload)
-        runs.append(om_run_from_spatial_catalog(product_name, catalog))
-    return runs
+        if not catalog.completed:
+            raise ValueError(
+                f"Open-Meteo spatial run is not complete: "
+                f"{latest_catalog.model} {reference_time.isoformat()}"
+            )
+        if catalog.reference_time_utc != reference_time:
+            raise ValueError(
+                f"run metadata reference time mismatch for {latest_catalog.model}: "
+                f"expected {reference_time.isoformat()}, "
+                f"got {catalog.reference_time_utc.isoformat()}"
+            )
+        catalogs[reference_time] = catalog
+        return catalog
+
+    for reference_time in reference_times:
+        load_reference_time(reference_time)
+
+    if required_long_run_forecast_hour is not None:
+        probes = 0
+        cursor = min(reference_times)
+        while not any(
+            catalog.max_forecast_hour >= required_long_run_forecast_hour
+            for catalog in catalogs.values()
+        ):
+            if probes >= max_additional_runs:
+                raise ValueError(
+                    f"could not discover a {latest_catalog.model} run reaching forecast hour "
+                    f"{required_long_run_forecast_hour}"
+                )
+            cursor -= timedelta(hours=run_cadence_hours)
+            load_reference_time(cursor)
+            probes += 1
+
+    return [
+        om_run_from_spatial_catalog(product_name, catalogs[reference_time])
+        for reference_time in sorted(catalogs)
+    ]
 
 
 def coverage_object_records(

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "products": {
     "gfs013_surface": {
       "download_product": "om_gfs013_surface",
@@ -112,6 +112,76 @@
         "cloud_cover"
       ],
       "requested_pressure_levels_hpa": [1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50]
+    },
+    "ecmwf_ifs025": {
+      "download_product": "om_ecmwf_ifs025",
+      "openmeteo_model": "ecmwf_ifs025",
+      "forecast_hour_end": 360,
+      "history_hours": 6,
+      "coverage_strategy": "latest_with_long_run_tail",
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "temperature_2m",
+        "relative_humidity_2m",
+        "wind_u_component_10m",
+        "wind_v_component_10m",
+        "precipitation_type",
+        "cloud_cover",
+        "cloud_cover_high",
+        "cloud_cover_mid",
+        "cloud_cover_low",
+        "pressure_msl",
+        "cape",
+        "snow_depth",
+        "wind_gusts_10m",
+        "wind_u_component_100m",
+        "wind_v_component_100m",
+        "surface_temperature",
+        "temperature_2m_min",
+        "temperature_2m_max",
+        "total_column_integrated_water_vapour",
+        "runoff",
+        "snow_depth_water_equivalent",
+        "soil_temperature_0_to_7cm",
+        "soil_temperature_7_to_28cm",
+        "soil_temperature_28_to_100cm",
+        "soil_temperature_100_to_255cm",
+        "soil_moisture_0_to_7cm",
+        "soil_moisture_7_to_28cm",
+        "soil_moisture_28_to_100cm",
+        "soil_moisture_100_to_255cm",
+        "precipitation",
+        "shortwave_radiation",
+        "snowfall_water_equivalent"
+      ],
+      "required_sparse_variables": [],
+      "required_initial_fallback_variables": [
+        "wind_gusts_10m",
+        "temperature_2m_max",
+        "temperature_2m_min",
+        "shortwave_radiation",
+        "precipitation",
+        "runoff"
+      ],
+      "interpolation_support_hours": 12,
+      "optional_variables": [],
+      "required_pressure_variable_prefixes": [
+        "temperature",
+        "relative_humidity",
+        "wind_u_component",
+        "wind_v_component",
+        "geopotential_height",
+        "vertical_velocity"
+      ],
+      "requested_pressure_levels_hpa": [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10]
     },
     "cams_global": {
       "download_product": "om_cams_global",

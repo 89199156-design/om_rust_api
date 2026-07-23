@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decide whether one of the two 1Panel OM download tasks may start."""
+"""Decide whether a 1Panel OM production download task may start."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 
 
-TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD")
-WEBP_TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD")
+TASKS = ("OM_GFS_DOWNLOAD", "OM_CAMS_DOWNLOAD", "OM_ECMWF_DOWNLOAD")
+WEBP_TASKS = ("OM_GFS_WEBP_BUILD", "OM_CAMS_WEBP_BUILD", "OM_ECMWF_WEBP_BUILD")
 ALL_PRODUCTION_TASKS = TASKS + WEBP_TASKS
 
 
@@ -23,7 +23,9 @@ def decision(database: Path, current_task: str) -> tuple[str, str]:
         rows = {
             str(name): int(is_executing or 0)
             for name, is_executing in connection.execute(
-                "select name, is_executing from cronjobs where name in (?, ?, ?, ?)",
+                "select name, is_executing from cronjobs where name in ("
+                + ", ".join("?" for _ in ALL_PRODUCTION_TASKS)
+                + ")",
                 ALL_PRODUCTION_TASKS,
             )
         }

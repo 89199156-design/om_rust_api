@@ -7,7 +7,9 @@ usage() {
 }
 
 RAW_ROOT=""
-DEM_ROOT="${OM_DEM_ROOT:-/data/om_static}"
+DEM_ROOT="${OM_DEM_ROOT:-/opt/1panel/apps/weather_om_api/static}"
+STRICT_DATA_ROOT="${OM_STRICT_DATA_ROOT:-/data}"
+MINIMUM_FREE_BYTES="${OM_DATA_MIN_FREE_BYTES:-10737418240}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --raw-root) RAW_ROOT="${2:-}"; shift 2 ;;
@@ -28,6 +30,19 @@ REVISION_FILE="$API_APP_DIR/source-revision"
 [ -d "$RAW_ROOT" ] || { echo "OM raw root is unavailable: $RAW_ROOT" >&2; exit 1; }
 [ -d "$DEM_ROOT" ] || { echo "DEM root is unavailable: $DEM_ROOT" >&2; exit 1; }
 command -v flock >/dev/null 2>&1 || { echo "flock is required" >&2; exit 1; }
+mountpoint -q -- "$STRICT_DATA_ROOT" \
+  || { echo "strict data root is not mounted: $STRICT_DATA_ROOT" >&2; exit 1; }
+[ "$(stat -c %d /)" != "$(stat -c %d "$STRICT_DATA_ROOT")" ] \
+  || { echo "strict data root shares the system filesystem: $STRICT_DATA_ROOT" >&2; exit 1; }
+strict_real="$(readlink -f -- "$STRICT_DATA_ROOT")"
+raw_real="$(readlink -f -- "$RAW_ROOT")"
+case "$raw_real" in
+  "$strict_real"|"$strict_real"/*) ;;
+  *) echo "OM raw root escapes strict data root: $RAW_ROOT" >&2; exit 1 ;;
+esac
+[ "$(stat -c %d "$DEM_ROOT")" = "$(stat -c %d /)" ] \
+  || { echo "fixed DEM root must stay on the system filesystem: $DEM_ROOT" >&2; exit 1; }
+export OM_NATIVE_MINIMUM_FREE_BYTES="$MINIMUM_FREE_BYTES"
 
 mkdir -p "$RAW_ROOT/locks"
 exec 9>"$RAW_ROOT/locks/gfs_native_materialize.lock"

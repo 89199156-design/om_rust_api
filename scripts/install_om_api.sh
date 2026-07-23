@@ -6,15 +6,20 @@ DATA_ROOT="${OM_DATA_ROOT:-/data/om_raw}"
 BIND_ADDR="${OM_API_BIND:-127.0.0.1:8088}"
 SERVICE_NAME="${OM_API_SERVICE_NAME:-weather-om-api}"
 INSTALL_OWNER="${OM_API_USER:-ubuntu}"
-API_DEM_ROOT="${OM_API_DEM_ROOT:-/data/om_static}"
+API_DEM_ROOT="${OM_API_DEM_ROOT:-$INSTALL_DIR/static}"
+MODEL_STATIC_ROOT="${OM_API_MODEL_STATIC_ROOT:-$INSTALL_DIR}"
+STRICT_DATA_ROOT="${OM_STRICT_DATA_ROOT:-}"
 DEM_LATITUDE_CHUNK_MIN=0
 DEM_LATITUDE_CHUNK_MAX=58
 GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
 GFS013_STATIC_SHA256="${OM_GFS013_STATIC_SHA256:-203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0}"
-GFS013_STATIC_PATH="$DATA_ROOT/static/ncep_gfs013/HSURF.om"
+GFS013_STATIC_PATH="$MODEL_STATIC_ROOT/static/ncep_gfs013/HSURF.om"
 GFS025_STATIC_URL="${OM_GFS025_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs025/static/HSURF.om}"
 GFS025_STATIC_SHA256="${OM_GFS025_STATIC_SHA256:-fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d}"
-GFS025_STATIC_PATH="$DATA_ROOT/static/ncep_gfs025/HSURF.om"
+GFS025_STATIC_PATH="$MODEL_STATIC_ROOT/static/ncep_gfs025/HSURF.om"
+ECMWF025_STATIC_URL="${OM_ECMWF025_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ecmwf_ifs025/static/HSURF.om}"
+ECMWF025_STATIC_SHA256="${OM_ECMWF025_STATIC_SHA256:-935d56ba000b438b61504fbc271bfaa8f70db2acb541d58d5b466a24d294a9fb}"
+ECMWF025_STATIC_PATH="$MODEL_STATIC_ROOT/static/ecmwf_ifs025/HSURF.om"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -29,10 +34,34 @@ if [[ "$API_DEM_ROOT" != /* ]]; then
   echo "OM_API_DEM_ROOT must be an absolute path: $API_DEM_ROOT" >&2
   exit 2
 fi
+if [[ "$MODEL_STATIC_ROOT" != /* ]]; then
+  echo "OM_API_MODEL_STATIC_ROOT must be an absolute path: $MODEL_STATIC_ROOT" >&2
+  exit 2
+fi
+if [ -n "$STRICT_DATA_ROOT" ]; then
+  if ! mountpoint -q -- "$STRICT_DATA_ROOT"; then
+    echo "strict data root is not mounted: $STRICT_DATA_ROOT" >&2
+    exit 1
+  fi
+  if [ "$(stat -c %d /)" = "$(stat -c %d "$STRICT_DATA_ROOT")" ]; then
+    echo "strict data root shares the system filesystem: $STRICT_DATA_ROOT" >&2
+    exit 1
+  fi
+  strict_real="$(readlink -f -- "$STRICT_DATA_ROOT")"
+  data_real="$(readlink -m -- "$DATA_ROOT")"
+  case "$data_real" in
+    "$strict_real"|"$strict_real"/*) ;;
+    *)
+      echo "OM data root escapes strict data root: $DATA_ROOT" >&2
+      exit 1
+      ;;
+  esac
+fi
 DEM_STATIC_DIR="$API_DEM_ROOT/copernicus_dem90/static"
 BIN_DIR="$INSTALL_DIR/bin"
 NATIVE_DIR="$INSTALL_DIR/native"
 SOURCE_REVISION_FILE="$INSTALL_DIR/source-revision"
+SOURCE_ARCHIVE_DIR="$INSTALL_DIR/source-archives"
 ENV_FILE="$INSTALL_DIR/${SERVICE_NAME}.env"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 PINNED_OM_FILE_FORMAT_REF="71f422b2706d8a81f1cecf52ae3073990de1ddbe"
@@ -78,6 +107,8 @@ resolve_source_revision() {
 }
 
 SOURCE_REVISION="$(resolve_source_revision)"
+BUILD_REVISION="$SOURCE_REVISION"
+archive_name="om_weather_server-${SOURCE_REVISION}.tar.gz"
 
 validate_required_dem_chunks() {
   if [ ! -d "$DEM_STATIC_DIR" ]; then
@@ -123,6 +154,12 @@ if [ ! -d "$DATA_ROOT" ]; then
   exit 1
 fi
 
+if [ ! -d "$API_DEM_ROOT/copernicus_dem90/static" ]; then
+  echo "Copernicus DEM root does not exist: $API_DEM_ROOT/copernicus_dem90/static" >&2
+  echo "Set OM_API_DEM_ROOT to the shared DEM root before installing the API." >&2
+  exit 1
+fi
+
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
@@ -137,6 +174,99 @@ run_privileged() {
     "$@"
   fi
 }
+
+run_privileged install -d -m 0755 "$MODEL_STATIC_ROOT"
+system_device="$(stat -c %d /)"
+for fixed_root in "$API_DEM_ROOT" "$MODEL_STATIC_ROOT"; do
+  if [ "$(stat -c %d "$fixed_root")" != "$system_device" ]; then
+    echo "fixed model/static root must use the system filesystem: $fixed_root" >&2
+    exit 1
+  fi
+done
+
+install_corresponding_source_archive() (
+  set -euo pipefail
+
+  local archive_tmp=""
+  local archive_staged=""
+  local checksum_tmp=""
+  local checksum_staged=""
+  local actual_sha256=""
+  local supplied_archive="${OM_API_SOURCE_ARCHIVE:-}"
+  local supplied_sha256="${OM_API_SOURCE_ARCHIVE_SHA256:-}"
+
+  cleanup() {
+    set +e
+    if [ -n "$archive_tmp" ]; then
+      rm -f -- "$archive_tmp"
+    fi
+    if [ -n "$checksum_tmp" ]; then
+      rm -f -- "$checksum_tmp"
+    fi
+    if [ -n "$archive_staged" ]; then
+      run_privileged rm -f -- "$archive_staged"
+    fi
+    if [ -n "$checksum_staged" ]; then
+      run_privileged rm -f -- "$checksum_staged"
+    fi
+  }
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  archive_tmp="$(mktemp)"
+  if command -v git >/dev/null 2>&1 \
+    && git -C "$APP_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! command -v gzip >/dev/null 2>&1; then
+      echo "gzip is required to build the corresponding source archive" >&2
+      exit 1
+    fi
+    git -C "$APP_ROOT" archive \
+      --format=tar \
+      --prefix="om_weather_server-${SOURCE_REVISION}/" \
+      "$SOURCE_REVISION" \
+      | gzip -n -9 > "$archive_tmp"
+  else
+    if [ -z "$supplied_archive" ] || [ -z "$supplied_sha256" ]; then
+      echo "OM_API_SOURCE_ARCHIVE and OM_API_SOURCE_ARCHIVE_SHA256 are required outside a Git worktree" >&2
+      exit 1
+    fi
+    if [ ! -f "$supplied_archive" ] || [ ! -s "$supplied_archive" ]; then
+      echo "supplied corresponding source archive is missing or empty: $supplied_archive" >&2
+      exit 1
+    fi
+    if [[ ! "$supplied_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "OM_API_SOURCE_ARCHIVE_SHA256 must be a lowercase SHA-256 digest" >&2
+      exit 1
+    fi
+    cp -- "$supplied_archive" "$archive_tmp"
+    actual_sha256="$(sha256sum -- "$archive_tmp" | awk '{print $1}')"
+    if [ "$actual_sha256" != "$supplied_sha256" ]; then
+      echo "supplied corresponding source archive checksum mismatch: $actual_sha256" >&2
+      exit 1
+    fi
+  fi
+
+  actual_sha256="$(sha256sum -- "$archive_tmp" | awk '{print $1}')"
+  checksum_tmp="$(mktemp)"
+  printf '%s  %s\n' "$actual_sha256" "$archive_name" > "$checksum_tmp"
+
+  run_privileged install -d -m 0755 "$SOURCE_ARCHIVE_DIR"
+  archive_staged="$(run_privileged mktemp "$SOURCE_ARCHIVE_DIR/.${archive_name}.tmp.XXXXXX")"
+  checksum_staged="$(run_privileged mktemp "$SOURCE_ARCHIVE_DIR/.${archive_name}.sha256.tmp.XXXXXX")"
+  run_privileged install -m 0644 -- "$archive_tmp" "$archive_staged"
+  run_privileged install -m 0644 -- "$checksum_tmp" "$checksum_staged"
+  if [ "$(run_privileged sha256sum -- "$archive_staged" | awk '{print $1}')" != "$actual_sha256" ]; then
+    echo "staged corresponding source archive checksum mismatch" >&2
+    exit 1
+  fi
+  run_privileged mv -f -- "$archive_staged" "$SOURCE_ARCHIVE_DIR/$archive_name"
+  archive_staged=""
+  run_privileged mv -f -- "$checksum_staged" "$SOURCE_ARCHIVE_DIR/$archive_name.sha256"
+  checksum_staged=""
+  printf 'source_archive=%s\n' "$SOURCE_ARCHIVE_DIR/$archive_name"
+)
 
 install_verified_static_asset() (
   set -euo pipefail
@@ -218,6 +348,10 @@ install_verified_static_asset \
   "GFS013" "$GFS013_STATIC_URL" "$GFS013_STATIC_SHA256" "$GFS013_STATIC_PATH"
 install_verified_static_asset \
   "GFS025" "$GFS025_STATIC_URL" "$GFS025_STATIC_SHA256" "$GFS025_STATIC_PATH"
+install_verified_static_asset \
+  "ECMWF025" "$ECMWF025_STATIC_URL" "$ECMWF025_STATIC_SHA256" "$ECMWF025_STATIC_PATH"
+
+install_corresponding_source_archive
 
 OM_FILE_FORMAT_REF="${OM_FILE_FORMAT_REF:-$PINNED_OM_FILE_FORMAT_REF}"
 OM_FILE_FORMAT_REVISION_FILE="$NATIVE_DIR/om-file-format.source-revision"
@@ -236,7 +370,7 @@ else
   echo "reusing=$NATIVE_DIR/libomfileformat.so"
 fi
 
-cargo build --release \
+OM_BUILD_REVISION="$BUILD_REVISION" cargo build --release \
   --bin om-api \
   --bin om-native-materialize \
   --manifest-path "$APP_ROOT/om_api/Cargo.toml" \
@@ -281,6 +415,7 @@ trap - EXIT
 cat > "$ENV_FILE" <<EOF
 OM_DATA_ROOT=$DATA_ROOT
 OM_DEM_ROOT=$API_DEM_ROOT
+OM_MODEL_STATIC_ROOT=$MODEL_STATIC_ROOT
 OM_API_BIND=$BIND_ADDR
 OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
 OM_SNAPSHOT_REFRESH_SECONDS=30
@@ -338,5 +473,7 @@ $SUDO systemctl reload nginx
 echo "installed=$INSTALL_DIR"
 echo "service=$SERVICE_NAME"
 echo "bind=$BIND_ADDR"
+echo "build_revision=$BUILD_REVISION"
+echo "source_archive=$SOURCE_ARCHIVE_DIR/$archive_name"
 echo "source_revision=$SOURCE_REVISION"
 echo "source_revision_file=$SOURCE_REVISION_FILE"

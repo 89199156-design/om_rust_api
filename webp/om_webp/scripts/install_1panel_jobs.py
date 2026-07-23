@@ -7,6 +7,7 @@ from pathlib import Path
 
 AGENT_DB = Path("/opt/1panel/db/agent.db")
 APP_DIR = Path("/opt/1panel/apps/weather_om_webp")
+INITIAL_DISABLED_TASKS = {"OM_ECMWF_WEBP_BUILD"}
 
 
 def now_text() -> str:
@@ -27,11 +28,11 @@ def ensure_group(cur: sqlite3.Cursor, timestamp: str) -> int:
 
 
 def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, object]:
-    spec = (
-        "5 * * * *&&25 * * * *&&45 * * * *"
-        if scope == "gfs"
-        else "15 * * * *&&35 * * * *&&55 * * * *"
-    )
+    spec = {
+        "gfs": "5 * * * *&&25 * * * *&&45 * * * *",
+        "cams": "15 * * * *&&35 * * * *&&55 * * * *",
+        "ecmwf_ifs025": "35 14 * * *",
+    }[scope]
     script = "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -71,7 +72,7 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
         "retry_times": 0,
         "timeout": 21600,
         "retain_copies": 7,
-        "status": "Enable",
+        "status": "Disable" if name in INITIAL_DISABLED_TASKS else "Enable",
         "entry_ids": "",
         "secret": "",
         "group_id": group_id,
@@ -87,7 +88,7 @@ def existing_job_values(payload: dict[str, object]) -> dict[str, object]:
     return {
         key: value
         for key, value in payload.items()
-        if key not in {"entry_ids", "is_executing"}
+        if key not in {"entry_ids", "is_executing", "status"}
     }
 
 
@@ -100,7 +101,11 @@ def main() -> int:
         cur = con.cursor()
         columns = {str(row[1]) for row in cur.execute("pragma table_info(cronjobs)")}
         group_id = ensure_group(cur, timestamp)
-        for name, scope in (("OM_GFS_WEBP_BUILD", "gfs"), ("OM_CAMS_WEBP_BUILD", "cams")):
+        for name, scope in (
+            ("OM_GFS_WEBP_BUILD", "gfs"),
+            ("OM_CAMS_WEBP_BUILD", "cams"),
+            ("OM_ECMWF_WEBP_BUILD", "ecmwf_ifs025"),
+        ):
             payload = values(timestamp, name, scope, group_id)
             if "args" in columns:
                 payload["args"] = ""

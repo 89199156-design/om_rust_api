@@ -23,7 +23,10 @@ CONFIG = APP_DIR / "config" / "models.json"
 PYTHON = Path("/usr/bin/python3")
 PROGRESS_REPORTER = APP_DIR / "scripts" / "task_progress_reporter.py"
 GFS_MATERIALIZER = APP_DIR / "scripts" / "materialize_openmeteo_gfs.sh"
-LOG_DIR = APP_DIR / "data" / "logs"
+DOWNLOAD_ROOT = Path("/data/om_downloader")
+STRICT_DATA_ROOT = Path("/data")
+DATA_MINIMUM_FREE_BYTES = 10 * 1024 * 1024 * 1024
+LOG_DIR = APP_DIR / "logs"
 PRODUCTS = (
     "gfs013_surface",
     "gfs025",
@@ -34,7 +37,15 @@ PRODUCTS = (
 OPENMETEO_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
+    "ecmwf": ("ecmwf_ifs025",),
 }
+TASK_BY_GROUP = {
+    "gfs": "OM_GFS_DOWNLOAD",
+    "cams": "OM_CAMS_DOWNLOAD",
+    "ecmwf": "OM_ECMWF_DOWNLOAD",
+}
+INITIAL_DISABLED_TASKS = {"OM_ECMWF_DOWNLOAD"}
+DEFAULT_ECMWF_REFERENCE_TIME = "2026-07-23T00:00:00Z"
 REMOVED_PLACEHOLDER_TASKS = (
     "OM_BUILD_GFS013_SURFACE",
     "OM_BUILD_GFS_POINT_PACKAGE",
@@ -71,7 +82,7 @@ def download_script(product: str) -> str:
             "/usr/bin/python3 -m om_downloader.cli "
             f"--download-openmeteo-product {product} "
             f"--config {shell_path(CONFIG)} "
-            "--output data "
+            f"--output {shell_path(DOWNLOAD_ROOT)} "
             '--now "$(date -u +%Y-%m-%dT%H:00:00Z)"',
             "",
         ]
@@ -84,7 +95,9 @@ def download_group_script(
     publish_root: Path | None = None,
     source_sync_task: str | None = None,
 ) -> str:
-    current_task = "OM_GFS_DOWNLOAD" if group == "gfs" else "OM_CAMS_DOWNLOAD"
+    if group not in OPENMETEO_GROUP_PRODUCTS:
+        raise ValueError(f"unknown group: {group}")
+    current_task = TASK_BY_GROUP[group]
     publish_args = []
     if publish_root is not None:
         publish_args = [f"--publish-openmeteo-group-to {shell_path(publish_root)} "]
@@ -104,8 +117,15 @@ def download_group_script(
         "--object-range-max-multiplier 1.5 "
         "--object-range-min-ranges 16 "
         "--object-range-max-bytes 8388608 "
-        "--output data "
+        f"--output {shell_path(DOWNLOAD_ROOT)} "
         + "".join(publish_args)
+        + (
+            '--reference-time "${OM_ECMWF_REFERENCE_TIME:-'
+            + DEFAULT_ECMWF_REFERENCE_TIME
+            + '}" '
+            if group == "ecmwf"
+            else ""
+        )
         + '--now "$(date -u +%Y-%m-%dT%H:00:00Z)"'
     )
     return "\n".join(
@@ -150,6 +170,8 @@ def download_group_script(
             "run_download() {",
             f"  cd {shell_path(APP_DIR)}",
             f"  export OM_TURBOPFOR_LIB={shell_path(NATIVE_LIB)}",
+            f"  export OM_STRICT_DATA_ROOT={shell_path(STRICT_DATA_ROOT)}",
+            f"  export OM_DATA_MIN_FREE_BYTES={DATA_MINIMUM_FREE_BYTES}",
             f"  {command}",
             *(
                 [
@@ -167,7 +189,7 @@ def download_group_script(
             "  ) 2>&1 | "
             f"{shell_path(PYTHON)} {shell_path(PROGRESS_REPORTER)} "
             f"--task {shlex.quote(group.upper() + ' 下载')} "
-            f"--watch-root {shell_path(APP_DIR / 'data')} "
+            f"--watch-root {shell_path(DOWNLOAD_ROOT)} "
             "--watch-root /data/om_raw "
             f"--log-file {shell_path(LOG_DIR / ('om_' + group + '_download.log'))}",
             "}",
@@ -184,6 +206,7 @@ def downloader_tasks() -> list[tuple[str, str, str]]:
     return [
         ("OM_GFS_DOWNLOAD", "0 * * * *&&20 * * * *&&40 * * * *", download_group_script("gfs")),
         ("OM_CAMS_DOWNLOAD", "10 * * * *&&30 * * * *&&50 * * * *", download_group_script("cams")),
+        ("OM_ECMWF_DOWNLOAD", "20 14 * * *", download_group_script("ecmwf")),
     ]
 
 
@@ -194,6 +217,11 @@ def api_publisher_tasks(*, raw_root: Path) -> list[tuple[str, str, str]]:
             "OM_CAMS_DOWNLOAD",
             "10 * * * *&&30 * * * *&&50 * * * *",
             download_group_script("cams", publish_root=raw_root),
+        ),
+        (
+            "OM_ECMWF_DOWNLOAD",
+            "20 14 * * *",
+            download_group_script("ecmwf", publish_root=raw_root),
         ),
     ]
 
@@ -232,6 +260,8 @@ def source_sync_task_script(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
+            f"export OM_STRICT_DATA_ROOT={shell_path(STRICT_DATA_ROOT)}",
+            f"export OM_DATA_MIN_FREE_BYTES={DATA_MINIMUM_FREE_BYTES}",
             'if [ "$(id -u)" -eq 0 ]; then',
             f"  exec sudo -H -u ubuntu {command}",
             "fi",
@@ -292,6 +322,11 @@ def api_source_sync_tasks(
                 raw_root=raw_root,
             ),
         ),
+        (
+            "OM_ECMWF_DOWNLOAD",
+            "20 14 * * *",
+            download_group_script("ecmwf", publish_root=raw_root),
+        ),
     ]
 
 
@@ -338,7 +373,7 @@ def _cronjob_values(timestamp: str, name: str, spec: str, script: str, group_id:
         "retry_times": 0,
         "timeout": 21600,
         "retain_copies": 7,
-        "status": "Enable",
+        "status": "Disable" if name in INITIAL_DISABLED_TASKS else "Enable",
         "entry_ids": "",
         "secret": "",
         "group_id": group_id,
@@ -354,7 +389,7 @@ def _existing_cronjob_values(values: dict[str, object]) -> dict[str, object]:
     return {
         key: value
         for key, value in values.items()
-        if key not in {"entry_ids", "is_executing"}
+        if key not in {"entry_ids", "is_executing", "status"}
     }
 
 

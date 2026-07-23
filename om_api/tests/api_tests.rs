@@ -45,7 +45,7 @@ fn write_product_coverage_timed(
     make_current: bool,
 ) {
     let product_root = root.join(product);
-    let coverage_root = product_root.join("coverages").join(&coverage_id);
+    let coverage_root = product_root.join("coverages").join(coverage_id);
     fs::create_dir_all(&coverage_root).unwrap();
     let bundle_path = coverage_root.join(format!("{product}.omranges"));
     let mut bundle = Vec::new();
@@ -1232,7 +1232,7 @@ async fn chinese_hourly_aqi_uses_current_one_hour_concentrations() {
     let mut entries = Vec::new();
     for hour in 0..24 {
         let pm2_5 = if hour == 23 { 60.0 } else { 30.0 };
-        let ozone = if hour >= 16 && hour < 23 {
+        let ozone = if (16..23).contains(&hour) {
             300.0
         } else {
             100.0
@@ -1461,7 +1461,7 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
         "gfs013_surface",
         vec![TestEntry {
             variable: "temperature_2m",
-            values: [28.049999, 0.0, 0.0, 0.0],
+            values: [28.05, 0.0, 0.0, 0.0],
         }],
     );
     write_group_ready(root.path(), "gfs", &[("gfs013_surface", &gfs013)]);

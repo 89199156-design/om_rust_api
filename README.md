@@ -13,6 +13,44 @@ single Git commit identifies the complete production source state. The
 standalone `om_downloader_sh` and `om_weather_webp` repositories are retired
 and must not be used for production changes.
 
+## Production storage layout
+
+- `/opt/1panel/apps/weather_om_api/static` stores immutable, checksum-verified
+  Copernicus DEM90 chunks plus GFS/ECMWF `HSURF.om` model-elevation grids on
+  the system disk.
+- `/data/om_downloader`, `/data/om_raw`, `/data/om_webp`, and
+  `/data/validation` store growing cycle payloads and validation evidence on the
+  dedicated data disk.
+- Native GFS coverage markers reference DEM90 through `OM_DEM_ROOT`; all model
+  groups reference fixed HSURF grids through `OM_MODEL_STATIC_ROOT`. Neither
+  fixed dataset is copied into growing `/data` cycle directories.
+- Production download and WebP jobs require `/data` to be a distinct mounted
+  filesystem and preserve at least 10 GiB free. A failed preflight leaves the
+  previously published immutable batch active and never spills into `/`.
+
+## License, deployed source, and data attribution
+
+Repository source is offered under `AGPL-3.0-or-later`; see [`LICENSE`](LICENSE)
+and [`NOTICE.md`](NOTICE.md). A production API exposes `/v1/source` with its
+compile-time Git revision, the corresponding tracked-source archive, and the
+archive SHA-256 file. The installer refuses a dirty checkout before building,
+so the revision named by the service and the archived source describe the same
+tracked tree.
+
+Weather and terrain data retain their providers' terms. Source URLs,
+transformations, attribution text, and known provenance limitations are in
+[`DATA_SOURCES.md`](DATA_SOURCES.md); third-party software is recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The public API also exposes
+`/.well-known/weather-attribution.json`, and ECMWF WebP catalogs/manifests
+carry machine-readable attribution.
+
+The full `om-file-format` decoder is pinned and emits build metadata and an
+artifact hash. Its upstream `GPL-2.0-only` license has an unresolved
+compatibility question with this project's `AGPL-3.0-or-later` service.
+Project policy therefore limits it to server-internal use and forbids placing
+it in distributed clients, SDKs, containers, or third-party native packages
+until upstream clarification or qualified legal review resolves that issue.
+
 ## Singapore native OM API
 
 The Rust API can read the producer's `openmeteo-native-v1` coverages directly.

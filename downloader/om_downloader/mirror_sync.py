@@ -12,14 +12,23 @@ from urllib.parse import urljoin
 from urllib.request import urlopen
 
 from .checksum import sha256_file
+from .static_assets import (
+    OPENMETEO_STATIC_ASSETS,
+    StaticAssetSpec,
+    static_asset_path,
+    verify_static_asset,
+)
+from .storage_guard import enforce_environment_storage_guard
 
 OPENMETEO_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
+    "ecmwf": ("ecmwf_ifs025",),
 }
 MINIMUM_GROUP_PRODUCTS = {
     "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
+    "ecmwf": ("ecmwf_ifs025",),
 }
 GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 DEFAULT_COMPLETE_RELEASE_RETENTION = 3
@@ -110,6 +119,130 @@ def _products_from_group_manifest(group_manifest: dict[str, Any], group: str) ->
     return tuple(product for product in allowed if product in summaries)
 
 
+def _static_assets_from_group_manifest(
+    group_manifest: dict[str, Any],
+    group: str,
+) -> dict[str, tuple[StaticAssetSpec, dict[str, Any]]]:
+    raw = group_manifest.get("static_assets", {})
+    if not isinstance(raw, dict):
+        raise ValueError(f"group manifest has invalid static assets: {group}")
+    required_models = {
+        model for model in OPENMETEO_GROUP_PRODUCTS[group] if model in OPENMETEO_STATIC_ASSETS
+    }
+    if set(raw) != required_models:
+        raise ValueError(
+            f"group manifest static assets mismatch for {group}: "
+            f"expected {sorted(required_models)}, got {sorted(raw)}"
+        )
+    assets: dict[str, tuple[StaticAssetSpec, dict[str, Any]]] = {}
+    for model in sorted(required_models):
+        record = raw.get(model)
+        spec = OPENMETEO_STATIC_ASSETS[model]
+        if not isinstance(record, dict):
+            raise ValueError(f"group manifest static asset is invalid: {model}")
+        if record.get("model") != model:
+            raise ValueError(f"group manifest static asset model mismatch: {model}")
+        if record.get("path") != spec.relative_path.as_posix():
+            raise ValueError(f"group manifest static asset path mismatch: {model}")
+        if int(record.get("bytes") or -1) != spec.bytes:
+            raise ValueError(f"group manifest static asset size mismatch: {model}")
+        if record.get("sha256") != spec.sha256:
+            raise ValueError(f"group manifest static asset checksum mismatch: {model}")
+        if (
+            record.get("storage") != "external_env"
+            or record.get("environment") != "OM_MODEL_STATIC_ROOT"
+        ):
+            raise ValueError(f"group manifest static asset storage mismatch: {model}")
+        source_url = record.get("source_url")
+        if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+            raise ValueError(f"group manifest static asset source URL is invalid: {model}")
+        assets[model] = (spec, record)
+    return assets
+
+
+def _local_static_assets_match(
+    group_manifest: dict[str, Any],
+    output_root: Path,
+    group: str,
+) -> bool:
+    try:
+        assets = _static_assets_from_group_manifest(group_manifest, group)
+    except ValueError:
+        return False
+    del output_root
+    return all(
+        record.get("storage") == "external_env"
+        and record.get("environment") == "OM_MODEL_STATIC_ROOT"
+        for _spec, record in assets.values()
+    )
+
+
+def _prepare_static_asset_stages(
+    group_manifest: dict[str, Any],
+    mirror_root: Path,
+    output_root: Path,
+    group: str,
+) -> list[dict[str, Any]]:
+    stages: list[dict[str, Any]] = []
+    for model, (spec, _record) in _static_assets_from_group_manifest(
+        group_manifest,
+        group,
+    ).items():
+        if _record.get("storage") == "external_env":
+            continue
+        source = static_asset_path(mirror_root, spec)
+        if not verify_static_asset(source, spec):
+            raise ValueError(f"source static asset is missing or corrupt: {source}")
+        target = static_asset_path(output_root, spec)
+        if verify_static_asset(target, spec):
+            stages.append({"status": "skipped", "model": model, "target": target})
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + f".incoming.{os.getpid()}.tmp")
+        temporary.unlink(missing_ok=True)
+        try:
+            shutil.copyfile(source, temporary)
+            if not verify_static_asset(temporary, spec):
+                raise ValueError(f"staged static asset failed verification: {temporary}")
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        stages.append(
+            {
+                "status": "staged",
+                "model": model,
+                "temporary": temporary,
+                "target": target,
+            }
+        )
+    return stages
+
+
+def _remove_static_asset_stages(stages: list[dict[str, Any]]) -> None:
+    for stage in stages:
+        temporary = stage.get("temporary")
+        if isinstance(temporary, Path):
+            temporary.unlink(missing_ok=True)
+
+
+def _promote_static_asset_stages(stages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for stage in stages:
+        if stage["status"] == "staged":
+            os.replace(stage["temporary"], stage["target"])
+            status = "synced"
+        else:
+            status = "skipped"
+        results.append(
+            {
+                "status": status,
+                "model": stage["model"],
+                "path": str(stage["target"]),
+            }
+        )
+    return results
+
+
 def group_release_id(group_manifest: dict[str, Any]) -> str:
     group = str(group_manifest.get("group") or "")
     if group not in OPENMETEO_GROUP_PRODUCTS:
@@ -125,8 +258,24 @@ def group_release_id(group_manifest: dict[str, Any]) -> str:
         }
         for product in products
     }
+    static_summary = {
+        model: {
+            "path": record.get("path"),
+            "bytes": record.get("bytes"),
+            "sha256": record.get("sha256"),
+            "storage": record.get("storage"),
+            "environment": record.get("environment"),
+        }
+        for model, (_spec, record) in _static_assets_from_group_manifest(
+            group_manifest,
+            group,
+        ).items()
+    }
+    identity: dict[str, Any] = {"group": group, "products": summary}
+    if static_summary:
+        identity["static_assets"] = static_summary
     encoded = json.dumps(
-        {"group": group, "products": summary},
+        identity,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -228,6 +377,10 @@ def _manifest_stage_bytes(manifest: dict[str, Any]) -> int:
 def _ensure_stage_capacity(output_root: Path, manifests: list[dict[str, Any]]) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     required_bytes = sum(_manifest_stage_bytes(manifest) for manifest in manifests)
+    enforce_environment_storage_guard(
+        output_root,
+        additional_bytes=required_bytes,
+    )
     available_bytes = shutil.disk_usage(output_root).free
     if available_bytes < required_bytes:
         raise OSError(
@@ -323,6 +476,7 @@ def _group_manifest_is_complete(group_manifest: dict[str, Any], group: str) -> b
         return False
     try:
         products = _products_from_group_manifest(group_manifest, group)
+        _static_assets_from_group_manifest(group_manifest, group)
     except ValueError:
         return False
     summaries = group_manifest["product_manifests"]
@@ -349,6 +503,10 @@ def _local_group_matches(group_manifest: dict[str, Any], output_root: Path, grou
     if local.get("status") != "complete":
         return False
     if local.get("latest_complete_run") != group_manifest.get("latest_complete_run"):
+        return False
+    if local.get("static_assets", {}) != group_manifest.get("static_assets", {}):
+        return False
+    if not _local_static_assets_match(group_manifest, output_root, group):
         return False
     remote_products = group_manifest.get("product_manifests") or {}
     local_products = local.get("product_manifests") or {}
@@ -550,6 +708,8 @@ def activate_group_release(
     if not _group_manifest_is_complete(release, group):
         raise ValueError(f"group release is not complete: {group}")
     now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if not _local_static_assets_match(release, output_root, group):
+        raise ValueError(f"retained group static assets are missing or corrupt: {group}")
     products = _products_from_group_manifest(release, group)
     summaries = release["product_manifests"]
     manifests: dict[str, dict[str, Any]] = {}
@@ -1053,9 +1213,16 @@ def sync_group_from_mirror(
     _ensure_stage_capacity(output_root, manifests_to_stage)
 
     staged = []
+    static_stages: list[dict[str, Any]] = []
     promoted = []
     manifests_by_product = {str(manifest["model"]): manifest for manifest in manifests_to_stage}
     try:
+        static_stages = _prepare_static_asset_stages(
+            group_manifest,
+            mirror_root,
+            output_root,
+            group,
+        )
         for product in products:
             summary = group_summaries[product]
             manifest = manifests_by_product.get(product)
@@ -1073,8 +1240,10 @@ def sync_group_from_mirror(
     except Exception:
         for stage in staged:
             _remove_stage(stage)
+        _remove_static_asset_stages(static_stages)
         raise
     promoted.extend(_promote_manifest_stage(stage) for stage in staged)
+    static_results = _promote_static_asset_stages(static_stages)
     _archive_current_group_release(output_root, group, now_utc=now)
     _write_group_ready(group, group_manifest, output_root, mirror_root)
     _write_group_release(output_root, group, group_manifest, mirror_root, now_utc=now)
@@ -1091,6 +1260,7 @@ def sync_group_from_mirror(
         "products": len(promoted),
         "files": sum(int(item.get("files") or 0) for item in promoted),
         "bytes": group_manifest.get("bytes"),
+        "static_assets": static_results,
         "pruned_raw_paths": pruned,
         "pruned_mirror_paths": [],
     }
