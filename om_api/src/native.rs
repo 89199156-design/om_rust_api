@@ -12,6 +12,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const OM_TRAILER_SIZE: u64 = 24;
+const GFS013_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs013/HSURF.om";
+const GFS013_HSURF_BYTES: u64 = 1_455_544;
+const GFS013_HSURF_SHA256: &str =
+    "203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0";
+const GFS025_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs025/HSURF.om";
+const GFS025_HSURF_BYTES: u64 = 408_440;
+const GFS025_HSURF_SHA256: &str =
+    "fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d";
 
 #[derive(Debug, Deserialize)]
 struct NativeReady {
@@ -50,9 +58,16 @@ struct NativeStaticSourceReady {
     storage: Option<String>,
     #[serde(default)]
     environment: Option<String>,
-    latitude_chunk_min: i32,
-    latitude_chunk_max: i32,
-    file_count: usize,
+    #[serde(default)]
+    latitude_chunk_min: Option<i32>,
+    #[serde(default)]
+    latitude_chunk_max: Option<i32>,
+    #[serde(default)]
+    file_count: Option<usize>,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -594,9 +609,11 @@ fn validate_dem(coverage_root: &Path, ready: &NativeReady) -> Result<()> {
     };
     if dem.source != "copernicus_dem90"
         || dem.runtime_path != "copernicus_dem90/static"
-        || dem.latitude_chunk_min != 0
-        || dem.latitude_chunk_max != 58
-        || dem.file_count != 59
+        || dem.latitude_chunk_min != Some(0)
+        || dem.latitude_chunk_max != Some(58)
+        || dem.file_count != Some(59)
+        || dem.bytes.is_some()
+        || dem.sha256.is_some()
     {
         bail!("native Copernicus DEM90 contract does not match Singapore region");
     }
@@ -613,13 +630,74 @@ fn validate_dem(coverage_root: &Path, ready: &NativeReady) -> Result<()> {
         }
         _ => bail!("unsupported native Copernicus DEM90 storage contract"),
     };
-    for latitude in dem.latitude_chunk_min..=dem.latitude_chunk_max {
+    for latitude in dem.latitude_chunk_min.unwrap()..=dem.latitude_chunk_max.unwrap() {
         let path = runtime_root
             .join(&dem.runtime_path)
             .join(format!("lat_{latitude}.om"));
         if !path.is_file() || path.metadata()?.len() == 0 {
             bail!(
                 "required Copernicus DEM90 chunk is missing: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_gfs_model_static(ready: &NativeReady) -> Result<()> {
+    let expected = [
+        (
+            "ncep_gfs013_hsurf",
+            GFS013_HSURF_RELATIVE_PATH,
+            GFS013_HSURF_BYTES,
+            GFS013_HSURF_SHA256,
+        ),
+        (
+            "ncep_gfs025_hsurf",
+            GFS025_HSURF_RELATIVE_PATH,
+            GFS025_HSURF_BYTES,
+            GFS025_HSURF_SHA256,
+        ),
+    ];
+    let declared = expected
+        .iter()
+        .filter(|(key, _, _, _)| ready.static_sources.contains_key(*key))
+        .count();
+    if declared == 0 {
+        // Backwards compatibility for immutable v3/v4 coverages, where HSURF
+        // lived inside the coverage and only DEM90 appeared in this marker.
+        return Ok(());
+    }
+    if declared != expected.len() {
+        bail!("native GFS marker must declare both external model elevation files");
+    }
+    let root = std::env::var_os("OM_MODEL_STATIC_ROOT")
+        .map(PathBuf::from)
+        .context("external GFS model elevation requires OM_MODEL_STATIC_ROOT")?;
+    if !root.is_absolute() {
+        bail!("OM_MODEL_STATIC_ROOT must be absolute for external GFS model elevation");
+    }
+    for (key, relative_path, expected_bytes, expected_sha256) in expected {
+        let source = ready
+            .static_sources
+            .get(key)
+            .with_context(|| format!("native GFS marker has no {key} contract"))?;
+        if source.source != key
+            || source.runtime_path != relative_path
+            || source.storage.as_deref() != Some("external_env")
+            || source.environment.as_deref() != Some("OM_MODEL_STATIC_ROOT")
+            || source.latitude_chunk_min.is_some()
+            || source.latitude_chunk_max.is_some()
+            || source.file_count != Some(1)
+            || source.bytes != Some(expected_bytes)
+            || source.sha256.as_deref() != Some(expected_sha256)
+        {
+            bail!("native GFS external model elevation contract is invalid for {key}");
+        }
+        let path = root.join(relative_path);
+        if !path.is_file() || path.metadata()?.len() != expected_bytes {
+            bail!(
+                "native GFS external model elevation file is invalid: {}",
                 path.display()
             );
         }
@@ -667,6 +745,7 @@ pub fn load_native_group_products(
     // the immutable coverage named by the old marker instead of failing startup.
     if group == "gfs" {
         validate_dem(&coverage_root, &ready)?;
+        validate_gfs_model_static(&ready)?;
     }
 
     for product in group_products {
@@ -798,6 +877,66 @@ mod tests {
             native_time_indices("cams_global", &meta, 41).unwrap(),
             (0..=120).step_by(3).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn deserializes_heterogeneous_external_static_contracts() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "gfs",
+            "coverage_id": "gfs_native_2026071300",
+            "latest_complete_run": "2026071300",
+            "source_runs": [
+                "2026071200",
+                "2026071206",
+                "2026071212",
+                "2026071218",
+                "2026071300"
+            ],
+            "public_start_utc": "2026-07-12T00:00:00Z",
+            "coverage_path": "coverages/gfs/gfs_native_2026071300",
+            "products": {},
+            "static_sources": {
+                "copernicus_dem90": {
+                    "source": "copernicus_dem90",
+                    "runtime_path": "copernicus_dem90/static",
+                    "storage": "external_env",
+                    "environment": "OM_DEM_ROOT",
+                    "latitude_chunk_min": 0,
+                    "latitude_chunk_max": 58,
+                    "file_count": 59
+                },
+                "ncep_gfs013_hsurf": {
+                    "source": "ncep_gfs013_hsurf",
+                    "runtime_path": GFS013_HSURF_RELATIVE_PATH,
+                    "storage": "external_env",
+                    "environment": "OM_MODEL_STATIC_ROOT",
+                    "file_count": 1,
+                    "bytes": GFS013_HSURF_BYTES,
+                    "sha256": GFS013_HSURF_SHA256
+                },
+                "ncep_gfs025_hsurf": {
+                    "source": "ncep_gfs025_hsurf",
+                    "runtime_path": GFS025_HSURF_RELATIVE_PATH,
+                    "storage": "external_env",
+                    "environment": "OM_MODEL_STATIC_ROOT",
+                    "file_count": 1,
+                    "bytes": GFS025_HSURF_BYTES,
+                    "sha256": GFS025_HSURF_SHA256
+                }
+            }
+        }))
+        .unwrap();
+
+        let dem = ready.static_sources.get("copernicus_dem90").unwrap();
+        assert_eq!(dem.latitude_chunk_min, Some(0));
+        assert_eq!(dem.latitude_chunk_max, Some(58));
+        assert_eq!(dem.bytes, None);
+        let gfs013 = ready.static_sources.get("ncep_gfs013_hsurf").unwrap();
+        assert_eq!(gfs013.latitude_chunk_min, None);
+        assert_eq!(gfs013.bytes, Some(GFS013_HSURF_BYTES));
+        assert_eq!(gfs013.sha256.as_deref(), Some(GFS013_HSURF_SHA256));
     }
 
     #[test]
