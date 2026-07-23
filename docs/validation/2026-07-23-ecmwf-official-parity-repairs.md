@@ -66,6 +66,18 @@ hourly 144..156:
 Regression:
 `ecmwf_first_stage_matches_captured_official_sparse_solar_transition`.
 
+## Precipitation-type JSON precision
+
+After the sparse-solar repair, strict comparison advanced to
+`hourly.precipitation_type[0]`. Both responses held the value one, but the
+official dimensionless unit writer emitted the JSON number `1.0`, while the
+clone emitted the JSON integer `1`. The repair assigns the official one-decimal
+dimensionless output precision to `precipitation_type`; it does not alter the
+stored or calculated category.
+
+Regression:
+`precipitation_type_uses_official_dimensionless_json_precision`.
+
 ## Verification contract
 
 Every repair requires the complete Rust unit and API suite, deployment from

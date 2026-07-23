@@ -10546,6 +10546,14 @@ mod output_tests {
     }
 
     #[test]
+    fn precipitation_type_uses_official_dimensionless_json_precision() {
+        assert_eq!(
+            json_array_for_variable("precipitation_type", vec![1.0, 0.0]).to_string(),
+            "[1.0,0.0]"
+        );
+    }
+
+    #[test]
     fn public_hourly_scope_keeps_core_outputs_and_hides_internal_inputs() {
         for variable in [
             "temperature_2m",
@@ -10843,7 +10851,6 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "chinese_aqi_carbon_monoxide" => OutputDecimals::Integer,
         "weather_code"
         | "weathercode"
-        | "precipitation_type"
         | "relative_humidity_2m"
         | "relativehumidity_2m"
         | "cloud_cover"
@@ -10864,6 +10871,7 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "winddirection_120m"
         | "categorical_freezing_rain"
         | "is_day" => OutputDecimals::Integer,
+        "precipitation_type" => OutputDecimals::Fixed(1),
         "wind_speed_10m"
         | "windspeed_10m"
         | "wind_speed_80m"
