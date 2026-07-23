@@ -86,6 +86,10 @@ class InstallOmApiTests(unittest.TestCase):
             'run_privileged rm -f -- "$target_path"',
             self.content,
         )
+        self.assertIn(
+            'run_privileged install -m 0644 -- "$ENV_FILE_TMP" "$ENV_FILE"',
+            self.content,
+        )
 
     def test_service_file_limit_covers_native_forecast_inventory(self) -> None:
         self.assertIn("LimitNOFILE=65536", self.content)

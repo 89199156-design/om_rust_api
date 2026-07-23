@@ -412,7 +412,12 @@ mv -f -- "$SOURCE_REVISION_TMP" "$SOURCE_REVISION_FILE"
 SOURCE_REVISION_TMP=""
 trap - EXIT
 
-cat > "$ENV_FILE" <<EOF
+ENV_FILE_TMP="$(mktemp)"
+cleanup_env_file_tmp() {
+  rm -f -- "$ENV_FILE_TMP"
+}
+trap cleanup_env_file_tmp EXIT
+cat > "$ENV_FILE_TMP" <<EOF
 OM_DATA_ROOT=$DATA_ROOT
 OM_DEM_ROOT=$API_DEM_ROOT
 OM_MODEL_STATIC_ROOT=$MODEL_STATIC_ROOT
@@ -421,6 +426,10 @@ OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
 OM_SNAPSHOT_REFRESH_SECONDS=30
 RUST_LOG=info,tower_http=warn
 EOF
+run_privileged install -m 0644 -- "$ENV_FILE_TMP" "$ENV_FILE"
+rm -f -- "$ENV_FILE_TMP"
+ENV_FILE_TMP=""
+trap - EXIT
 
 $SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
 [Unit]
