@@ -525,6 +525,26 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
         )
         self.assertTrue(all(weight <= daily_limit for weight in weights.values()))
 
+    def test_local_and_ssh_public_executors_keep_declared_static_order(self) -> None:
+        requesters = compare.build_public_executor_requesters(
+            "terminal-shanghai",
+            [
+                "terminal-156=ubuntu@43.156.81.216",
+                "terminal-162=ubuntu@43.162.112.201",
+            ],
+        )
+
+        self.assertEqual(
+            list(requesters),
+            ["terminal-shanghai", "terminal-156", "terminal-162"],
+        )
+        self.assertIs(requesters["terminal-shanghai"], compare._request_once)
+        with self.assertRaisesRegex(compare.ValidationError, "duplicate"):
+            compare.build_public_executor_requesters(
+                "terminal-156",
+                ["terminal-156=ubuntu@43.156.81.216"],
+            )
+
     def test_ssh_executor_requests_gzip_and_returns_decompressed_json(self) -> None:
         raw = b'{"status":"ok"}'
         meta = {

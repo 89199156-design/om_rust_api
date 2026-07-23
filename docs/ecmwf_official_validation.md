@@ -208,6 +208,16 @@ python3 scripts/validation/ecmwf_official_compare.py \
 
 分配是确定性的：相同计划、配置和终端顺序得到相同绑定。某终端返回 429 时，验证器遵守 Retry-After 并留在原终端；若最终失败则停止，不会把该批次转给其他终端。
 
+运行验证器的机器本身也可作为一个预先声明的独立终端。它始终排在随后声明的 SSH 执行器之前参与静态分配：
+
+~~~bash
+  --public-local-executor terminal-shanghai \
+  --public-ssh-executor terminal-156=ubuntu@43.156.81.216 \
+  --public-ssh-executor terminal-162=ubuntu@43.162.112.201
+~~~
+
+本机执行器不是失败后的动态回退；必须在新快照目录开始网络请求前声明并固定。旧的失败快照目录应原样保留，不能通过改变执行器顺序覆盖或续写。
+
 每个官方批次会把 canonical JSON request body 单独保存并哈希。若公共诊断因单请求权重被分批，每批重复同一 sentinel；同一语义的 sentinel 361 小时 + 15 日规范化哈希必须一致，否则整份快照无效。
 
 SSH 执行器使用标准 `Accept-Encoding: gzip` 接收大响应，并在执行器内完整解压后再计算响应字节数、SHA-256 和回传原始 JSON。压缩仅作用于 HTTP 传输，不改变 canonical 请求、落盘响应或逐值比较语义。

@@ -3275,6 +3275,28 @@ def parse_public_ssh_executors(
     return requesters
 
 
+def build_public_executor_requesters(
+    local_executor_id: str | None,
+    ssh_specifications: Iterable[str],
+) -> dict[str, Callable[..., HttpResult]]:
+    requesters: dict[str, Callable[..., HttpResult]] = {}
+    if local_executor_id is not None:
+        if not local_executor_id or any(
+            character.isspace() for character in local_executor_id
+        ):
+            raise ValidationError(
+                "public local executor id must be non-empty and contain no whitespace"
+            )
+        requesters[local_executor_id] = _request_once
+    for executor_id, requester in parse_public_ssh_executors(
+        ssh_specifications
+    ).items():
+        if executor_id in requesters:
+            raise ValidationError(f"duplicate public executor id: {executor_id}")
+        requesters[executor_id] = requester
+    return requesters
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(default_config_path()))
@@ -3314,6 +3336,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "statically assign public request batches to named independent SSH "
             "terminals; may be repeated"
+        ),
+    )
+    fetch_parser.add_argument(
+        "--public-local-executor",
+        metavar="ID",
+        help=(
+            "include the machine running this command as one statically assigned "
+            "public executor"
         ),
     )
     fetch_parser.add_argument("--max-new-requests", type=int, default=0)
@@ -3389,8 +3419,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 api_key_environment=args.api_key_env,
                 allow_loopback_mock=args.allow_loopback_mock,
             )
-            public_requesters = parse_public_ssh_executors(
-                args.public_ssh_executor
+            public_requesters = build_public_executor_requesters(
+                args.public_local_executor,
+                args.public_ssh_executor,
             )
             index = fetch_official(
                 plan,
