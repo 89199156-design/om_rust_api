@@ -6676,19 +6676,22 @@ fn interpolate_solar_backwards_value(
     if b_value.is_nan() {
         return f32::NAN;
     }
-    let output_solar =
-        extra_terrestrial_radiation_backwards(time, output_dt_seconds.max(1), latitude, longitude)
-            / SOLAR_CONSTANT;
+    let output_solar = extra_terrestrial_radiation_factor_backwards(
+        time,
+        output_dt_seconds.max(1),
+        latitude,
+        longitude,
+    );
     if output_solar == 0.0 {
         return 0.0;
     }
     let sample_solar = |index: usize| {
-        extra_terrestrial_radiation_backwards(
+        extra_terrestrial_radiation_factor_backwards(
             native_times[index],
             native_dt_seconds_at(native_times, index),
             latitude,
             longitude,
-        ) / SOLAR_CONSTANT
+        )
     };
     let minimum_solar = 5.0 / SOLAR_CONSTANT;
     let radiation_limit = SOLAR_CONSTANT * 0.95;
@@ -9581,6 +9584,37 @@ mod tests {
             solar_interpolation_position(&native, start + Duration::hours(2), 3600).unwrap();
         assert_eq!((two_hours_later.b, two_hours_later.c), (1, 2));
         assert_eq!(two_hours_later.fraction, 0.0);
+    }
+
+    #[test]
+    fn solar_interpolation_preserves_normalized_factor_at_integer_boundary() {
+        // Frozen p0076 inputs at 2026-08-02T11:00Z. Multiplying the normalized
+        // solar factor by SOLAR_CONSTANT and dividing it back loses one ULP and
+        // incorrectly rounds the public value to 367 instead of the official 366.
+        let native_times = [
+            Utc.with_ymd_and_hms(2026, 8, 2, 9, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 2, 15, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 2, 18, 0, 0).unwrap(),
+        ];
+        let value = interpolate_solar_backwards_value(
+            [772.0, 362.0, 19.0, 0.0],
+            &native_times,
+            SolarInterpolationPosition {
+                a: 0,
+                b: 1,
+                c: 2,
+                d: 3,
+                fraction: 0.0,
+            },
+            Utc.with_ymd_and_hms(2026, 8, 2, 11, 0, 0).unwrap(),
+            44.0,
+            93.75,
+            1.0,
+            true,
+            3600,
+        );
+        assert_eq!(value, 366.0);
     }
 
     #[test]
