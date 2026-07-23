@@ -1111,7 +1111,7 @@ def _download_openmeteo_product(
                 }
                 fallback_variables = tuple(
                     variable
-                    for variable in (
+                    for variable in dict.fromkeys(
                         tuple(product.required_variables)
                         + tuple(product.required_initial_fallback_variables)
                     )
@@ -1125,8 +1125,7 @@ def _download_openmeteo_product(
                     fallback_url,
                     fallback_content_length,
                 )
-                for variable in fallback_variables:
-                    remaining_missing.remove(variable)
+                remaining_missing.difference_update(fallback_variables)
                 missing_for_object = sorted(remaining_missing)
         return {
             "object_record": object_record,

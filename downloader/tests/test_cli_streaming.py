@@ -13,6 +13,128 @@ from om_downloader.model_config import Bounds, ProductConfig
 
 
 class CliStreamingTests(unittest.TestCase):
+    def test_initial_fallback_variable_is_planned_once_when_also_required(self):
+        product = ProductConfig(
+            name="ecmwf_ifs025",
+            download_product="om_ecmwf_ifs025",
+            openmeteo_model="ecmwf_ifs025",
+            forecast_hour_end=1,
+            run_cadence_hours=6,
+            timezone_anchors=(8, 6),
+            requested_bounds=Bounds(lon_min=70.0, lat_min=0.0, lon_max=70.1, lat_max=0.1),
+            bounds_padding_degrees=0.0,
+            required_variables=("wind_gusts_10m",),
+            optional_variables=(),
+            requested_pressure_levels_hpa=(),
+            required_initial_fallback_variables=("wind_gusts_10m",),
+        )
+        base_time = datetime(2026, 7, 23, tzinfo=timezone.utc)
+        fallback_time = datetime(2026, 7, 22, 18, tzinfo=timezone.utc)
+        runs = [
+            OmRun(
+                run_id="2026072218",
+                base_time_utc=fallback_time,
+                max_forecast_hour=6,
+                variables=("wind_gusts_10m",),
+                pressure_levels_hpa=(),
+                valid_times_utc=(base_time,),
+            ),
+            OmRun(
+                run_id="2026072300",
+                base_time_utc=base_time,
+                max_forecast_hour=1,
+                variables=("wind_gusts_10m",),
+                pressure_levels_hpa=(),
+                valid_times_utc=(base_time,),
+            ),
+        ]
+        plan = CoveragePlan(
+            product="ecmwf_ifs025",
+            required_start_utc=base_time,
+            required_end_utc=base_time,
+            latest_complete_run="2026072300",
+            slots=(CoverageSlot(base_time, "2026072300", 0),),
+        )
+        originals = {
+            "coverage_object_records": cli.coverage_object_records,
+            "_with_interpolation_support_records": cli._with_interpolation_support_records,
+            "HttpByteRangeSource": cli.HttpByteRangeSource,
+            "load_remote_om_inventory_fast": cli.load_remote_om_inventory_fast,
+            "plan_region_for_array": cli.plan_region_for_array,
+            "plan_variable_range_bundle": cli.plan_variable_range_bundle,
+            "write_om_coverage_bundle_file": cli.write_om_coverage_bundle_file,
+        }
+        written_entries = []
+
+        class FakeSource:
+            def __init__(self, url):
+                self.url = url
+
+            def content_length(self):
+                return 100
+
+        def fake_inventory(source, _wanted, **_kwargs):
+            arrays = (
+                {"wind_gusts_10m": SimpleNamespace(name="wind_gusts_10m")}
+                if "2026/07/22/1800Z" in source.url
+                else {}
+            )
+            return SimpleNamespace(arrays=arrays)
+
+        def fake_write(_output_root, _model, _coverage_id, entries, **_kwargs):
+            written_entries.extend(entries)
+            return {
+                "kind": "om_coverage_bundle",
+                "path": "coverages/ecmwf/test.omranges",
+                "bytes": 1,
+                "sha256": "0" * 64,
+                "entries": [],
+                "downloaded_bytes": 1,
+                "reused_existing": False,
+            }
+
+        cli.coverage_object_records = lambda *_args, **_kwargs: [
+            {
+                "url": "https://example.test/ecmwf_ifs025/2026/07/23/0000Z/2026-07-23T0000.om",
+                "valid_time_utc": "2026-07-23T00:00:00Z",
+                "source_run": "2026072300",
+                "forecast_hour": 0,
+            }
+        ]
+        cli._with_interpolation_support_records = lambda *_args, **_kwargs: _args[3]
+        cli.HttpByteRangeSource = FakeSource
+        cli.load_remote_om_inventory_fast = fake_inventory
+        cli.plan_region_for_array = lambda *_args: ({}, ((0, 1), (0, 1)))
+        cli.plan_variable_range_bundle = lambda _source, array, **_kwargs: {
+            "variable": array.name,
+            "byte_ranges": [],
+        }
+        cli.write_om_coverage_bundle_file = fake_write
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cli._download_openmeteo_product(
+                    product,
+                    now_utc=base_time,
+                    output_root=Path(tmp),
+                    bucket_url="https://example.test",
+                    lut_codec="plain",
+                    download_workers=1,
+                    planning_workers=1,
+                    range_workers=1,
+                    range_io_merge_gap=0,
+                    range_io_size_max=None,
+                    plan_data=(None, runs, plan),
+                )
+        finally:
+            for name, value in originals.items():
+                setattr(cli, name, value)
+
+        self.assertEqual(len(written_entries), 1)
+        self.assertEqual(
+            written_entries[0]["object_record"]["source_run"],
+            "2026072218",
+        )
+
     def test_download_product_streams_planned_entries_to_writer(self):
         events = []
         originals = {
