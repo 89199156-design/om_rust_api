@@ -10449,7 +10449,7 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "soil_moisture_40_to_100cm"
         | "soil_moisture_100_to_200cm" => "m\u{00B3}/m\u{00B3}",
         "total_column_integrated_water_vapour" => "kg/m\u{00B2}",
-        "growing_degree_days_base_0_limit_50" => "°C",
+        "growing_degree_days_base_0_limit_50" => "GGDc",
         _ => "unknown",
     }
 }
@@ -10543,6 +10543,14 @@ enum OutputDecimals {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn growing_degree_days_uses_official_api_unit_token() {
+        assert_eq!(
+            unit_for_variable("growing_degree_days_base_0_limit_50"),
+            "GGDc"
+        );
+    }
 
     #[test]
     fn public_hourly_scope_keeps_core_outputs_and_hides_internal_inputs() {
