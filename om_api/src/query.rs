@@ -5665,9 +5665,8 @@ fn ecmwf_regularize_source_run(
     if entries.is_empty() {
         return Ok(None);
     }
-    entries.sort_by_key(|entry| entry.coverage_forecast_hour.unwrap_or(entry.forecast_hour));
-    let logical_hour =
-        |entry: &BundleEntry| entry.coverage_forecast_hour.unwrap_or(entry.forecast_hour);
+    entries.sort_by_key(|entry| entry.forecast_hour);
+    let logical_hour = |entry: &BundleEntry| entry.forecast_hour;
     let min_hour = entries
         .iter()
         .map(|entry| logical_hour(entry))
