@@ -17,6 +17,7 @@ import base64
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import datetime as dt
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import math
@@ -326,6 +327,27 @@ def parse_run(value: str) -> dt.datetime:
         parsed = parsed.astimezone(dt.timezone.utc)
     if parsed.minute or parsed.second or parsed.microsecond or parsed.hour != 0:
         raise ValidationError("the strict ECMWF daily contract requires an exact 00Z run")
+    return parsed
+
+
+def _parse_run_instant(value: str) -> dt.datetime:
+    text = value.strip()
+    if len(text) == 10 and text.isdigit():
+        parsed = dt.datetime.strptime(text, "%Y%m%d%H").replace(
+            tzinfo=dt.timezone.utc
+        )
+    else:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = dt.datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValidationError(f"invalid model run time {value!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        parsed = parsed.astimezone(dt.timezone.utc)
+    if parsed.minute or parsed.second or parsed.microsecond:
+        raise ValidationError("model run time must be aligned to an exact hour")
     return parsed
 
 
@@ -956,7 +978,15 @@ def _batch_request_points(
 def _safe_headers(headers: Mapping[str, Any] | None) -> dict[str, str]:
     if not headers:
         return {}
-    allowed = {"content-type", "content-length", "retry-after", "date", "server"}
+    allowed = {
+        "content-type",
+        "content-length",
+        "retry-after",
+        "date",
+        "server",
+        "last-modified",
+        "etag",
+    }
     return {
         str(key).lower(): str(value)
         for key, value in headers.items()
@@ -1282,7 +1312,7 @@ def _official_request_identity(
     return payload_raw, identity, sha256_bytes(canonical_bytes(identity))
 
 
-def _probe_identity(value: Any, expected_run: str) -> dict[str, int]:
+def _probe_identity(value: Any, expected_run: str | None) -> dict[str, int]:
     if not isinstance(value, dict):
         raise ValidationError("ECMWF live source probe must contain a JSON object")
     keys = (
@@ -1297,6 +1327,8 @@ def _probe_identity(value: Any, expected_run: str) -> dict[str, int]:
         if type(item) is not int:
             raise ValidationError(f"ECMWF live source probe has no integer {key}")
         identity[key] = item
+    if expected_run is None:
+        return identity
     run_epoch = int(parse_run(expected_run).timestamp())
     if identity["last_run_initialisation_time"] != run_epoch:
         actual = dt.datetime.fromtimestamp(
@@ -1322,7 +1354,7 @@ def _read_source_probe(
     cache_dir: Path,
     label: str,
     probe_endpoint: str,
-    expected_run: str,
+    expected_run: str | None,
 ) -> tuple[dict[str, Any], dict[str, int], bytes, dict[str, Any]]:
     raw_path, meta_path = _probe_paths(cache_dir, label)
     if not raw_path.is_file() or not meta_path.is_file():
@@ -1357,7 +1389,7 @@ def _capture_source_probe(
     cache_dir: Path,
     label: str,
     probe_endpoint: str,
-    expected_run: str,
+    expected_run: str | None,
     timeout: float,
     requester: Callable[..., HttpResult],
 ) -> tuple[dict[str, Any], dict[str, int], bytes, dict[str, Any]]:
@@ -1403,15 +1435,15 @@ def _next_resume_probe_label(cache_dir: Path, prefix: str = "resume_guard") -> s
     return f"{prefix}_{len(existing):04d}"
 
 
-def _spatial_probe_identity(value: Any, expected_run: str) -> dict[str, Any]:
+def _spatial_probe_identity(value: Any, expected_run: str | None) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("completed") is not True:
         raise ValidationError("ECMWF spatial latest probe is not a completed catalog")
     reference = value.get("reference_time")
     try:
-        normalized_reference = format_run(parse_run(str(reference)))
+        normalized_reference = format_run(_parse_run_instant(str(reference)))
     except ValidationError as exc:
         raise ValidationError("ECMWF spatial latest probe has no valid 00Z reference_time") from exc
-    if normalized_reference != expected_run:
+    if expected_run is not None and normalized_reference != expected_run:
         raise ValidationError(
             f"ECMWF spatial source run {normalized_reference} != frozen run {expected_run}"
         )
@@ -1425,11 +1457,12 @@ def _spatial_probe_identity(value: Any, expected_run: str) -> dict[str, Any]:
         or any(not isinstance(item, str) for item in variables)
     ):
         raise ValidationError("ECMWF spatial latest probe lacks valid_times/variables")
-    expected_end = (parse_run(expected_run) + dt.timedelta(hours=FORECAST_HOUR_END)).strftime(
-        "%Y-%m-%dT%H:%MZ"
-    )
-    if expected_end not in valid_times:
-        raise ValidationError("ECMWF spatial source does not include forecast hour 360")
+    if expected_run is not None:
+        expected_end = (
+            parse_run(expected_run) + dt.timedelta(hours=FORECAST_HOUR_END)
+        ).strftime("%Y-%m-%dT%H:%MZ")
+        if expected_end not in valid_times:
+            raise ValidationError("ECMWF spatial source does not include forecast hour 360")
     return {
         "reference_time": normalized_reference,
         "last_modified_time": value.get("last_modified_time"),
@@ -1444,7 +1477,7 @@ def _read_spatial_probe(
     cache_dir: Path,
     label: str,
     endpoint: str,
-    expected_run: str,
+    expected_run: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, dict[str, Any]]:
     raw_path, meta_path = _probe_paths(cache_dir, label)
     if not raw_path.is_file() or not meta_path.is_file():
@@ -1475,7 +1508,7 @@ def _capture_spatial_probe(
     cache_dir: Path,
     label: str,
     endpoint: str,
-    expected_run: str,
+    expected_run: str | None,
     timeout: float,
     requester: Callable[..., HttpResult],
 ) -> tuple[dict[str, Any], dict[str, Any], bytes, dict[str, Any]]:
@@ -1846,6 +1879,130 @@ def _fetch_one_official_batch(
         retry_index += 1
 
 
+def _http_header_datetime(
+    headers: Mapping[str, Any] | None,
+    name: str,
+    context: str,
+) -> dt.datetime:
+    value = headers.get(name) if isinstance(headers, Mapping) else None
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{context} has no HTTP {name} header")
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{context} has an invalid HTTP {name} header") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _http_datetime_text(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _post_capture_transition_proof(
+    *,
+    cache_dir: Path,
+    batches: list[dict[str, Any]],
+    target_run: str,
+    source_identity: Mapping[str, int],
+    source_transition_identity: Mapping[str, int],
+    source_transition_meta: Mapping[str, Any],
+    source_transition_sha256: str,
+    spatial_identity: Mapping[str, Any],
+    spatial_transition_identity: Mapping[str, Any],
+    spatial_transition_meta: Mapping[str, Any],
+    spatial_transition_sha256: str,
+) -> dict[str, Any]:
+    target_epoch = int(parse_run(target_run).timestamp())
+    if source_identity.get("last_run_initialisation_time") != target_epoch:
+        raise ValidationError("transition proof source-before identity is not the target run")
+    source_transition_epoch = source_transition_identity.get(
+        "last_run_initialisation_time"
+    )
+    if type(source_transition_epoch) is not int or source_transition_epoch <= target_epoch:
+        raise ValidationError("temporal source did not transition to a newer ECMWF run")
+    if spatial_identity.get("reference_time") != target_run:
+        raise ValidationError("transition proof spatial-before identity is not the target run")
+    spatial_transition_run = spatial_transition_identity.get("reference_time")
+    if (
+        not isinstance(spatial_transition_run, str)
+        or _parse_run_instant(spatial_transition_run) <= parse_run(target_run)
+    ):
+        raise ValidationError("spatial source did not transition to a newer ECMWF run")
+
+    source_boundary = _http_header_datetime(
+        source_transition_meta.get("response_headers"),
+        "last-modified",
+        "temporal transition probe",
+    )
+    spatial_boundary = _http_header_datetime(
+        spatial_transition_meta.get("response_headers"),
+        "last-modified",
+        "spatial transition probe",
+    )
+    batch_dates: dict[str, str] = {}
+    sentinel_by_profile: dict[str, str] = {}
+    latest_batch_date: dt.datetime | None = None
+    for batch in batches:
+        _raw_path, meta_path = _cache_paths(cache_dir, str(batch["batch_id"]))
+        meta = read_json(meta_path)
+        if not isinstance(meta, dict):
+            raise ValidationError(
+                f"official batch metadata is invalid: {batch['batch_id']}"
+            )
+        captured = _http_header_datetime(
+            meta.get("response_headers"),
+            "date",
+            f"official batch {batch['batch_id']}",
+        )
+        batch_dates[str(batch["batch_id"])] = _http_datetime_text(captured)
+        latest_batch_date = (
+            captured if latest_batch_date is None else max(latest_batch_date, captured)
+        )
+        profile = str(batch["profile"])
+        sentinel = meta.get("sentinel_sha256")
+        if not isinstance(sentinel, str):
+            raise ValidationError(
+                f"official batch has no sentinel proof: {batch['batch_id']}"
+            )
+        previous = sentinel_by_profile.setdefault(profile, sentinel)
+        if previous != sentinel:
+            raise ValidationError(
+                f"official live sentinel changed between {profile} batches"
+            )
+    if latest_batch_date is None:
+        raise ValidationError("transition proof has no official batch HTTP dates")
+    if latest_batch_date >= source_boundary:
+        raise ValidationError(
+            "an official batch HTTP Date is not earlier than the temporal source transition"
+        )
+    if latest_batch_date >= spatial_boundary:
+        raise ValidationError(
+            "an official batch HTTP Date is not earlier than the spatial source transition"
+        )
+    return _with_self_hash(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "type": "ecmwf_post_capture_transition_proof",
+            "acceptance_mode": "explicit_post_capture_transition",
+            "target_run": target_run,
+            "batch_http_dates": batch_dates,
+            "max_batch_http_date": _http_datetime_text(latest_batch_date),
+            "sentinel_sha256_by_profile": sentinel_by_profile,
+            "source_before_identity": dict(source_identity),
+            "source_transition_identity": dict(source_transition_identity),
+            "source_transition_last_modified": _http_datetime_text(source_boundary),
+            "source_transition_probe_sha256": source_transition_sha256,
+            "spatial_before_identity": dict(spatial_identity),
+            "spatial_transition_identity": dict(spatial_transition_identity),
+            "spatial_transition_last_modified": _http_datetime_text(spatial_boundary),
+            "spatial_transition_probe_sha256": spatial_transition_sha256,
+        },
+        "proof_sha256",
+    )
+
+
 def _validate_official_index(
     index: Mapping[str, Any],
     *,
@@ -1860,6 +2017,10 @@ def _validate_official_index(
     spatial_identity: Mapping[str, Any],
     spatial_probe_before_sha256: str,
     spatial_probe_after_sha256: str,
+    capture_mode: str = "same_source",
+    source_transition_identity: Mapping[str, int] | None = None,
+    spatial_transition_identity: Mapping[str, Any] | None = None,
+    post_capture_transition_proof: Mapping[str, Any] | None = None,
 ) -> None:
     _verify_self_hash(index, "index_sha256", "official cache index")
     expected = {
@@ -1880,7 +2041,31 @@ def _validate_official_index(
         "spatial_identity": dict(spatial_identity),
         "spatial_probe_before_sha256": spatial_probe_before_sha256,
         "spatial_probe_after_sha256": spatial_probe_after_sha256,
+        "capture_mode": capture_mode,
     }
+    if capture_mode == "post_capture_transition":
+        if (
+            source_transition_identity is None
+            or spatial_transition_identity is None
+            or post_capture_transition_proof is None
+        ):
+            raise ValidationError("official cache index has incomplete transition evidence")
+        _verify_self_hash(
+            post_capture_transition_proof,
+            "proof_sha256",
+            "post-capture transition proof",
+        )
+        expected.update(
+            {
+                "source_transition_identity": dict(source_transition_identity),
+                "spatial_transition_identity": dict(spatial_transition_identity),
+                "post_capture_transition_proof": dict(
+                    post_capture_transition_proof
+                ),
+            }
+        )
+    elif capture_mode != "same_source":
+        raise ValidationError(f"unsupported official capture mode: {capture_mode}")
     executor_batch_ids, executor_weights = public_executor_summary(batches)
     if executor_batch_ids:
         expected["public_executor_batch_ids"] = executor_batch_ids
@@ -1929,6 +2114,7 @@ def fetch_official(
     requester: Callable[..., HttpResult] = _request_once,
     public_executor_requesters: Mapping[str, Callable[..., HttpResult]] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
+    accept_proven_post_capture_transition: bool = False,
 ) -> dict[str, Any]:
     if max_new_requests < 0 or delay_seconds < 0 or timeout <= 0 or retries < 0:
         raise ValidationError("invalid official capture network settings")
@@ -1974,26 +2160,18 @@ def fetch_official(
     spatial_before_paths = _probe_paths(cache_dir, "spatial_before")
     spatial_after_paths = _probe_paths(cache_dir, "spatial_after")
     if not missing and index_path.is_file():
+        existing = read_json(index_path)
+        if not isinstance(existing, dict):
+            raise ValidationError("official cache index must contain an object")
+        capture_mode = str(existing.get("capture_mode", ""))
         _before_value, before_identity, before_raw, _before_meta = _read_source_probe(
             cache_dir, "before", probe_endpoint, plan["run"]
         )
-        _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
-            cache_dir, "after", probe_endpoint, plan["run"]
-        )
-        if before_identity != after_identity:
-            raise ValidationError("cached ECMWF live source changed during official capture")
         _spatial_before_value, spatial_identity, spatial_before_raw, _spatial_before_meta = (
             _read_spatial_probe(
                 cache_dir, "spatial_before", spatial_probe_endpoint, plan["run"]
             )
         )
-        _spatial_after_value, spatial_after_identity, spatial_after_raw, _spatial_after_meta = (
-            _read_spatial_probe(
-                cache_dir, "spatial_after", spatial_probe_endpoint, plan["run"]
-            )
-        )
-        if spatial_identity != spatial_after_identity:
-            raise ValidationError("cached ECMWF spatial source changed during official capture")
         for batch in batches:
             selected = _batch_request_points(batch, points)
             if _verify_cached_batch(
@@ -2005,9 +2183,63 @@ def fetch_official(
                 expected_source_identity=before_identity,
             ) is None:
                 raise ValidationError("official cache index exists but a batch is missing")
-        existing = read_json(index_path)
-        if not isinstance(existing, dict):
-            raise ValidationError("official cache index must contain an object")
+        transition_proof: dict[str, Any] | None = None
+        source_transition_identity: dict[str, int] | None = None
+        spatial_transition_identity: dict[str, Any] | None = None
+        if capture_mode == "same_source":
+            _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
+                cache_dir, "after", probe_endpoint, plan["run"]
+            )
+            if before_identity != after_identity:
+                raise ValidationError(
+                    "cached ECMWF live source changed during official capture"
+                )
+            (
+                _spatial_after_value,
+                spatial_after_identity,
+                spatial_after_raw,
+                _spatial_after_meta,
+            ) = _read_spatial_probe(
+                cache_dir, "spatial_after", spatial_probe_endpoint, plan["run"]
+            )
+            if spatial_identity != spatial_after_identity:
+                raise ValidationError(
+                    "cached ECMWF spatial source changed during official capture"
+                )
+        elif capture_mode == "post_capture_transition":
+            (
+                _after_value,
+                source_transition_identity,
+                after_raw,
+                after_meta,
+            ) = _read_source_probe(
+                cache_dir, "after_transition", probe_endpoint, None
+            )
+            (
+                _spatial_after_value,
+                spatial_transition_identity,
+                spatial_after_raw,
+                spatial_after_meta,
+            ) = _read_spatial_probe(
+                cache_dir, "spatial_after_transition", spatial_probe_endpoint, None
+            )
+            transition_proof = _post_capture_transition_proof(
+                cache_dir=cache_dir,
+                batches=batches,
+                target_run=plan["run"],
+                source_identity=before_identity,
+                source_transition_identity=source_transition_identity,
+                source_transition_meta=after_meta,
+                source_transition_sha256=sha256_bytes(after_raw),
+                spatial_identity=spatial_identity,
+                spatial_transition_identity=spatial_transition_identity,
+                spatial_transition_meta=spatial_after_meta,
+                spatial_transition_sha256=sha256_bytes(spatial_after_raw),
+            )
+        else:
+            raise ValidationError(
+                f"unsupported official capture mode: {capture_mode}"
+            )
         _validate_official_index(
             existing,
             plan=plan,
@@ -2021,6 +2253,10 @@ def fetch_official(
             spatial_identity=spatial_identity,
             spatial_probe_before_sha256=sha256_bytes(spatial_before_raw),
             spatial_probe_after_sha256=sha256_bytes(spatial_after_raw),
+            capture_mode=capture_mode,
+            source_transition_identity=source_transition_identity,
+            spatial_transition_identity=spatial_transition_identity,
+            post_capture_transition_proof=transition_proof,
         )
         return existing
     if not allow_network:
@@ -2034,23 +2270,31 @@ def fetch_official(
             f"--max-new-requests={max_new_requests}"
         )
 
+    transition_finalize = (
+        accept_proven_post_capture_transition
+        and not missing
+        and not index_path.exists()
+        and all(path.is_file() for path in before_paths)
+        and all(path.is_file() for path in spatial_before_paths)
+    )
     if before_paths[0].exists() or before_paths[1].exists():
         _before_value, source_identity, before_raw, _before_meta = _read_source_probe(
             cache_dir, "before", probe_endpoint, plan["run"]
         )
-        guard_label = _next_resume_probe_label(cache_dir)
-        _guard_value, guard_identity, _guard_raw, _guard_meta = _capture_source_probe(
-            cache_dir=cache_dir,
-            label=guard_label,
-            probe_endpoint=probe_endpoint,
-            expected_run=plan["run"],
-            timeout=timeout,
-            requester=requester,
-        )
-        if guard_identity != source_identity:
-            raise ValidationError(
-                "live ECMWF source changed since the partial capture began; quarantine this cache"
+        if not transition_finalize:
+            guard_label = _next_resume_probe_label(cache_dir)
+            _guard_value, guard_identity, _guard_raw, _guard_meta = _capture_source_probe(
+                cache_dir=cache_dir,
+                label=guard_label,
+                probe_endpoint=probe_endpoint,
+                expected_run=plan["run"],
+                timeout=timeout,
+                requester=requester,
             )
+            if guard_identity != source_identity:
+                raise ValidationError(
+                    "live ECMWF source changed since the partial capture began; quarantine this cache"
+                )
     else:
         _before_value, source_identity, before_raw, _before_meta = _capture_source_probe(
             cache_dir=cache_dir,
@@ -2068,9 +2312,16 @@ def fetch_official(
                 cache_dir, "spatial_before", spatial_probe_endpoint, plan["run"]
             )
         )
-        spatial_guard_label = _next_resume_probe_label(cache_dir, "spatial_resume_guard")
-        _spatial_guard_value, spatial_guard_identity, _spatial_guard_raw, _spatial_guard_meta = (
-            _capture_spatial_probe(
+        if not transition_finalize:
+            spatial_guard_label = _next_resume_probe_label(
+                cache_dir, "spatial_resume_guard"
+            )
+            (
+                _spatial_guard_value,
+                spatial_guard_identity,
+                _spatial_guard_raw,
+                _spatial_guard_meta,
+            ) = _capture_spatial_probe(
                 cache_dir=cache_dir,
                 label=spatial_guard_label,
                 endpoint=spatial_probe_endpoint,
@@ -2078,11 +2329,10 @@ def fetch_official(
                 timeout=timeout,
                 requester=requester,
             )
-        )
-        if spatial_guard_identity != spatial_identity:
-            raise ValidationError(
-                "ECMWF spatial source changed since partial capture began; quarantine this cache"
-            )
+            if spatial_guard_identity != spatial_identity:
+                raise ValidationError(
+                    "ECMWF spatial source changed since partial capture began; quarantine this cache"
+                )
     else:
         _spatial_before_value, spatial_identity, spatial_before_raw, _spatial_before_meta = (
             _capture_spatial_probe(
@@ -2141,33 +2391,117 @@ def fetch_official(
             if captured < len(missing) and delay_seconds:
                 sleeper(delay_seconds)
 
-    if after_paths[0].exists() or after_paths[1].exists():
-        _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
-            cache_dir, "after", probe_endpoint, plan["run"]
+    capture_mode = "post_capture_transition" if transition_finalize else "same_source"
+    transition_proof: dict[str, Any] | None = None
+    source_transition_identity: dict[str, int] | None = None
+    spatial_transition_identity: dict[str, Any] | None = None
+    if transition_finalize:
+        transition_paths = _probe_paths(cache_dir, "after_transition")
+        if transition_paths[0].exists() or transition_paths[1].exists():
+            (
+                _after_value,
+                source_transition_identity,
+                after_raw,
+                after_meta,
+            ) = _read_source_probe(
+                cache_dir, "after_transition", probe_endpoint, None
+            )
+        else:
+            (
+                _after_value,
+                source_transition_identity,
+                after_raw,
+                after_meta,
+            ) = _capture_source_probe(
+                cache_dir=cache_dir,
+                label="after_transition",
+                probe_endpoint=probe_endpoint,
+                expected_run=None,
+                timeout=timeout,
+                requester=requester,
+            )
+        spatial_transition_paths = _probe_paths(
+            cache_dir, "spatial_after_transition"
+        )
+        if (
+            spatial_transition_paths[0].exists()
+            or spatial_transition_paths[1].exists()
+        ):
+            (
+                _spatial_after_value,
+                spatial_transition_identity,
+                spatial_after_raw,
+                spatial_after_meta,
+            ) = _read_spatial_probe(
+                cache_dir,
+                "spatial_after_transition",
+                spatial_probe_endpoint,
+                None,
+            )
+        else:
+            (
+                _spatial_after_value,
+                spatial_transition_identity,
+                spatial_after_raw,
+                spatial_after_meta,
+            ) = _capture_spatial_probe(
+                cache_dir=cache_dir,
+                label="spatial_after_transition",
+                endpoint=spatial_probe_endpoint,
+                expected_run=None,
+                timeout=timeout,
+                requester=requester,
+            )
+        source_probe_after_sha256 = sha256_bytes(after_raw)
+        spatial_probe_after_sha256 = sha256_bytes(spatial_after_raw)
+        transition_proof = _post_capture_transition_proof(
+            cache_dir=cache_dir,
+            batches=batches,
+            target_run=plan["run"],
+            source_identity=source_identity,
+            source_transition_identity=source_transition_identity,
+            source_transition_meta=after_meta,
+            source_transition_sha256=source_probe_after_sha256,
+            spatial_identity=spatial_identity,
+            spatial_transition_identity=spatial_transition_identity,
+            spatial_transition_meta=spatial_after_meta,
+            spatial_transition_sha256=spatial_probe_after_sha256,
         )
     else:
-        _after_value, after_identity, after_raw, _after_meta = _capture_source_probe(
-            cache_dir=cache_dir,
-            label="after",
-            probe_endpoint=probe_endpoint,
-            expected_run=plan["run"],
-            timeout=timeout,
-            requester=requester,
-        )
-    if after_identity != source_identity:
-        raise ValidationError(
-            "live ECMWF source changed between the before/after probes; official snapshot is invalid"
-        )
-    source_probe_after_sha256 = sha256_bytes(after_raw)
-    if spatial_after_paths[0].exists() or spatial_after_paths[1].exists():
-        _spatial_after_value, spatial_after_identity, spatial_after_raw, _spatial_after_meta = (
-            _read_spatial_probe(
+        if after_paths[0].exists() or after_paths[1].exists():
+            _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
+                cache_dir, "after", probe_endpoint, plan["run"]
+            )
+        else:
+            _after_value, after_identity, after_raw, _after_meta = _capture_source_probe(
+                cache_dir=cache_dir,
+                label="after",
+                probe_endpoint=probe_endpoint,
+                expected_run=plan["run"],
+                timeout=timeout,
+                requester=requester,
+            )
+        if after_identity != source_identity:
+            raise ValidationError(
+                "live ECMWF source changed between the before/after probes; official snapshot is invalid"
+            )
+        source_probe_after_sha256 = sha256_bytes(after_raw)
+        if spatial_after_paths[0].exists() or spatial_after_paths[1].exists():
+            (
+                _spatial_after_value,
+                spatial_after_identity,
+                spatial_after_raw,
+                _spatial_after_meta,
+            ) = _read_spatial_probe(
                 cache_dir, "spatial_after", spatial_probe_endpoint, plan["run"]
             )
-        )
-    else:
-        _spatial_after_value, spatial_after_identity, spatial_after_raw, _spatial_after_meta = (
-            _capture_spatial_probe(
+        else:
+            (
+                _spatial_after_value,
+                spatial_after_identity,
+                spatial_after_raw,
+                _spatial_after_meta,
+            ) = _capture_spatial_probe(
                 cache_dir=cache_dir,
                 label="spatial_after",
                 endpoint=spatial_probe_endpoint,
@@ -2175,12 +2509,11 @@ def fetch_official(
                 timeout=timeout,
                 requester=requester,
             )
-        )
-    if spatial_after_identity != spatial_identity:
-        raise ValidationError(
-            "ECMWF spatial source changed between before/after probes; snapshot is invalid"
-        )
-    spatial_probe_after_sha256 = sha256_bytes(spatial_after_raw)
+        if spatial_after_identity != spatial_identity:
+            raise ValidationError(
+                "ECMWF spatial source changed between before/after probes; snapshot is invalid"
+            )
+        spatial_probe_after_sha256 = sha256_bytes(spatial_after_raw)
 
     entries: list[dict[str, Any]] = []
     total_failed_attempts = 0
@@ -2216,10 +2549,20 @@ def fetch_official(
                 "metadata_sha256": sha256_file(meta_path),
                 "sentinel_point_id": batch["sentinel_point_id"],
                 "sentinel_sha256": meta["sentinel_sha256"],
+                "response_http_date": meta.get("response_headers", {}).get("date"),
             }
         )
-    index = _with_self_hash(
-        {
+    after_probe_paths = (
+        _probe_paths(cache_dir, "after_transition")
+        if transition_finalize
+        else after_paths
+    )
+    spatial_final_probe_paths = (
+        _probe_paths(cache_dir, "spatial_after_transition")
+        if transition_finalize
+        else spatial_after_paths
+    )
+    index_value: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "type": "official_ecmwf_cache_index",
             "model": MODEL,
@@ -2239,7 +2582,9 @@ def fetch_official(
             "source_identity": source_identity,
             "source_probe_before_file": before_paths[0].relative_to(cache_dir).as_posix(),
             "source_probe_before_sha256": source_probe_before_sha256,
-            "source_probe_after_file": after_paths[0].relative_to(cache_dir).as_posix(),
+            "source_probe_after_file": after_probe_paths[0]
+            .relative_to(cache_dir)
+            .as_posix(),
             "source_probe_after_sha256": source_probe_after_sha256,
             "spatial_probe_endpoint": spatial_probe_endpoint,
             "spatial_identity": spatial_identity,
@@ -2247,10 +2592,11 @@ def fetch_official(
             .relative_to(cache_dir)
             .as_posix(),
             "spatial_probe_before_sha256": spatial_probe_before_sha256,
-            "spatial_probe_after_file": spatial_after_paths[0]
+            "spatial_probe_after_file": spatial_final_probe_paths[0]
             .relative_to(cache_dir)
             .as_posix(),
             "spatial_probe_after_sha256": spatial_probe_after_sha256,
+            "capture_mode": capture_mode,
             "sentinel_sha256_by_profile": {
                 profile: next(
                     entry["sentinel_sha256"]
@@ -2263,9 +2609,19 @@ def fetch_official(
             "public_executor_batch_ids": public_executor_summary(batches)[0],
             "public_executor_estimated_weight": public_executor_summary(batches)[1],
             "entries": entries,
-        },
-        "index_sha256",
-    )
+    }
+    if transition_finalize:
+        assert source_transition_identity is not None
+        assert spatial_transition_identity is not None
+        assert transition_proof is not None
+        index_value.update(
+            {
+                "source_transition_identity": source_transition_identity,
+                "spatial_transition_identity": spatial_transition_identity,
+                "post_capture_transition_proof": transition_proof,
+            }
+        )
+    index = _with_self_hash(index_value, "index_sha256")
     if index_path.exists():
         existing = read_json(index_path)
         if not isinstance(existing, dict):
@@ -2283,6 +2639,10 @@ def fetch_official(
             spatial_identity=spatial_identity,
             spatial_probe_before_sha256=spatial_probe_before_sha256,
             spatial_probe_after_sha256=spatial_probe_after_sha256,
+            capture_mode=capture_mode,
+            source_transition_identity=source_transition_identity,
+            spatial_transition_identity=spatial_transition_identity,
+            post_capture_transition_proof=transition_proof,
         )
         # All immutable entry hashes must also agree. Dynamic completion time is
         # retained from the first complete capture.
@@ -2303,6 +2663,10 @@ def fetch_official(
         spatial_identity=spatial_identity,
         spatial_probe_before_sha256=spatial_probe_before_sha256,
         spatial_probe_after_sha256=spatial_probe_after_sha256,
+        capture_mode=capture_mode,
+        source_transition_identity=source_transition_identity,
+        spatial_transition_identity=spatial_transition_identity,
+        post_capture_transition_proof=transition_proof,
     )
     return index
 
@@ -2605,24 +2969,66 @@ def load_official_reference(
     _before_value, before_identity, before_raw, _before_meta = _read_source_probe(
         cache_dir, "before", probe_endpoint, plan["run"]
     )
-    _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
-        cache_dir, "after", probe_endpoint, plan["run"]
-    )
-    if before_identity != after_identity:
-        raise ValidationError("official cache spans two live ECMWF source identities")
     spatial_probe_endpoint = normalize_endpoint(config["official"]["spatial_probe_endpoint"])
     _spatial_before_value, spatial_identity, spatial_before_raw, _spatial_before_meta = (
         _read_spatial_probe(
             cache_dir, "spatial_before", spatial_probe_endpoint, plan["run"]
         )
     )
-    _spatial_after_value, spatial_after_identity, spatial_after_raw, _spatial_after_meta = (
-        _read_spatial_probe(
+    capture_mode = str(index.get("capture_mode", ""))
+    transition_proof: dict[str, Any] | None = None
+    source_transition_identity: dict[str, int] | None = None
+    spatial_transition_identity: dict[str, Any] | None = None
+    if capture_mode == "same_source":
+        _after_value, after_identity, after_raw, _after_meta = _read_source_probe(
+            cache_dir, "after", probe_endpoint, plan["run"]
+        )
+        if before_identity != after_identity:
+            raise ValidationError("official cache spans two live ECMWF source identities")
+        (
+            _spatial_after_value,
+            spatial_after_identity,
+            spatial_after_raw,
+            _spatial_after_meta,
+        ) = _read_spatial_probe(
             cache_dir, "spatial_after", spatial_probe_endpoint, plan["run"]
         )
-    )
-    if spatial_identity != spatial_after_identity:
-        raise ValidationError("official cache spans two ECMWF spatial source identities")
+        if spatial_identity != spatial_after_identity:
+            raise ValidationError(
+                "official cache spans two ECMWF spatial source identities"
+            )
+    elif capture_mode == "post_capture_transition":
+        (
+            _after_value,
+            source_transition_identity,
+            after_raw,
+            after_meta,
+        ) = _read_source_probe(
+            cache_dir, "after_transition", probe_endpoint, None
+        )
+        (
+            _spatial_after_value,
+            spatial_transition_identity,
+            spatial_after_raw,
+            spatial_after_meta,
+        ) = _read_spatial_probe(
+            cache_dir, "spatial_after_transition", spatial_probe_endpoint, None
+        )
+        transition_proof = _post_capture_transition_proof(
+            cache_dir=cache_dir,
+            batches=batches,
+            target_run=plan["run"],
+            source_identity=before_identity,
+            source_transition_identity=source_transition_identity,
+            source_transition_meta=after_meta,
+            source_transition_sha256=sha256_bytes(after_raw),
+            spatial_identity=spatial_identity,
+            spatial_transition_identity=spatial_transition_identity,
+            spatial_transition_meta=spatial_after_meta,
+            spatial_transition_sha256=sha256_bytes(spatial_after_raw),
+        )
+    else:
+        raise ValidationError(f"unsupported official capture mode: {capture_mode}")
     _validate_official_index(
         index,
         plan=plan,
@@ -2636,6 +3042,10 @@ def load_official_reference(
         spatial_identity=spatial_identity,
         spatial_probe_before_sha256=sha256_bytes(spatial_before_raw),
         spatial_probe_after_sha256=sha256_bytes(spatial_after_raw),
+        capture_mode=capture_mode,
+        source_transition_identity=source_transition_identity,
+        spatial_transition_identity=spatial_transition_identity,
+        post_capture_transition_proof=transition_proof,
     )
     points = point_map(plan)
     result: dict[str, dict[str, Any]] = {}
@@ -3327,6 +3737,15 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_parser.add_argument("--api-key-env", default="OPEN_METEO_API_KEY")
     fetch_parser.add_argument("--allow-network", action="store_true")
     fetch_parser.add_argument("--allow-public-noncommercial", action="store_true")
+    fetch_parser.add_argument(
+        "--accept-proven-post-capture-transition",
+        action="store_true",
+        help=(
+            "explicitly finalize a complete immutable cache when every official "
+            "HTTP Date predates independently timestamped temporal and spatial "
+            "source transitions"
+        ),
+    )
     fetch_parser.add_argument("--allow-loopback-mock", action="store_true", help=argparse.SUPPRESS)
     fetch_parser.add_argument(
         "--public-ssh-executor",
@@ -3437,6 +3856,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                 api_key,
                 access_profile,
                 public_executor_requesters=public_requesters or None,
+                accept_proven_post_capture_transition=(
+                    args.accept_proven_post_capture_transition
+                ),
             )
             print(
                 json.dumps(

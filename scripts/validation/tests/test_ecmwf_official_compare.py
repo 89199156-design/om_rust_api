@@ -255,7 +255,12 @@ class FakeApi:
         )
         if parsed.path == "/source-meta":
             self.probe_calls += 1
-            epoch = int(compare.parse_run(RUN).timestamp())
+            probe_run = (
+                "2026-07-23T06:00:00Z"
+                if getattr(self, "transitioned", False)
+                else RUN
+            )
+            epoch = int(compare._parse_run_instant(probe_run).timestamp())
             return self._result(
                 200,
                 {
@@ -264,20 +269,35 @@ class FakeApi:
                     "last_run_availability_time": epoch + 20,
                     "data_end_time": epoch + 360 * 3600,
                 },
+                {
+                    "content-type": "application/json",
+                    "last-modified": "Thu, 23 Jul 2026 13:06:01 GMT",
+                    "etag": '"source"',
+                },
             )
         if parsed.path == "/spatial-latest":
             self.probe_calls += 1
+            probe_run = (
+                "2026-07-23T06:00:00Z"
+                if getattr(self, "transitioned", False)
+                else RUN
+            )
             return self._result(
                 200,
                 {
                     "completed": True,
-                    "last_modified_time": "2026-07-23T01:00:00Z",
-                    "reference_time": RUN,
+                    "last_modified_time": "2026-07-23T13:07:00Z",
+                    "reference_time": probe_run,
                     "valid_times": [
-                        "2026-07-23T00:00Z",
+                        probe_run[:16] + "Z",
                         "2026-08-07T00:00Z",
                     ],
                     "variables": ["temperature_2m"],
+                },
+                {
+                    "content-type": "application/json",
+                    "last-modified": "Thu, 23 Jul 2026 13:07:00 GMT",
+                    "etag": '"spatial"',
                 },
             )
         if parsed.path == "/official":
@@ -296,7 +316,18 @@ class FakeApi:
                 self._row(payload, index, local=False)
                 for index in range(len(payload["latitude"]))
             ]
-            return self._result(200, rows[0] if len(rows) == 1 else rows)
+            return self._result(
+                200,
+                rows[0] if len(rows) == 1 else rows,
+                {
+                    "content-type": "application/json",
+                    "date": getattr(
+                        self,
+                        "official_http_date",
+                        "Thu, 23 Jul 2026 12:21:02 GMT",
+                    ),
+                },
+            )
         if parsed.path == "/local":
             self.local_calls += 1
             self.assert_json_post(method, body, headers)
@@ -738,6 +769,171 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
             )
             self.assertEqual(reused["index_sha256"], index["index_sha256"])
             self.assertEqual(len(no_network.calls), 0)
+
+    @staticmethod
+    def prepare_post_capture_transition(workflow: Workflow) -> None:
+        workflow.fetch()
+        (workflow.cache_dir / "official_index.json").unlink()
+        for label in ("after", "spatial_after"):
+            for path in compare._probe_paths(workflow.cache_dir, label):
+                path.unlink()
+        workflow.fake.transitioned = True
+
+    def test_explicit_post_capture_transition_finalizes_and_validates(self) -> None:
+        with self.small_contract():
+            fake = FakeApi()
+            workflow = Workflow(self.root, fake)
+            self.prepare_post_capture_transition(workflow)
+            index = compare.fetch_official(
+                workflow.plan,
+                workflow.plan_path,
+                workflow.config,
+                workflow.cache_dir,
+                str(workflow.config["official"]["endpoint"]),
+                True,
+                0,
+                0,
+                30,
+                0,
+                None,
+                "mock",
+                requester=fake,
+                accept_proven_post_capture_transition=True,
+            )
+            self.assertEqual(index["capture_mode"], "post_capture_transition")
+            proof = index["post_capture_transition_proof"]
+            self.assertEqual(
+                proof["max_batch_http_date"],
+                "2026-07-23T12:21:02Z",
+            )
+            self.assertEqual(
+                proof["source_transition_identity"]["last_run_initialisation_time"],
+                int(
+                    compare._parse_run_instant(
+                        "2026-07-23T06:00:00Z"
+                    ).timestamp()
+                ),
+            )
+            self.assertEqual(fake.official_calls, 1)
+            report = workflow.validate()
+            self.assertEqual(report["status"], "passed")
+
+    def test_post_capture_transition_requires_explicit_opt_in(self) -> None:
+        with self.small_contract():
+            fake = FakeApi()
+            workflow = Workflow(self.root, fake)
+            self.prepare_post_capture_transition(workflow)
+            with self.assertRaisesRegex(compare.ValidationError, "not the frozen 00Z"):
+                compare.fetch_official(
+                    workflow.plan,
+                    workflow.plan_path,
+                    workflow.config,
+                    workflow.cache_dir,
+                    str(workflow.config["official"]["endpoint"]),
+                    True,
+                    0,
+                    0,
+                    30,
+                    0,
+                    None,
+                    "mock",
+                    requester=fake,
+                )
+            self.assertFalse((workflow.cache_dir / "official_index.json").exists())
+
+    def test_post_capture_transition_rejects_batch_at_transition_boundary(self) -> None:
+        with self.small_contract():
+            fake = FakeApi()
+            fake.official_http_date = "Thu, 23 Jul 2026 13:06:01 GMT"
+            workflow = Workflow(self.root, fake)
+            self.prepare_post_capture_transition(workflow)
+            with self.assertRaisesRegex(
+                compare.ValidationError,
+                "not earlier than the temporal source transition",
+            ):
+                compare.fetch_official(
+                    workflow.plan,
+                    workflow.plan_path,
+                    workflow.config,
+                    workflow.cache_dir,
+                    str(workflow.config["official"]["endpoint"]),
+                    True,
+                    0,
+                    0,
+                    30,
+                    0,
+                    None,
+                    "mock",
+                    requester=fake,
+                    accept_proven_post_capture_transition=True,
+                )
+            self.assertFalse((workflow.cache_dir / "official_index.json").exists())
+
+    def test_post_capture_transition_rejects_sentinel_drift(self) -> None:
+        with self.small_contract():
+            fake = FakeApi()
+            workflow = Workflow(self.root, fake)
+            self.prepare_post_capture_transition(workflow)
+            index = compare.fetch_official(
+                workflow.plan,
+                workflow.plan_path,
+                workflow.config,
+                workflow.cache_dir,
+                str(workflow.config["official"]["endpoint"]),
+                True,
+                0,
+                0,
+                30,
+                0,
+                None,
+                "mock",
+                requester=fake,
+                accept_proven_post_capture_transition=True,
+            )
+            first_meta_path = (
+                workflow.cache_dir / "official" / "land_dem_000.meta.json"
+            )
+            second_meta = json.loads(first_meta_path.read_bytes())
+            second_meta["sentinel_sha256"] = "0" * 64
+            second_meta_path = (
+                workflow.cache_dir / "official" / "land_dem_001.meta.json"
+            )
+            second_meta_path.write_text(json.dumps(second_meta), encoding="utf-8")
+            source_meta = json.loads(
+                compare._probe_paths(
+                    workflow.cache_dir, "after_transition"
+                )[1].read_bytes()
+            )
+            spatial_meta = json.loads(
+                compare._probe_paths(
+                    workflow.cache_dir, "spatial_after_transition"
+                )[1].read_bytes()
+            )
+            with self.assertRaisesRegex(compare.ValidationError, "sentinel changed"):
+                compare._post_capture_transition_proof(
+                    cache_dir=workflow.cache_dir,
+                    batches=[
+                        {"batch_id": "land_dem_000", "profile": "land_dem"},
+                        {"batch_id": "land_dem_001", "profile": "land_dem"},
+                    ],
+                    target_run=RUN,
+                    source_identity=index["source_identity"],
+                    source_transition_identity=index[
+                        "source_transition_identity"
+                    ],
+                    source_transition_meta=source_meta,
+                    source_transition_sha256=index[
+                        "source_probe_after_sha256"
+                    ],
+                    spatial_identity=index["spatial_identity"],
+                    spatial_transition_identity=index[
+                        "spatial_transition_identity"
+                    ],
+                    spatial_transition_meta=spatial_meta,
+                    spatial_transition_sha256=index[
+                        "spatial_probe_after_sha256"
+                    ],
+                )
 
     def test_complete_serial_local_post_validation_passes(self) -> None:
         with self.small_contract():

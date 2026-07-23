@@ -222,6 +222,28 @@ python3 scripts/validation/ecmwf_official_compare.py \
 
 SSH 执行器使用标准 `Accept-Encoding: gzip` 接收大响应，并在执行器内完整解压后再计算响应字节数、SHA-256 和回传原始 JSON。压缩仅作用于 HTTP 传输，不改变 canonical 请求、落盘响应或逐值比较语义。
 
+### 响应完成后源桶切换的显式闭合
+
+若所有预先分配的官方 POST 均已成功并不可变落盘，但 before/after 闭合探针执行前 live temporal 或 spatial 源已切到更晚周期，默认行为仍是拒绝闭合。只有保存的每个批次均有可解析 HTTP `Date`，同一 profile 的 sentinel 完全一致，temporal 与 spatial 当前身份都严格晚于目标周期，且全部批次的 `Date` 都严格早于两个当前源对象各自的 HTTP `Last-Modified` 时，才可显式启用切换证明：
+
+~~~bash
+python3 scripts/validation/ecmwf_official_compare.py \
+  --config scripts/validation/ecmwf_validation_config.json \
+  fetch-official \
+  --plan /data/validation/ecmwf/2026072300/plan.json \
+  --cache-dir /data/validation/ecmwf/2026072300/official-cache-final \
+  --official-endpoint https://api.open-meteo.com/v1/ecmwf \
+  --allow-public-noncommercial \
+  --allow-network \
+  --max-new-requests 0 \
+  --public-local-executor terminal-shanghai \
+  --public-ssh-executor terminal-156=ubuntu@43.156.81.216 \
+  --public-ssh-executor terminal-162=ubuntu@43.162.112.201 \
+  --accept-proven-post-capture-transition
+~~~
+
+该模式只允许两个小型源探针，不允许新的官方 POST。实际新周期分别保存为 `after_transition` 与 `spatial_after_transition`，不会写成目标周期的普通 `after`。索引的 `capture_mode=post_capture_transition`、两个真实新周期身份、批次 HTTP 时间、两个切换边界、探针哈希、sentinel 哈希及自哈希会共同组成 `post_capture_transition_proof`。后续逐点验证只复验这份不可变证据及 freeze，不再依赖已经继续滚动的 live 源。任一时间缺失、无法解析、等于/晚于边界，或 sentinel 漂移都立即拒绝。
+
 ## 串行本地比对
 
 ~~~powershell
@@ -274,7 +296,7 @@ python -m unittest discover `
   -v
 ~~~
 
-离线测试覆盖 canonical 197/65/257 指纹、land+DEM 500 点合同、旧 run 隐藏右侧 stencil、公共批次静态分片与单终端额度、官方最小 POST、executor 成功/重试留证、key 不落盘、本地逐点 POST、完整通过、日帧首差即停、六个 hour-0 字段、严格 JSON 类型、429 留证、sentinel 漂移和 manifest 点间变化。
+离线测试覆盖 canonical 197/65/257 指纹、land+DEM 500 点合同、旧 run 隐藏右侧 stencil、公共批次静态分片与单终端额度、官方最小 POST、executor 成功/重试留证、key 不落盘、本地逐点 POST、完整通过、日帧首差即停、六个 hour-0 字段、严格 JSON 类型、429 留证、sentinel 漂移、显式切换后闭合的 opt-in/时间边界/离线复验，以及 manifest 点间变化。
 
 CLI 返回码：
 
