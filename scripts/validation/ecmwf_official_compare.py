@@ -1043,14 +1043,16 @@ class SshHttpRequester:
         }
         encoded = base64.b64encode(canonical_bytes(envelope)).decode("ascii")
         program = f"""\
-import base64, hashlib, json, sys, time, urllib.error, urllib.request
+import base64, gzip, hashlib, json, sys, time, urllib.error, urllib.request
 request_data = json.loads(base64.b64decode({encoded!r}))
 body = base64.b64decode(request_data["body"]) if request_data["has_body"] else None
+request_headers = dict(request_data["headers"])
+request_headers.setdefault("Accept-Encoding", "gzip")
 request = urllib.request.Request(
     request_data["url"],
     data=body,
     method=request_data["method"],
-    headers=request_data["headers"],
+    headers=request_headers,
 )
 started = time.monotonic()
 try:
@@ -1062,6 +1064,12 @@ except urllib.error.HTTPError as error:
     status = int(error.code)
     headers = dict(error.headers.items()) if error.headers else {{}}
     raw = error.read()
+content_encoding = next(
+    (value for key, value in headers.items() if key.lower() == "content-encoding"),
+    "",
+)
+if "gzip" in content_encoding.lower():
+    raw = gzip.decompress(raw)
 meta = {{
     "status": status,
     "headers": headers,

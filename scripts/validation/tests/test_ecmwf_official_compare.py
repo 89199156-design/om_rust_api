@@ -525,6 +525,50 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
         )
         self.assertTrue(all(weight <= daily_limit for weight in weights.values()))
 
+    def test_ssh_executor_requests_gzip_and_returns_decompressed_json(self) -> None:
+        raw = b'{"status":"ok"}'
+        meta = {
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "elapsed_seconds": 1.25,
+            "response_bytes": len(raw),
+            "response_sha256": compare.sha256_bytes(raw),
+        }
+        completed = SimpleNamespace(
+            returncode=0,
+            stderr=b"",
+            stdout=(
+                b"\n"
+                + compare._SSH_HTTP_MARKER
+                + json.dumps(meta, separators=(",", ":")).encode()
+                + b"\n"
+                + raw
+            ),
+        )
+        requester = compare.SshHttpRequester(
+            "terminal-a",
+            "ubuntu@example.invalid",
+        )
+
+        with mock.patch.object(
+            compare.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            result = requester(
+                "POST",
+                "https://api.open-meteo.com/v1/ecmwf",
+                body=b"{}",
+                headers={"Content-Type": "application/json"},
+                timeout=300,
+            )
+
+        program = run.call_args.kwargs["input"]
+        self.assertIn(b'Accept-Encoding", "gzip"', program)
+        self.assertIn(b"gzip.decompress(raw)", program)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.raw, raw)
+
     def test_public_capture_records_fixed_executor_in_success_and_retry_evidence(
         self,
     ) -> None:

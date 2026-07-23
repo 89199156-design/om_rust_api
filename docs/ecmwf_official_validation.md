@@ -210,6 +210,8 @@ python3 scripts/validation/ecmwf_official_compare.py \
 
 每个官方批次会把 canonical JSON request body 单独保存并哈希。若公共诊断因单请求权重被分批，每批重复同一 sentinel；同一语义的 sentinel 361 小时 + 15 日规范化哈希必须一致，否则整份快照无效。
 
+SSH 执行器使用标准 `Accept-Encoding: gzip` 接收大响应，并在执行器内完整解压后再计算响应字节数、SHA-256 和回传原始 JSON。压缩仅作用于 HTTP 传输，不改变 canonical 请求、落盘响应或逐值比较语义。
+
 ## 串行本地比对
 
 ~~~powershell
