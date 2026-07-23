@@ -8344,24 +8344,31 @@ fn resolve_model_sampling(
     let x0 = center_x.saturating_sub(1);
     let y1 = (center_y + 1).min(ny - 1);
     let x1 = (center_x + 1).min(nx - 1);
-    let height = y1 - y0 + 1;
     let width = x1 - x0 + 1;
+    let latitudes = (y0..=y1)
+        .map(|y| {
+            grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y).map(f64::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let longitudes = (x0..=x1)
+        .map(|x| {
+            grid_longitude_for_index(&entry.array, entry.native_grid.as_ref(), x).map(f64::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let elevations = if let Some(static_entry) = product.static_entries.get("surface_elevation") {
-        let latitudes = (y0..=y1)
-            .map(|y| {
-                grid_latitude_for_index(&static_entry.array, static_entry.native_grid.as_ref(), y)
-                    .map(f64::from)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let longitudes = (x0..=x1)
-            .map(|x| {
-                grid_longitude_for_index(&static_entry.array, static_entry.native_grid.as_ref(), x)
-                    .map(f64::from)
-            })
-            .collect::<Result<Vec<_>>>()?;
         read_entry_grid(&product, static_entry, decoder, &latitudes, &longitudes)?
     } else {
-        read_static_elevation_grid(snapshot, decoder, spec, y0, x0, height, width)?
+        // Native cycle files are regional crops, while the fixed HSURF file is
+        // the official global grid. Regional y/x indices therefore cannot be
+        // used directly against the global file; remap the regional cell
+        // centres to the corresponding global indices first.
+        read_static_elevation_grid_for_coordinates(
+            snapshot,
+            decoder,
+            spec,
+            &latitudes,
+            &longitudes,
+        )?
     };
     let center_index = (elevations.len() / 2).min(elevations.len().saturating_sub(1));
     let center_elevation = elevations[center_index];
@@ -8941,6 +8948,58 @@ mod tests {
         let model_latitude = grid_latitude_for_index(&array, None, y).unwrap();
 
         assert!((model_latitude - 22.78555).abs() < 0.00001);
+    }
+
+    #[test]
+    fn regional_gfs_cell_centres_map_to_global_static_indices() {
+        let regional_array = ArrayMetadata {
+            data_type: 20,
+            compression: 0,
+            dimensions: vec![513, 615, 481],
+            chunks: vec![20, 20, 481],
+            lut_offset: None,
+            lut_size: None,
+            scale_factor: Some(1.0),
+            add_offset: Some(0.0),
+        };
+        let regional_grid = crate::manifest::NativeGridMetadata {
+            nx: 615,
+            ny: 513,
+            lon_min: 69.0234375,
+            lat_min: -0.995769475000003,
+            dx: 0.1171875,
+            dy: 0.11714935,
+            dt_seconds: 3600,
+            om_file_length: 481,
+            full_nx: Some(3072),
+            full_ny: Some(1536),
+            x0: Some(2125),
+            y0: Some(759),
+        };
+        let global_array = ArrayMetadata {
+            data_type: 20,
+            compression: 0,
+            dimensions: GFS013_STATIC_SPEC.dimensions.to_vec(),
+            chunks: GFS013_STATIC_SPEC.chunks.to_vec(),
+            lut_offset: Some(GFS013_STATIC_SPEC.lut_offset),
+            lut_size: Some(GFS013_STATIC_SPEC.lut_size),
+            scale_factor: Some(1.0),
+            add_offset: Some(0.0),
+        };
+
+        for (regional_y, regional_x) in [(0, 0), (275, 448), (512, 614)] {
+            let latitude = f64::from(
+                grid_latitude_for_index(&regional_array, Some(&regional_grid), regional_y).unwrap(),
+            );
+            let longitude = f64::from(
+                grid_longitude_for_index(&regional_array, Some(&regional_grid), regional_x)
+                    .unwrap(),
+            );
+            assert_eq!(
+                grid_index_for_lat_lon(&global_array, None, latitude, longitude).unwrap(),
+                (regional_y + 759, regional_x + 2125)
+            );
+        }
     }
 
     #[test]
