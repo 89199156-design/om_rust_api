@@ -3,8 +3,9 @@ use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
-    backwards_diffuse_radiation, backwards_direct_normal_irradiance, backwards_sunshine_duration,
-    backwards_to_instant_factor, daylight_duration, extra_terrestrial_radiation_backwards,
+    backwards_diffuse_radiation, backwards_direct_normal_irradiance,
+    backwards_global_tilted_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
+    daylight_duration, extra_terrestrial_radiation_backwards,
     extra_terrestrial_radiation_factor_backwards, is_day, sun_transit, SunTransit, SOLAR_CONSTANT,
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -2430,10 +2431,9 @@ pub fn read_variable_value(
         }
         "shortwave_radiation_instant"
         | "diffuse_radiation_instant"
-        | "direct_radiation_instant"
-        | "global_tilted_irradiance_instant" => {
+        | "direct_radiation_instant" => {
             let raw = match variable {
-                "shortwave_radiation_instant" | "global_tilted_irradiance_instant" => read_direct(
+                "shortwave_radiation_instant" => read_direct(
                     snapshot,
                     decoder,
                     "shortwave_radiation",
@@ -2486,15 +2486,35 @@ pub fn read_variable_value(
                 variable.ends_with("_instant"),
             ));
         }
-        "global_tilted_irradiance" => {
-            return read_direct(
+        "global_tilted_irradiance" | "global_tilted_irradiance_instant" => {
+            let direct = read_variable_value(
                 snapshot,
                 decoder,
-                "shortwave_radiation",
+                "direct_radiation",
                 time,
                 latitude,
                 longitude,
-            )
+            )?;
+            let diffuse = read_variable_value(
+                snapshot,
+                decoder,
+                "diffuse_radiation",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
+            return Ok(backwards_global_tilted_irradiance(
+                direct,
+                diffuse,
+                time,
+                3600,
+                sampling.latitude as f32,
+                sampling.longitude as f32,
+                0.0,
+                0.0,
+                variable.ends_with("_instant"),
+            ));
         }
         "sunshine_duration" => {
             let direct = read_variable_value(
@@ -3360,8 +3380,7 @@ pub fn read_variable_grid_series(
         )),
         "shortwave_radiation_instant"
         | "direct_radiation_instant"
-        | "diffuse_radiation_instant"
-        | "global_tilted_irradiance_instant" => {
+        | "diffuse_radiation_instant" => {
             let source = match variable {
                 "direct_radiation_instant" => "direct_radiation",
                 "diffuse_radiation_instant" => "diffuse_radiation",
@@ -3422,15 +3441,51 @@ pub fn read_variable_grid_series(
                 })
                 .collect())
         }
-        "global_tilted_irradiance" => read_direct_grid_series(
-            snapshot,
-            decoder,
-            "shortwave_radiation",
-            times,
-            latitudes,
-            longitudes,
-            true,
-        ),
+        "global_tilted_irradiance" | "global_tilted_irradiance_instant" => {
+            let direct = read_variable_grid_series(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                times,
+                latitudes,
+                longitudes,
+            )?;
+            let diffuse = read_variable_grid_series(
+                snapshot,
+                decoder,
+                "diffuse_radiation",
+                times,
+                latitudes,
+                longitudes,
+            )?;
+            let instant = variable.ends_with("_instant");
+            let width = longitudes.len();
+            Ok(direct
+                .into_iter()
+                .zip(diffuse)
+                .zip(times)
+                .map(|((direct, diffuse), time)| {
+                    direct
+                        .into_iter()
+                        .zip(diffuse)
+                        .enumerate()
+                        .map(|(index, (direct, diffuse))| {
+                            backwards_global_tilted_irradiance(
+                                direct,
+                                diffuse,
+                                *time,
+                                dt_seconds,
+                                latitudes[index / width] as f32,
+                                longitudes[index % width] as f32,
+                                0.0,
+                                0.0,
+                                instant,
+                            )
+                        })
+                        .collect()
+                })
+                .collect())
+        }
         "sunshine_duration" => {
             let direct = read_variable_grid_series(
                 snapshot,

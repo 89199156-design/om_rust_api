@@ -309,6 +309,83 @@ pub fn backwards_direct_normal_irradiance(
     dni * instant_sun_elevation(no_cutoff).max(0.0) / backwards
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn backwards_global_tilted_irradiance(
+    direct_radiation: f32,
+    diffuse_radiation: f32,
+    timestamp: DateTime<Utc>,
+    dt_seconds: i64,
+    latitude: f32,
+    longitude: f32,
+    tilt_degrees: f32,
+    array_azimuth_degrees: f32,
+    convert_to_instant: bool,
+) -> f32 {
+    if !direct_radiation.is_finite() || !diffuse_radiation.is_finite() {
+        return f32::NAN;
+    }
+    if direct_radiation + diffuse_radiation <= 0.0 {
+        return 0.0;
+    }
+    let Some(geometry) = backwards_geometry(timestamp, dt_seconds, latitude, longitude, 3.0) else {
+        return 0.0;
+    };
+    let daylight = backwards_sun_elevation(geometry, true);
+    let daylight_delta = {
+        let value = geometry.p1_limited - geometry.p10_limited;
+        if value < 0.0 {
+            value.min(-0.001)
+        } else {
+            value.max(0.001)
+        }
+    };
+    let xx_daylight = (geometry.t1.sin() * -(geometry.p1_limited - geometry.p0).cos()
+        - geometry.t1.sin() * -(geometry.p10_limited - geometry.p0).cos())
+        / daylight_delta;
+    let yy_left = geometry.p1_limited * geometry.t0.sin() * geometry.t1.cos()
+        - geometry.t0.cos() * geometry.t1.sin() * (geometry.p1_limited - geometry.p0).sin();
+    let yy_right = geometry.p10_limited * geometry.t0.sin() * geometry.t1.cos()
+        - geometry.t0.cos() * geometry.t1.sin() * (geometry.p10_limited - geometry.p0).sin();
+    let yy_daylight = (yy_left - yy_right) / (geometry.p1_limited - geometry.p10_limited);
+
+    let zenith = daylight.acos();
+    let azimuth = xx_daylight.atan2(yy_daylight);
+    let array_azimuth = if array_azimuth_degrees.is_nan() {
+        azimuth + PI
+    } else {
+        radians(array_azimuth_degrees)
+    };
+    let tilt = if tilt_degrees.is_nan() {
+        zenith
+    } else {
+        radians(tilt_degrees)
+    };
+    let sky_view_factor = (1.0 + tilt.cos()) / 2.0;
+    let module_diffuse = sky_view_factor * diffuse_radiation;
+    let module_albedo = (direct_radiation + diffuse_radiation) * 0.2 * (1.0 - sky_view_factor);
+    let dni = if daylight <= 0.0001 {
+        direct_radiation
+    } else {
+        direct_radiation / daylight
+    };
+    let angle_of_incidence_cosine = (zenith.cos() * tilt.cos()
+        + zenith.sin() * tilt.sin() * (azimuth - PI - array_azimuth).cos())
+    .max(0.0);
+    let gti = dni * angle_of_incidence_cosine + module_diffuse + module_albedo;
+    if !convert_to_instant {
+        return gti;
+    }
+    let Some(no_cutoff) = backwards_geometry(timestamp, dt_seconds, latitude, longitude, 0.0)
+    else {
+        return 0.0;
+    };
+    let backwards = backwards_sun_elevation(no_cutoff, false).abs();
+    if backwards <= 0.0 {
+        return 0.0;
+    }
+    gti * instant_sun_elevation(no_cutoff).max(0.0) / backwards
+}
+
 pub fn backwards_sunshine_duration(
     direct_radiation: f32,
     timestamp: DateTime<Utc>,
@@ -527,5 +604,23 @@ mod tests {
             "actual={actual:?}, bits={:08x}",
             actual.to_bits()
         );
+    }
+
+    #[test]
+    fn horizontal_gti_matches_frozen_ecmwf_sunset_cutoff() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 23, 12, 0, 0).unwrap();
+        let diffuse = backwards_diffuse_radiation(1.0, timestamp, 3600, 58.0, 140.0);
+        let actual = backwards_global_tilted_irradiance(
+            1.0 - diffuse,
+            diffuse,
+            timestamp,
+            3600,
+            58.0,
+            140.0,
+            0.0,
+            0.0,
+            false,
+        );
+        assert_eq!(actual, 0.0);
     }
 }
