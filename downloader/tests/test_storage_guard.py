@@ -61,11 +61,12 @@ class StorageGuardTests(unittest.TestCase):
     def test_guard_rejects_capacity_below_write_plus_reserve(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             data = Path(temporary_directory)
+            system_root = Path(data.resolve().anchor)
             with (
                 mock.patch("os.path.ismount", return_value=True),
                 mock.patch(
                     "om_downloader.storage_guard._device_id",
-                    side_effect=lambda path: 100 if Path(path) == Path("/") else 200,
+                    side_effect=lambda path: 100 if Path(path) == system_root else 200,
                 ),
                 mock.patch(
                     "om_downloader.storage_guard.shutil.disk_usage",

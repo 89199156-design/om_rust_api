@@ -1,6 +1,12 @@
+from contextlib import closing, redirect_stdout
+import io
 from pathlib import Path
+import sqlite3
+import tempfile
 import unittest
+from unittest.mock import patch
 
+import scripts.install_1panel_v2_cronjobs as cronjob_installer
 from scripts.install_1panel_v2_cronjobs import (
     REMOVED_PLACEHOLDER_TASKS,
     _existing_cronjob_values,
@@ -11,6 +17,22 @@ from scripts.install_1panel_v2_cronjobs import (
 
 
 class InstallScriptTests(unittest.TestCase):
+    def test_legacy_database_without_cronjobs_table_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "1Panel.db"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute("create table settings (name text primary key)")
+                connection.commit()
+
+            output = io.StringIO()
+            with (
+                patch.object(cronjob_installer, "LEGACY_DB", database),
+                redirect_stdout(output),
+            ):
+                cronjob_installer.clean_legacy_jobs(("OM_GFS_DOWNLOAD",))
+
+            self.assertEqual(output.getvalue().strip(), "LEGACY_DB_CLEANED=0")
+
     def test_existing_job_update_preserves_scheduler_runtime_fields(self):
         values = _existing_cronjob_values(
             {"spec": "0 * * * *", "entry_ids": "1", "is_executing": 1}

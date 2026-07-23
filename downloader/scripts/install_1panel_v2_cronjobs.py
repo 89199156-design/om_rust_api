@@ -451,6 +451,12 @@ def clean_legacy_jobs(names: tuple[str, ...]) -> None:
         return
     con = sqlite3.connect(str(LEGACY_DB))
     try:
+        has_cronjobs = con.execute(
+            "select 1 from sqlite_master where type = 'table' and name = 'cronjobs'"
+        ).fetchone()
+        if not has_cronjobs:
+            print("LEGACY_DB_CLEANED=0")
+            return
         count = con.execute(
             "select count(*) from cronjobs where name like 'om-download-%' or name like 'OM_%'"
         ).fetchone()[0]
