@@ -10726,6 +10726,39 @@ mod output_tests {
     }
 
     #[test]
+    fn growing_degree_days_use_official_two_decimal_precision() {
+        assert_eq!(
+            json_array_for_variable(
+                "growing_degree_days_base_0_limit_50",
+                vec![1.1375],
+            ),
+            serde_json::json!([1.14]),
+        );
+        assert_eq!(
+            json_array_for_daily_variable(
+                "growing_degree_days_base_0_limit_50",
+                DailyWeatherAggregation::Sum(
+                    "growing_degree_days_base_0_limit_50",
+                ),
+                vec![17.006],
+            ),
+            serde_json::json!([17.01]),
+        );
+    }
+
+    #[test]
+    fn daylight_duration_uses_official_two_decimal_precision() {
+        assert_eq!(
+            json_array_for_daily_variable(
+                "daylight_duration",
+                DailyWeatherAggregation::DaylightDuration,
+                vec![43_625.707],
+            ),
+            serde_json::json!([43625.71]),
+        );
+    }
+
+    #[test]
     fn precipitation_type_uses_official_dimensionless_json_precision() {
         assert_eq!(
             json_array_for_variable("precipitation_type", vec![1.0, 0.0]).to_string(),
@@ -11090,10 +11123,12 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "uv_index"
         | "uv_index_clear_sky"
         | "sunshine_duration"
+        | "daylight_duration"
         | "evapotranspiration"
         | "et0_fao_evapotranspiration"
         | "vapour_pressure_deficit"
-        | "vapor_pressure_deficit" => OutputDecimals::Fixed(2),
+        | "vapor_pressure_deficit"
+        | "growing_degree_days_base_0_limit_50" => OutputDecimals::Fixed(2),
         "direct_radiation"
         | "shortwave_radiation_instant"
         | "diffuse_radiation_instant"
