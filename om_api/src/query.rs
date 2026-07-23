@@ -5541,7 +5541,11 @@ fn interpolate_ecmwf_linear_in_place(values: &mut [f32]) {
     }
 }
 
-fn interpolate_ecmwf_hermite_in_place(values: &mut [f32], bounds: Option<(f32, f32)>) {
+fn interpolate_ecmwf_hermite_in_place(
+    values: &mut [f32],
+    bounds: Option<(f32, f32)>,
+    require_full_support: bool,
+) {
     let mut width = 0usize;
     for index in 0..values.len() {
         if !values[index].is_nan() {
@@ -5567,6 +5571,7 @@ fn interpolate_ecmwf_hermite_in_place(values: &mut [f32], bounds: Option<(f32, f
         if c.is_nan() {
             break;
         }
+        let has_distinct_d = !d.is_nan();
         if d.is_nan() {
             d = c;
         } else {
@@ -5574,6 +5579,9 @@ fn interpolate_ecmwf_hermite_in_place(values: &mut [f32], bounds: Option<(f32, f
         }
         let pos_b = pos_c.saturating_sub(width);
         let pos_a = pos_b.checked_sub(width).unwrap_or(pos_b);
+        if require_full_support && (pos_a == pos_b || !has_distinct_d) {
+            continue;
+        }
         let b = values[pos_b];
         let a = values[pos_a];
         let coefficient_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
@@ -5603,6 +5611,7 @@ fn ecmwf_first_stage_point(
     start: DateTime<Utc>,
     latitude: f32,
     longitude: f32,
+    require_full_hermite_support: bool,
 ) {
     match kind {
         InterpolationKind::Direct => {}
@@ -5612,7 +5621,7 @@ fn ecmwf_first_stage_point(
         InterpolationKind::Backwards { .. } => interpolate_ecmwf_backwards_in_place(values, false),
         InterpolationKind::Linear { .. } => interpolate_ecmwf_linear_in_place(values),
         InterpolationKind::Hermite { bounds, .. } => {
-            interpolate_ecmwf_hermite_in_place(values, bounds)
+            interpolate_ecmwf_hermite_in_place(values, bounds, require_full_hermite_support)
         }
         InterpolationKind::SolarBackwardsAveraged { .. } => {
             interpolate_solar_backwards_with_dt_in_place(
@@ -5698,6 +5707,7 @@ fn ecmwf_regularize_source_run(
             start,
             latitudes[point / width] as f32,
             longitudes[point % width] as f32,
+            raw_variable == "wind_gusts_10m",
         );
         for (frame, value) in frames.iter_mut().zip(values) {
             frame[point] = value;
@@ -5866,14 +5876,32 @@ fn build_ecmwf_regular_series(
     if runs.is_empty() {
         return Ok(None);
     }
+    Ok(Some(stitch_ecmwf_regular_runs(
+        runs,
+        latitudes.len() * longitudes.len(),
+    )?))
+}
 
+fn stitch_ecmwf_regular_runs(
+    mut runs: Vec<EcmwfRegularRun>,
+    grid_len: usize,
+) -> Result<EcmwfRegularSeries> {
     // Oldest-to-newest insertion reproduces Open-Meteo's rolling database:
-    // newer runs overwrite only their own regular 3-hour horizon.
+    // newer runs overwrite only finite frames they can actually reconstruct.
+    // A boundary NaN must retain the older run's fully supported interpolation.
     runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
     let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
     for run in runs {
         for (index, frame) in run.frames.into_iter().enumerate() {
-            stitched.insert(run.start + Duration::hours(index as i64 * 3), frame);
+            let time = run.start + Duration::hours(index as i64 * 3);
+            let target = stitched
+                .entry(time)
+                .or_insert_with(|| vec![f32::NAN; frame.len()]);
+            for (target_value, value) in target.iter_mut().zip(frame) {
+                if value.is_finite() {
+                    *target_value = value;
+                }
+            }
         }
     }
     let first = *stitched
@@ -5885,7 +5913,6 @@ fn build_ecmwf_regular_series(
         .next_back()
         .context("ECMWF regular series is empty")?;
     let count = usize::try_from((last - first).num_hours() / 3 + 1)?;
-    let grid_len = latitudes.len() * longitudes.len();
     let mut regular_times = Vec::with_capacity(count);
     let mut regular_frames = Vec::with_capacity(count);
     for index in 0..count {
@@ -5897,10 +5924,10 @@ fn build_ecmwf_regular_series(
                 .unwrap_or_else(|| vec![f32::NAN; grid_len]),
         );
     }
-    Ok(Some(EcmwfRegularSeries {
+    Ok(EcmwfRegularSeries {
         times: regular_times,
         frames: regular_frames,
-    }))
+    })
 }
 
 fn ecmwf_cached_regular_series(
@@ -9127,6 +9154,39 @@ mod tests {
     }
 
     #[test]
+    fn ecmwf_gust_first_stage_leaves_boundary_gaps_for_older_complete_run() {
+        let mut values = vec![6.3, f32::NAN, 6.6, f32::NAN, 6.9, f32::NAN, 9.6];
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 10e9)), true);
+
+        assert!(values[1].is_nan());
+        assert!((values[3] - 6.6).abs() < 1e-6);
+        assert!(values[5].is_nan());
+    }
+
+    #[test]
+    fn ecmwf_newer_boundary_nan_preserves_older_interpolated_frame() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 26, 18, 0, 0).unwrap();
+        let stitched = stitch_ecmwf_regular_runs(
+            vec![
+                EcmwfRegularRun {
+                    source_run: "2026072000".to_string(),
+                    start,
+                    frames: vec![vec![7.0], vec![6.8], vec![6.5]],
+                },
+                EcmwfRegularRun {
+                    source_run: "2026072012".to_string(),
+                    start,
+                    frames: vec![vec![7.1], vec![f32::NAN], vec![6.6]],
+                },
+            ],
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(stitched.frames, vec![vec![7.1], vec![6.8], vec![6.6]]);
+    }
+
+    #[test]
     fn sparse_solar_full_series_keeps_official_nan_d_at_night() {
         let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
         let mut values = vec![f32::NAN; 10];
@@ -10678,7 +10738,7 @@ mod output_tests {
         };
         let raw = vec![0.93, 0.22, 2.17, f32::NAN, -1.64, f32::NAN, -1.01];
         let mut staged = raw.clone();
-        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5);
+        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5, false);
         assert_eq!(staged, vec![0.95, 0.2, 2.15, 0.3, -1.65, -1.55, -1.0]);
 
         let regular_times = (0..staged.len())
@@ -10694,7 +10754,7 @@ mod output_tests {
             3600,
         );
         let mut unquantized = raw;
-        interpolate_ecmwf_hermite_in_place(&mut unquantized, None);
+        interpolate_ecmwf_hermite_in_place(&mut unquantized, None, false);
         let direct_hour = ecmwf_second_stage_value(
             &unquantized,
             &regular_times,

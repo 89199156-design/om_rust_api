@@ -130,10 +130,21 @@ older run first and only then lets the newer run overwrite the frames it
 actually supplies. Context entries are marked as interpolation support and
 deduplicated by variable, source run, valid time and logical coverage hour.
 
+The first long-range six-hour interval of a newer retained run has no distinct
+A frame. The rolling database therefore keeps the fully supported midpoint
+from the preceding long run instead of replacing it with a boundary-replicated
+Hermite value. The downloader retains one additional older source run for each
+selected fallback variable. The API groups those entries by their real
+`source_run`, leaves first/last-stage gust gaps as NaN when A or D is absent,
+then overlays runs oldest-to-newest while replacing only finite values. Direct
+newer raw frames still win; an unreconstructable newer midpoint cannot erase
+the older exact midpoint.
+
 Regressions:
 `test_missing_variable_fallback_candidates_reach_retained_long_run`,
 `test_fallback_context_captures_all_four_point_hermite_support_candidates`,
-and
+`ecmwf_gust_first_stage_leaves_boundary_gaps_for_older_complete_run`,
+`ecmwf_newer_boundary_nan_preserves_older_interpolated_frame`, and
 `ecmwf_retained_gust_frame_supplies_official_second_stage_lookahead`.
 
 ## Verification contract

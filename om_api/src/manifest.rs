@@ -198,13 +198,8 @@ fn load_product_snapshot_from_manifest_path(
     let mut entries = HashMap::new();
     let mut entries_by_source_run: HashMap<String, Vec<BundleEntry>> = HashMap::new();
     for entry in &bundle_file.entries {
-        let logical_source_run = entry
-            .coverage_source_run
-            .as_deref()
-            .unwrap_or(&entry.source_run)
-            .to_string();
         entries_by_source_run
-            .entry(logical_source_run)
+            .entry(entry.source_run.clone())
             .or_default()
             .push(entry.clone());
         if !entry.interpolation_support {

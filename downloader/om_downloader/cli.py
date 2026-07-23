@@ -1132,6 +1132,7 @@ def _download_openmeteo_product(
         )
         if missing_for_object:
             remaining_missing = set(missing_for_object)
+            predecessor_support_missing: set[str] = set()
             valid_time = _parse_utc(str(object_record["valid_time_utc"]))
             primary_run = str(object_record["source_run"])
             fallback_runs = _missing_variable_fallback_candidates(
@@ -1140,9 +1141,109 @@ def _download_openmeteo_product(
                 primary_run=primary_run,
                 valid_time=valid_time,
             )
+
+            def append_fallback_source_variables(
+                variables: tuple[str, ...],
+                fallback_source: Any,
+                fallback_inventory: Any,
+                fallback_run_id: str,
+                fallback_base_time: datetime,
+                fallback_forecast_hour: int,
+                fallback_url: str,
+                fallback_content_length: int | None,
+                *,
+                interpolation_support: bool,
+            ) -> None:
+                if not variables:
+                    return
+                fallback_object_record = {
+                    "valid_time_utc": object_record["valid_time_utc"],
+                    "source_run": fallback_run_id,
+                    "forecast_hour": fallback_forecast_hour,
+                    "coverage_source_run": object_record.get(
+                        "coverage_source_run", primary_run
+                    ),
+                    "coverage_forecast_hour": coverage_forecast_hour,
+                    "interpolation_support": interpolation_support,
+                }
+                append_planned_variables(
+                    variables,
+                    fallback_source,
+                    fallback_inventory,
+                    fallback_object_record,
+                    fallback_url,
+                    fallback_content_length,
+                )
+                context_hours = product.missing_variable_fallback_context_hours
+                if context_hours <= 0:
+                    return
+                for context_offset in _missing_variable_fallback_context_offsets(
+                    context_hours
+                ):
+                    context_valid_time = valid_time + timedelta(hours=context_offset)
+                    context_forecast_hour = fallback_forecast_hour + context_offset
+                    context_coverage_forecast_hour = (
+                        coverage_forecast_hour + context_offset
+                    )
+                    if (
+                        context_forecast_hour < 0
+                        or context_forecast_hour > product.forecast_hour_end
+                        or context_coverage_forecast_hour < 0
+                    ):
+                        continue
+                    context_url = openmeteo_spatial_object_url(
+                        bucket_url,
+                        product.openmeteo_model,
+                        reference_time_utc=fallback_base_time,
+                        valid_time_utc=context_valid_time,
+                    )
+                    try:
+                        (
+                            context_source,
+                            context_content_length,
+                            context_inventory,
+                        ) = inventory_for_url(context_url, variables)
+                    except Exception:
+                        continue
+                    context_variables = tuple(
+                        variable
+                        for variable in variables
+                        if variable in context_inventory.arrays
+                    )
+                    context_object_record = {
+                        "valid_time_utc": _format_utc(context_valid_time),
+                        "source_run": fallback_run_id,
+                        "forecast_hour": context_forecast_hour,
+                        "coverage_source_run": object_record.get(
+                            "coverage_source_run", primary_run
+                        ),
+                        "coverage_forecast_hour": context_coverage_forecast_hour,
+                        "interpolation_support": True,
+                    }
+                    append_planned_variables(
+                        context_variables,
+                        context_source,
+                        context_inventory,
+                        context_object_record,
+                        context_url,
+                        context_content_length,
+                    )
+
+            variable_order = tuple(
+                dict.fromkeys(
+                    tuple(product.required_variables)
+                    + tuple(product.required_initial_fallback_variables)
+                )
+            )
             for fallback_run_id, fallback_base_time, fallback_forecast_hour in fallback_runs:
-                if not remaining_missing:
+                if not remaining_missing and not predecessor_support_missing:
                     break
+                fallback_wanted_variables = tuple(
+                    variable
+                    for variable in variable_order
+                    if variable in remaining_missing
+                    or variable in predecessor_support_missing
+                )
                 fallback_url = openmeteo_spatial_object_url(
                     bucket_url,
                     product.openmeteo_model,
@@ -1152,94 +1253,49 @@ def _download_openmeteo_product(
                 try:
                     _fallback_source, fallback_content_length, fallback_inventory = inventory_for_url(
                         fallback_url,
-                        tuple(remaining_missing),
+                        fallback_wanted_variables,
                     )
                 except Exception:
                     continue
-                fallback_object_record = {
-                    "valid_time_utc": object_record["valid_time_utc"],
-                    "source_run": fallback_run_id,
-                    "forecast_hour": fallback_forecast_hour,
-                    "coverage_source_run": object_record.get(
-                        "coverage_source_run", primary_run
-                    ),
-                    "coverage_forecast_hour": coverage_forecast_hour,
-                    "interpolation_support": bool(
-                        object_record.get("interpolation_support")
-                    ),
-                }
                 fallback_variables = tuple(
                     variable
-                    for variable in dict.fromkeys(
-                        tuple(product.required_variables)
-                        + tuple(product.required_initial_fallback_variables)
-                    )
+                    for variable in variable_order
                     if variable in remaining_missing and variable in fallback_inventory.arrays
                 )
-                append_planned_variables(
+                predecessor_variables = tuple(
+                    variable
+                    for variable in variable_order
+                    if variable in predecessor_support_missing
+                    and variable in fallback_inventory.arrays
+                )
+                append_fallback_source_variables(
                     fallback_variables,
                     _fallback_source,
                     fallback_inventory,
-                    fallback_object_record,
+                    fallback_run_id,
+                    fallback_base_time,
+                    fallback_forecast_hour,
                     fallback_url,
                     fallback_content_length,
+                    interpolation_support=bool(
+                        object_record.get("interpolation_support")
+                    ),
                 )
-                context_hours = product.missing_variable_fallback_context_hours
-                if fallback_variables and context_hours > 0:
-                    for context_offset in _missing_variable_fallback_context_offsets(
-                        context_hours
-                    ):
-                        context_valid_time = valid_time + timedelta(hours=context_offset)
-                        context_forecast_hour = fallback_forecast_hour + context_offset
-                        context_coverage_forecast_hour = (
-                            coverage_forecast_hour + context_offset
-                        )
-                        if (
-                            context_forecast_hour < 0
-                            or context_forecast_hour > product.forecast_hour_end
-                            or context_coverage_forecast_hour < 0
-                        ):
-                            continue
-                        context_url = openmeteo_spatial_object_url(
-                            bucket_url,
-                            product.openmeteo_model,
-                            reference_time_utc=fallback_base_time,
-                            valid_time_utc=context_valid_time,
-                        )
-                        try:
-                            (
-                                context_source,
-                                context_content_length,
-                                context_inventory,
-                            ) = inventory_for_url(context_url, fallback_variables)
-                        except Exception:
-                            continue
-                        context_variables = tuple(
-                            variable
-                            for variable in fallback_variables
-                            if variable in context_inventory.arrays
-                        )
-                        context_object_record = {
-                            "valid_time_utc": _format_utc(context_valid_time),
-                            "source_run": fallback_run_id,
-                            "forecast_hour": context_forecast_hour,
-                            "coverage_source_run": object_record.get(
-                                "coverage_source_run", primary_run
-                            ),
-                            "coverage_forecast_hour": (
-                                context_coverage_forecast_hour
-                            ),
-                            "interpolation_support": True,
-                        }
-                        append_planned_variables(
-                            context_variables,
-                            context_source,
-                            context_inventory,
-                            context_object_record,
-                            context_url,
-                            context_content_length,
-                        )
+                append_fallback_source_variables(
+                    predecessor_variables,
+                    _fallback_source,
+                    fallback_inventory,
+                    fallback_run_id,
+                    fallback_base_time,
+                    fallback_forecast_hour,
+                    fallback_url,
+                    fallback_content_length,
+                    interpolation_support=True,
+                )
                 remaining_missing.difference_update(fallback_variables)
+                predecessor_support_missing.difference_update(predecessor_variables)
+                if product.missing_variable_fallback_context_hours > 0:
+                    predecessor_support_missing.update(fallback_variables)
                 missing_for_object = sorted(remaining_missing)
         return {
             "object_record": object_record,
