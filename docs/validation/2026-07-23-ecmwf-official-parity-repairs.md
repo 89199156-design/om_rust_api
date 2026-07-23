@@ -78,6 +78,24 @@ stored or calculated category.
 Regression:
 `precipitation_type_uses_official_dimensionless_json_precision`.
 
+## Diffuse-radiation exponent parity
+
+The next strict mismatch was the sunrise frame
+`hourly.sunshine_duration[338]`: official `403.71` seconds, clone `403.72`
+seconds. The incoming shortwave value was exactly `35.0 W/m²`; the difference
+was isolated to the diffuse-radiation separation model.
+
+Open-Meteo evaluates its squared and cubed clearness-index and incidence-angle
+terms with Float `powf`. The clone had replaced those calls with integer-power
+multiplication. Although both paths produced the same public one-decimal
+direct-radiation value, the few internal Float ULPs changed the two-decimal
+sunshine result. Restoring `powf` produces diffuse radiation bits `0x41e86c5f`
+and sunshine-duration bits `0x43c9db7d`, which serialize to the captured
+official `403.71`.
+
+Regression:
+`diffuse_and_sunshine_match_captured_ecmwf_sunrise_frame`.
+
 ## Verification contract
 
 Every repair requires the complete Rust unit and API suite, deployment from

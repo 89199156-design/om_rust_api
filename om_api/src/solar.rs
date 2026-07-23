@@ -255,10 +255,10 @@ pub fn backwards_diffuse_radiation(
     let clearness_index = shortwave_radiation / extraterrestrial;
     let angle_of_incidence = sin_alpha.acos();
 
-    let kt2 = clearness_index.powi(2);
-    let kt3 = clearness_index.powi(3);
-    let aoi2 = angle_of_incidence.powi(2);
-    let aoi3 = angle_of_incidence.powi(3);
+    let kt2 = clearness_index.powf(2.0);
+    let kt3 = clearness_index.powf(3.0);
+    let aoi2 = angle_of_incidence.powf(2.0);
+    let aoi3 = angle_of_incidence.powf(3.0);
     let diffuse_fraction = 1.58 * clearness_index + 0.991 * angle_of_incidence
         - 5.084 * kt2
         - 2.11 * clearness_index * angle_of_incidence
@@ -453,6 +453,17 @@ mod tests {
         let timestamp = Utc.timestamp_opt(1_784_070_000, 0).unwrap();
         let duration = backwards_sunshine_duration(200.0, timestamp, 3600, 29.580215, 106.52344);
         assert_eq!(duration.to_bits(), 1_162_005_532);
+    }
+
+    #[test]
+    fn diffuse_and_sunshine_match_captured_ecmwf_sunrise_frame() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 8, 6, 2, 0, 0).unwrap();
+        let diffuse = backwards_diffuse_radiation(35.0, timestamp, 3600, 0.0, 70.0);
+        let duration = backwards_sunshine_duration(35.0 - diffuse, timestamp, 3600, 0.0, 70.0);
+
+        assert_eq!(diffuse.to_bits(), 0x41e8_6c5f);
+        assert_eq!(duration.to_bits(), 0x43c9_db7d);
+        assert_eq!((duration * 100.0).round() / 100.0, 403.71);
     }
 
     #[test]
