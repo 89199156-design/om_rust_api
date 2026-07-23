@@ -11,6 +11,22 @@ from install_1panel_jobs import existing_job_values, values
 
 
 class WebpTaskGateTests(unittest.TestCase):
+    def test_run_scope_exports_external_static_roots(self):
+        content = (
+            Path(__file__).resolve().parents[1] / "scripts" / "run_scope.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'dem_root="${OM_DEM_ROOT:-/opt/1panel/apps/weather_om_api/static}"',
+            content,
+        )
+        self.assertIn(
+            'model_static_root="${OM_MODEL_STATIC_ROOT:-/opt/1panel/apps/weather_om_api}"',
+            content,
+        )
+        self.assertIn('export OM_DEM_ROOT="$dem_root"', content)
+        self.assertIn('export OM_MODEL_STATIC_ROOT="$model_static_root"', content)
+
     def test_ecmwf_task_is_initially_disabled_and_uses_canonical_scope(self):
         payload = values("now", "OM_ECMWF_WEBP_BUILD", "ecmwf_ifs025", 1)
         self.assertEqual(payload["status"], "Disable")

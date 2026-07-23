@@ -25,11 +25,16 @@ strict_data_root="${OM_STRICT_DATA_ROOT:-/data}"
 minimum_free_bytes="${OM_DATA_MIN_FREE_BYTES:-10737418240}"
 public_root="${OM_WEBP_PUBLIC_ROOT:-/opt/1panel/apps/weather/data}"
 decoder_lib="${OM_OMFILE_LIB:-/opt/1panel/apps/weather_om_api/native/libomfileformat.so}"
+dem_root="${OM_DEM_ROOT:-/opt/1panel/apps/weather_om_api/static}"
+model_static_root="${OM_MODEL_STATIC_ROOT:-/opt/1panel/apps/weather_om_api}"
 workers="${OM_WEBP_WORKERS:-2}"
 frames="${OM_WEBP_FRAMES:-121}"
 reporter="${OM_TASK_PROGRESS_REPORTER:-/opt/1panel/apps/weather_om_downloader/scripts/task_progress_reporter.py}"
 log_dir="${OM_WEBP_LOG_DIR:-$app_dir/logs}"
 ready_marker="$data_root/groups/$ready_group/current/ready_for_processing.json"
+
+export OM_DEM_ROOT="$dem_root"
+export OM_MODEL_STATIC_ROOT="$model_static_root"
 
 if [[ ! -f "$ready_marker" ]]; then
   printf '%s\n' "跳过｜任务：${scope^^} WebP｜原因：官方下载批次尚未发布"
