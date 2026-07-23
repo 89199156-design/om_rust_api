@@ -5764,6 +5764,18 @@ fn ecmwf_second_stage_value(
         .map(|pair| (pair[1] - pair[0]).num_seconds())
         .find(|seconds| *seconds > 0)
         .unwrap_or(3 * 3600);
+    // A request on the native regular axis is a database read, not another
+    // interpolation pass. Re-running solar interpolation at a low-angle
+    // native frame can replace a valid 1 W/m² value with the neighbouring
+    // clearness index and materially change nonlinear derivatives such as
+    // daily ET0.
+    if output_dt_seconds == regular_dt_seconds && elapsed % regular_dt_seconds == 0 {
+        return usize::try_from(elapsed / regular_dt_seconds)
+            .ok()
+            .and_then(|index| values.get(index))
+            .copied()
+            .unwrap_or(f32::NAN);
+    }
     let scalefactor = match kind {
         InterpolationKind::Direct => 1.0,
         InterpolationKind::BackwardsSum { scalefactor }
@@ -10955,6 +10967,26 @@ mod output_tests {
             3600,
         );
         assert_eq!(hourly_at_three, 0.1);
+    }
+
+    #[test]
+    fn ecmwf_native_three_hour_solar_frame_is_not_reinterpolated() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 23, 18, 0, 0).unwrap();
+        let regular_times = (0..4)
+            .map(|index| start + Duration::hours(index * 3))
+            .collect::<Vec<_>>();
+        let values = vec![0.0, 1.0, 272.0, 764.0];
+        let native = ecmwf_second_stage_value(
+            &values,
+            &regular_times,
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 },
+            start + Duration::hours(3),
+            0.0,
+            140.0,
+            10_800,
+        );
+
+        assert_eq!(native, 1.0);
     }
 
     #[test]
