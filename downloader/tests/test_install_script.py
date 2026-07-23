@@ -25,6 +25,12 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn("/opt/1panel/apps/weather_om_downloader", content)
         self.assertIn("unzip", content)
         self.assertIn("scripts/build_turbopfor_decoder.sh", content)
+        self.assertIn('ln -s -- "$DOWNLOAD_ROOT" "$INSTALL_DIR/data"', content)
+        self.assertIn(
+            'if [ -f "$BACKUP_DIR/native/libom_turbopfor.so" ]; then',
+            content,
+        )
+        self.assertIn("reused native decoder:", content)
         self.assertNotIn("python3 -m unittest discover -s tests -p", content)
         self.assertIn("native_decoder_ok", content)
         self.assertIn("--inspect-product-catalog gfs025", content)

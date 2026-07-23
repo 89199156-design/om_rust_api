@@ -83,6 +83,11 @@ cd "$INSTALL_DIR"
 if [ -d "$BACKUP_DIR/data" ]; then
   echo "legacy system-disk data preserved at $BACKUP_DIR/data"
 fi
+if [ -e "$INSTALL_DIR/data" ] || [ -L "$INSTALL_DIR/data" ]; then
+  echo "deployment package must not contain a runtime data path" >&2
+  exit 1
+fi
+ln -s -- "$DOWNLOAD_ROOT" "$INSTALL_DIR/data"
 mkdir -p native logs
 run_privileged install -d -o "$INSTALL_OWNER" -g "$INSTALL_OWNER" -m 0775 \
   "$DOWNLOAD_ROOT" \
@@ -91,9 +96,20 @@ run_privileged install -d -o "$INSTALL_OWNER" -g "$INSTALL_OWNER" -m 0775 \
   "$RAW_ROOT/groups/ecmwf" \
   "$RAW_ROOT/groups/ecmwf/current" \
   "$RAW_ROOT/groups/ecmwf/releases"
-bash scripts/build_turbopfor_decoder.sh "$INSTALL_DIR/native"
-
 export OM_TURBOPFOR_LIB="$INSTALL_DIR/native/libom_turbopfor.so"
+if [ -f "$BACKUP_DIR/native/libom_turbopfor.so" ]; then
+  run_privileged install -m 0755 \
+    "$BACKUP_DIR/native/libom_turbopfor.so" "$OM_TURBOPFOR_LIB"
+  if python3 -c "from om_downloader.om_native import load_default_turbopfor_decoder; load_default_turbopfor_decoder()"; then
+    echo "reused native decoder: $OM_TURBOPFOR_LIB"
+  else
+    run_privileged rm -f -- "$OM_TURBOPFOR_LIB"
+    bash scripts/build_turbopfor_decoder.sh "$INSTALL_DIR/native"
+  fi
+else
+  bash scripts/build_turbopfor_decoder.sh "$INSTALL_DIR/native"
+fi
+
 python3 -c "from om_downloader.om_native import load_default_turbopfor_decoder; load_default_turbopfor_decoder(); print('native_decoder_ok')"
 python3 -m om_downloader.cli --inspect-product-catalog gfs025 --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 python3 -m om_downloader.cli --inspect-product-catalog cams_global --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
