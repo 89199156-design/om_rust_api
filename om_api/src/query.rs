@@ -1202,8 +1202,8 @@ enum DailyWeatherAggregation {
     RadiationSum(&'static str),
     PrecipitationHours(&'static str),
     DominantWindDirection {
-        u: &'static str,
-        v: &'static str,
+        speed: &'static str,
+        direction: &'static str,
         output: &'static str,
     },
     Sunrise,
@@ -1220,7 +1220,7 @@ impl DailyWeatherAggregation {
             | Self::Sum(variable)
             | Self::RadiationSum(variable)
             | Self::PrecipitationHours(variable) => variable,
-            Self::DominantWindDirection { u, .. } => u,
+            Self::DominantWindDirection { speed, .. } => speed,
             Self::Sunrise | Self::Sunset | Self::DaylightDuration => "temperature_2m",
         }
     }
@@ -1277,14 +1277,14 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "wind_speed_100m_mean" => DailyWeatherAggregation::Mean("wind_speed_100m"),
         "wind_direction_10m_dominant" | "winddirection_10m_dominant" => {
             DailyWeatherAggregation::DominantWindDirection {
-                u: "wind_u_component_10m",
-                v: "wind_v_component_10m",
+                speed: "wind_speed_10m",
+                direction: "wind_direction_10m",
                 output: "wind_direction_10m",
             }
         }
         "wind_direction_100m_dominant" => DailyWeatherAggregation::DominantWindDirection {
-            u: "wind_u_component_100m",
-            v: "wind_v_component_100m",
+            speed: "wind_speed_100m",
+            direction: "wind_direction_100m",
             output: "wind_direction_100m",
         },
         "precipitation_hours" => DailyWeatherAggregation::PrecipitationHours("precipitation"),
@@ -1627,25 +1627,31 @@ fn daily_weather_value(
         return Ok(daylight_duration(display_midnight, latitude));
     }
 
-    if let DailyWeatherAggregation::DominantWindDirection { u, v, .. } = aggregation {
+    if let DailyWeatherAggregation::DominantWindDirection {
+        speed, direction, ..
+    } = aggregation
+    {
         let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025 {
             3
         } else {
             1
         };
         let times = daily_sample_times(start, end, step_hours);
-        let u_values = read_daily_series(snapshot, decoder, u, &times, latitude, longitude)?;
-        let v_values = read_daily_series(snapshot, decoder, v, &times, latitude, longitude)?;
-        if u_values
+        let speed_values =
+            read_daily_series(snapshot, decoder, speed, &times, latitude, longitude)?;
+        let direction_values =
+            read_daily_series(snapshot, decoder, direction, &times, latitude, longitude)?;
+        if speed_values
             .iter()
-            .chain(&v_values)
+            .chain(&direction_values)
             .any(|value| !value.is_finite())
         {
             return Ok(f32::NAN);
         }
-        let u_sum = u_values.iter().sum::<f32>();
-        let v_sum = v_values.iter().sum::<f32>();
-        return Ok(wind_direction(u_sum, v_sum));
+        return Ok(dominant_wind_direction(
+            &speed_values,
+            &direction_values,
+        ));
     }
 
     let source = aggregation.seed_variable();
@@ -3190,7 +3196,7 @@ pub fn read_variable_grid_series(
                         .zip(middle)
                         .zip(deep)
                         .map(|((shallow, middle), deep)| {
-                            shallow * 0.07 + middle * 0.21 + deep * 0.72
+                            weighted_soil_layer_0_to_100cm(shallow, middle, deep)
                         })
                         .collect()
                 })
@@ -8868,6 +8874,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn combined_soil_layer_preserves_official_float_weight_order() {
+        let value = weighted_soil_layer_0_to_100cm(0.354, 0.356, 0.343);
+        assert_eq!(
+            json_value_for_variable("soil_moisture_0_to_100cm", value),
+            serde_json::json!(0.347)
+        );
+    }
+
+    #[test]
     fn et0_propagates_a_missing_shortwave_tail_frame() {
         assert!(et0_evapotranspiration(
             -0.4,
@@ -8911,6 +8926,26 @@ mod tests {
         let actual = inputs.map(|(u, v)| wind_direction(u, v));
         assert_eq!(actual, expected);
         assert!(wind_direction(f32::NAN, 1.0).is_nan());
+    }
+
+    #[test]
+    fn dominant_wind_direction_preserves_north_as_360() {
+        // Internal single-precision model frames from the frozen p0014
+        // boundary case. Rounding these inputs before vector reconstruction
+        // changes the strict result from the official 360 to 0.
+        let speed = [
+            0.98994946, 0.2, 1.0630146, 1.1, 1.3453624, 1.5, 1.9235384, 1.8439089,
+        ];
+        let direction = [
+            44.999893, 180.0, 228.81418, 270.0, 318.01288, 360.0, 27.897186, 40.60121,
+        ];
+        assert_eq!(
+            json_value_for_variable(
+                "wind_direction_100m",
+                dominant_wind_direction(&speed, &direction),
+            ),
+            serde_json::json!(360)
+        );
     }
 
     #[test]
@@ -10395,6 +10430,29 @@ fn wind_direction(u: f32, v: f32) -> f32 {
     result * (180.0 / std::f32::consts::PI) + 180.0
 }
 
+/// Reproduce `GenericDailyCalculator.dominantDirection` from the pinned
+/// Open-Meteo source. The official path derives speed and direction for every
+/// model frame, reconstructs the two components in single precision, sums
+/// those reconstructed components, and only then evaluates the fast angle.
+fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
+    debug_assert_eq!(speed.len(), direction.len());
+    let u = speed
+        .iter()
+        .zip(direction)
+        .map(|(&speed, &direction)| {
+            -1.0 * speed * (direction * std::f32::consts::PI / 180.0).sin()
+        })
+        .sum::<f32>();
+    let v = speed
+        .iter()
+        .zip(direction)
+        .map(|(&speed, &direction)| {
+            -1.0 * speed * (direction * std::f32::consts::PI / 180.0).cos()
+        })
+        .sum::<f32>();
+    wind_direction(u, v)
+}
+
 fn wind_scale_factor(from: f32, to: f32) -> f32 {
     let factor_from = 4.87 / (67.8 * from - 5.42).ln();
     let factor_to = 4.87 / (67.8 * to - 5.42).ln();
@@ -10466,6 +10524,10 @@ fn vapor_pressure_deficit(temperature: f32, dewpoint: f32) -> f32 {
     let saturated = 0.6108 * ((17.27 * temperature) / (temperature + 237.3)).exp();
     let actual = 0.6108 * ((17.27 * dewpoint) / (dewpoint + 237.3)).exp();
     (saturated - actual).max(0.0)
+}
+
+fn weighted_soil_layer_0_to_100cm(shallow: f32, middle: f32, deep: f32) -> f32 {
+    shallow * 0.07 + middle * (0.28 - 0.07) + deep * (1.0 - 0.28)
 }
 
 #[allow(clippy::too_many_arguments)]
