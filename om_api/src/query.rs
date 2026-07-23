@@ -5597,74 +5597,6 @@ fn interpolate_ecmwf_hermite_in_place(values: &mut [f32], bounds: Option<(f32, f
     }
 }
 
-fn ecmwf_clear_sky_factor(time: DateTime<Utc>, latitude: f32, longitude: f32) -> f32 {
-    let solar = extra_terrestrial_radiation_factor_backwards(time, 3 * 3600, latitude, longitude);
-    if solar <= 0.0 {
-        0.0
-    } else {
-        solar * (-0.09_f32 / solar).exp()
-    }
-}
-
-fn interpolate_ecmwf_solar_first_stage(
-    values: &mut [f32],
-    start: DateTime<Utc>,
-    latitude: f32,
-    longitude: f32,
-) {
-    if !values.iter().any(|value| value.is_nan()) {
-        return;
-    }
-    let mut first_valid = values.len();
-    for (index, value) in values.iter().enumerate() {
-        if value.is_nan() {
-            continue;
-        }
-        if first_valid == values.len() {
-            first_valid = index;
-            continue;
-        }
-        first_valid = first_valid.saturating_sub(index - first_valid - 1);
-        break;
-    }
-    if first_valid >= values.len() {
-        return;
-    }
-    let solar = (0..values.len())
-        .map(|index| {
-            ecmwf_clear_sky_factor(
-                start + Duration::hours(index as i64 * 3),
-                latitude,
-                longitude,
-            )
-        })
-        .collect::<Vec<_>>();
-    let radiation_limit = SOLAR_CONSTANT * 0.95;
-    let radiation_minimum = 5.0 / SOLAR_CONSTANT;
-    for missing in first_valid..values.len() {
-        if !values[missing].is_nan() || missing == 0 {
-            continue;
-        }
-        let pos_b = missing - 1;
-        let search_end = (missing + 6).min(values.len());
-        let Some(pos_c) = ((missing + 1)..search_end).find(|index| !values[*index].is_nan()) else {
-            break;
-        };
-        let width = pos_c - pos_b;
-        let solar_average = solar[(pos_b + 1)..=pos_c].iter().sum::<f32>() / width as f32;
-        let kt_c = if solar_average <= radiation_minimum || values[pos_c] <= 0.0 {
-            f32::NAN
-        } else {
-            (values[pos_c] / solar_average).min(radiation_limit)
-        };
-        let kt = if kt_c.is_nan() { 0.0 } else { kt_c.max(0.0) };
-        for target in missing..pos_c {
-            values[target] = kt * solar[target];
-        }
-        values[pos_c] = kt * solar[pos_c];
-    }
-}
-
 fn ecmwf_first_stage_point(
     values: &mut [f32],
     kind: InterpolationKind,
@@ -5683,7 +5615,13 @@ fn ecmwf_first_stage_point(
             interpolate_ecmwf_hermite_in_place(values, bounds)
         }
         InterpolationKind::SolarBackwardsAveraged { .. } => {
-            interpolate_ecmwf_solar_first_stage(values, start, latitude, longitude)
+            interpolate_solar_backwards_with_dt_in_place(
+                values,
+                start,
+                3 * 3600,
+                latitude as f64,
+                longitude as f64,
+            )
         }
     }
     let scalefactor = match kind {
@@ -6738,9 +6676,19 @@ fn read_backwards_value(
     ))
 }
 
-fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) -> f32 {
-    extra_terrestrial_radiation_factor_backwards(time, 3600, latitude as f32, longitude as f32)
-        .max(0.0)
+fn solar_factor_backwards_with_dt(
+    time: DateTime<Utc>,
+    dt_seconds: i64,
+    latitude: f64,
+    longitude: f64,
+) -> f32 {
+    extra_terrestrial_radiation_factor_backwards(
+        time,
+        dt_seconds,
+        latitude as f32,
+        longitude as f32,
+    )
+    .max(0.0)
 }
 
 /// Port of Open-Meteo's `interpolateInplaceSolarBackwards` for one hourly
@@ -6751,6 +6699,16 @@ fn solar_factor_backwards(time: DateTime<Utc>, latitude: f64, longitude: f64) ->
 pub(crate) fn interpolate_solar_backwards_in_place(
     values: &mut [f32],
     start: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) {
+    interpolate_solar_backwards_with_dt_in_place(values, start, 3600, latitude, longitude);
+}
+
+fn interpolate_solar_backwards_with_dt_in_place(
+    values: &mut [f32],
+    start: DateTime<Utc>,
+    dt_seconds: i64,
     latitude: f64,
     longitude: f64,
 ) {
@@ -6776,7 +6734,12 @@ pub(crate) fn interpolate_solar_backwards_in_place(
 
     let solar = (0..values.len())
         .map(|index| {
-            solar_factor_backwards(start + Duration::hours(index as i64), latitude, longitude)
+            solar_factor_backwards_with_dt(
+                start + Duration::seconds(index as i64 * dt_seconds),
+                dt_seconds,
+                latitude,
+                longitude,
+            )
         })
         .collect::<Vec<_>>();
     let radiation_limit = SOLAR_CONSTANT * 0.95;
@@ -6794,7 +6757,9 @@ pub(crate) fn interpolate_solar_backwards_in_place(
             break;
         }
         let pos_b = missing - 1;
-        let search_end = (missing + 14).min(values.len());
+        let maximum_missing_steps = 12 * 3600 / dt_seconds;
+        let search_end =
+            (missing + 2 + usize::try_from(maximum_missing_steps).unwrap_or(0)).min(values.len());
         let Some(pos_c) = ((missing + 1)..search_end).find(|index| !values[*index].is_nan()) else {
             break;
         };
@@ -9106,6 +9071,34 @@ mod tests {
         assert_eq!(
             maybe_round_to_scalefactor(values[181], 20.0, true).to_bits(),
             0x4105_999a
+        );
+    }
+
+    #[test]
+    fn ecmwf_first_stage_matches_captured_official_sparse_solar_transition() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap();
+        let mut values = vec![f32::NAN; 55];
+        for (hour, value) in [
+            (132, 510.0),
+            (135, 42.0),
+            (138, 0.0),
+            (141, 0.0),
+            (144, 0.0),
+            (150, 269.0),
+            (156, 568.0),
+            (162, 19.0),
+        ] {
+            values[hour / 3] = value;
+        }
+
+        interpolate_solar_backwards_with_dt_in_place(&mut values, start, 3 * 3600, 0.0, 70.0);
+
+        assert_eq!(
+            values[44..=54]
+                .iter()
+                .map(|value| round_to_scalefactor(*value, 1.0))
+                .collect::<Vec<_>>(),
+            vec![510.0, 42.0, 0.0, 0.0, 0.0, 70.0, 468.0, 677.0, 466.0, 50.0, 0.0]
         );
     }
 
