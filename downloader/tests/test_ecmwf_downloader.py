@@ -130,7 +130,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
             ),
         )
         self.assertEqual(product.interpolation_support_hours, 12)
-        self.assertEqual(product.missing_variable_fallback_context_hours, 12)
+        self.assertEqual(product.missing_variable_fallback_context_hours, 18)
         self.assertEqual(product.missing_variable_fallback_predecessor_runs, 1)
         self.assertIn("wind_gusts_10m", product.required_variables)
         for unavailable in ("visibility", "uv_index", "showers", "precipitation_probability"):

@@ -259,8 +259,8 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
 class CliOpenMeteoDownloadTests(unittest.TestCase):
     def test_fallback_context_captures_all_four_point_hermite_support_candidates(self):
         self.assertEqual(
-            cli_module._missing_variable_fallback_context_offsets(12),
-            (-12, -9, -6, -3, 3, 6, 9, 12),
+            cli_module._missing_variable_fallback_context_offsets(18),
+            (-18, -15, -12, -9, -6, -3, 3, 6, 9, 12, 15, 18),
         )
 
     def test_missing_variable_fallback_candidates_reach_retained_long_run(self):
