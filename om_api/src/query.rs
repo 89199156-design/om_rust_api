@@ -8868,6 +8868,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn et0_propagates_a_missing_shortwave_tail_frame() {
+        assert!(et0_evapotranspiration(
+            -0.4,
+            0.71,
+            -0.8,
+            f32::NAN,
+            4_884.0,
+            0.0,
+            3600,
+        )
+        .is_nan());
+    }
+
+    #[test]
     fn wind_direction_matches_pinned_official_fast_approximation() {
         let inputs = [
             (-1.0, -3.0),
@@ -10464,6 +10478,15 @@ fn et0_evapotranspiration(
     extraterrestrial_radiation: f32,
     dt_seconds: i64,
 ) -> f32 {
+    if !temperature.is_finite()
+        || !wind_speed_10m.is_finite()
+        || !dewpoint.is_finite()
+        || !shortwave_radiation.is_finite()
+        || !elevation.is_finite()
+        || !extraterrestrial_radiation.is_finite()
+    {
+        return f32::NAN;
+    }
     let wind_speed_2m = wind_scale_factor(10.0, 2.0) * wind_speed_10m;
     let beta = 17.27_f32;
     let lambda = 237.3_f32;
