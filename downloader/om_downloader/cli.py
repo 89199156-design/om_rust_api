@@ -1294,7 +1294,7 @@ def _download_openmeteo_product(
                 )
                 remaining_missing.difference_update(fallback_variables)
                 predecessor_support_missing.difference_update(predecessor_variables)
-                if product.missing_variable_fallback_context_hours > 0:
+                if product.missing_variable_fallback_predecessor_runs > 0:
                     predecessor_support_missing.update(fallback_variables)
                 missing_for_object = sorted(remaining_missing)
         return {

@@ -67,6 +67,9 @@ def product_config_fingerprint(product: ProductConfig) -> str:
         "missing_variable_fallback_context_hours": (
             product.missing_variable_fallback_context_hours
         ),
+        "missing_variable_fallback_predecessor_runs": (
+            product.missing_variable_fallback_predecessor_runs
+        ),
         "optional_variables": list(product.optional_variables),
         "requested_pressure_levels_hpa": list(product.requested_pressure_levels_hpa),
         "requested_bounds": bounds_to_dict(product.requested_bounds),
@@ -126,6 +129,9 @@ def build_latest_manifest(
         ),
         "missing_variable_fallback_context_hours": (
             product.missing_variable_fallback_context_hours
+        ),
+        "missing_variable_fallback_predecessor_runs": (
+            product.missing_variable_fallback_predecessor_runs
         ),
         "missing_optional_variables": missing_optional,
         "available_pressure_levels_hpa": available_levels,

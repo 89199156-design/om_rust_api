@@ -34,6 +34,7 @@ class ProductConfig:
     interpolation_support_hours: int = 0
     missing_variable_fallback_lookback_hours: int = 0
     missing_variable_fallback_context_hours: int = 0
+    missing_variable_fallback_predecessor_runs: int = 0
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,14 @@ def load_models(path: Path) -> ModelsConfig:
                 f"product {name} missing_variable_fallback_context_hours must be "
                 "aligned to the three-hour regularization axis"
             )
+        missing_variable_fallback_predecessor_runs = int(
+            raw.get("missing_variable_fallback_predecessor_runs", 0)
+        )
+        if missing_variable_fallback_predecessor_runs not in (0, 1):
+            raise ValueError(
+                f"product {name} missing_variable_fallback_predecessor_runs "
+                "must be zero or one"
+            )
         coverage_strategy = str(raw.get("coverage_strategy", "latest_run"))
         if coverage_strategy not in ("latest_run", "latest_with_long_run_tail"):
             raise ValueError(
@@ -179,6 +188,9 @@ def load_models(path: Path) -> ModelsConfig:
             ),
             missing_variable_fallback_context_hours=(
                 missing_variable_fallback_context_hours
+            ),
+            missing_variable_fallback_predecessor_runs=(
+                missing_variable_fallback_predecessor_runs
             ),
         )
     return ModelsConfig(version=int(data.get("version", 1)), products=products)
