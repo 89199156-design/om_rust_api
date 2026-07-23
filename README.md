@@ -64,8 +64,9 @@ only the immediately previous run as a null fallback.
 API requests never scan or rebuild the snapshot. After OM and WebP publication
 finish, the pipeline sends one `SIGHUP`; the API builds the replacement snapshot
 in a background worker and atomically swaps it only after successful validation.
-Regional GFS `HSURF.om` and Copernicus DEM90 remain part of the official
-elevation/cell-selection path.
+The GFS cell-selection path decodes only the required regional window from the
+checksum-pinned global `HSURF.om` files on the system disk. Native cycle
+coverages contain no model-elevation or Copernicus DEM90 copies.
 
 Silicon Valley is a generic download gateway, not an Open-Meteo runtime. It must not run Open-Meteo containers, Swift services, WebP builders, Shanghai package builders, or business parsers.
 

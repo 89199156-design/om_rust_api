@@ -198,6 +198,10 @@ class InstallScriptTests(unittest.TestCase):
         )
         self.assertIn("flock -n 9", materializer_content)
         self.assertIn("build-and-publish", materializer_content)
+        self.assertIn("OM_MODEL_STATIC_ROOT", materializer_content)
+        self.assertIn("--model-static-root", materializer_content)
+        self.assertIn("fixed model elevation checksum mismatch", materializer_content)
+        self.assertNotIn('$RAW_ROOT/static/ncep_gfs013/HSURF.om', materializer_content)
         self.assertNotIn("2026072018", materializer_content)
 
 

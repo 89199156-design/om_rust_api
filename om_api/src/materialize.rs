@@ -26,14 +26,22 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, FileExt};
+use std::os::unix::fs::{symlink, FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime};
 
-pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v5";
+pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v6-external-static";
 pub const GFS_PRODUCTS: [&str; 3] = ["gfs013_surface", "gfs025", "gfs_pressure_profile"];
+const GFS013_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs013/HSURF.om";
+const GFS013_HSURF_BYTES: u64 = 1_455_544;
+const GFS013_HSURF_SHA256: &str =
+    "203745df4dfa10069e1a39206350e006818a0eea644bb19c1668c0f32f7475e0";
+const GFS025_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs025/HSURF.om";
+const GFS025_HSURF_BYTES: u64 = 408_440;
+const GFS025_HSURF_SHA256: &str =
+    "fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d";
 const DATA_TYPE_FLOAT_ARRAY: u8 = 20;
 const COMPRESSION_PFOR_DELTA2D_INT16: u8 = 0;
 const PROCESS_VALUES: u64 = 2 * 1024 * 1024;
@@ -53,6 +61,7 @@ const NATIVE_LIFECYCLE_MANAGER: &str = "om-native-materialize";
 pub struct GfsBuildOptions {
     pub data_root: PathBuf,
     pub dem_root: PathBuf,
+    pub model_static_root: PathBuf,
     pub latest_run: String,
     pub coverage_id: String,
     pub producer_revision: String,
@@ -185,6 +194,38 @@ fn grid_marker(contract: &DomainContract) -> Value {
     })
 }
 
+fn external_static_sources_marker() -> Value {
+    json!({
+        "copernicus_dem90": {
+            "source": "copernicus_dem90",
+            "runtime_path": "copernicus_dem90/static",
+            "storage": "external_env",
+            "environment": "OM_DEM_ROOT",
+            "latitude_chunk_min": 0,
+            "latitude_chunk_max": 58,
+            "file_count": 59
+        },
+        "ncep_gfs013_hsurf": {
+            "source": "ncep_gfs013_hsurf",
+            "runtime_path": GFS013_HSURF_RELATIVE_PATH,
+            "storage": "external_env",
+            "environment": "OM_MODEL_STATIC_ROOT",
+            "file_count": 1,
+            "bytes": GFS013_HSURF_BYTES,
+            "sha256": GFS013_HSURF_SHA256
+        },
+        "ncep_gfs025_hsurf": {
+            "source": "ncep_gfs025_hsurf",
+            "runtime_path": GFS025_HSURF_RELATIVE_PATH,
+            "storage": "external_env",
+            "environment": "OM_MODEL_STATIC_ROOT",
+            "file_count": 1,
+            "bytes": GFS025_HSURF_BYTES,
+            "sha256": GFS025_HSURF_SHA256
+        }
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct LegacyGroupRelease {
     group: String,
@@ -277,9 +318,16 @@ struct GfsNativeStaticSource {
     runtime_path: String,
     storage: String,
     environment: String,
-    latitude_chunk_min: i32,
-    latitude_chunk_max: i32,
-    file_count: usize,
+    #[serde(default)]
+    latitude_chunk_min: Option<i32>,
+    #[serde(default)]
+    latitude_chunk_max: Option<i32>,
+    #[serde(default)]
+    file_count: Option<usize>,
+    #[serde(default)]
+    bytes: Option<u64>,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 const GFS013_REQUIRED_VARIABLES: &[&str] = &[
@@ -418,7 +466,12 @@ pub fn build_gfs_coverage(
     let identity = build_identity(options, &sources);
     let target = coverage_parent.join(&options.coverage_id);
     if path_is_real_directory(&target, "immutable native coverage")? {
-        let validation = validate_gfs_coverage(&target, &options.dem_root, decoder)?;
+        let validation = validate_gfs_coverage(
+            &target,
+            &options.dem_root,
+            &options.model_static_root,
+            decoder,
+        )?;
         let identity_path = target.join("build_identity.json");
         let existing: Value =
             serde_json::from_slice(&fs::read(&identity_path).with_context(|| {
@@ -500,21 +553,14 @@ pub fn build_gfs_coverage(
     })?;
 
     write_run_metadata(&sources, &run_variables, &staging)?;
-    materialize_static_elevation(
-        decoder,
-        &options.data_root.join("static/ncep_gfs013/HSURF.om"),
-        &staging.join("ncep_gfs013/static/HSURF.om"),
-        &gfs013_contract(),
-    )?;
-    materialize_static_elevation(
-        decoder,
-        &options.data_root.join("static/ncep_gfs025/HSURF.om"),
-        &staging.join("ncep_gfs025/static/HSURF.om"),
-        &gfs025_contract(),
-    )?;
     let marker = build_coverage_marker(options, &sources, legacy_marker, &staging)?;
     atomic_write_json(&staging.join("coverage.json"), &marker)?;
-    let validation = validate_gfs_coverage(&staging, &options.dem_root, decoder)?;
+    let validation = validate_gfs_coverage(
+        &staging,
+        &options.dem_root,
+        &options.model_static_root,
+        decoder,
+    )?;
     Ok(GfsBuildResult {
         coverage_id: options.coverage_id.clone(),
         staging_path: staging,
@@ -544,6 +590,25 @@ fn validate_build_options(options: &GfsBuildOptions) -> Result<()> {
     }
     if !options.dem_root.is_dir() {
         bail!("DEM root does not exist: {}", options.dem_root.display());
+    }
+    if !options.model_static_root.is_absolute() || !options.model_static_root.is_dir() {
+        bail!(
+            "model static root does not exist or is not absolute: {}",
+            options.model_static_root.display()
+        );
+    }
+    let data_device = options.data_root.metadata()?.dev();
+    if options.dem_root.metadata()?.dev() == data_device {
+        bail!("fixed DEM root must not use the cycle-data filesystem");
+    }
+    if options.model_static_root.metadata()?.dev() == data_device {
+        bail!("fixed model static root must not use the cycle-data filesystem");
+    }
+    for relative in [GFS013_HSURF_RELATIVE_PATH, GFS025_HSURF_RELATIVE_PATH] {
+        let path = options.model_static_root.join(relative);
+        if !path.is_file() {
+            bail!("model static elevation does not exist: {}", path.display());
+        }
     }
     Ok(())
 }
@@ -836,7 +901,8 @@ fn build_identity(options: &GfsBuildOptions, sources: &[LegacySourceRun]) -> Val
         "domain_grids": {
             "ncep_gfs013": grid_marker(&gfs013_contract()),
             "ncep_gfs025": grid_marker(&gfs025_contract())
-        }
+        },
+        "external_static_sources": external_static_sources_marker()
     })
 }
 
@@ -955,7 +1021,7 @@ fn checked_ceil_ratio(value: u64, numerator: u64, denominator: u64) -> Result<u6
     u64::try_from(result).context("native disk estimate exceeds u64")
 }
 
-fn estimate_native_build_bytes(options: &GfsBuildOptions, tasks: &[VariableTask]) -> Result<u64> {
+fn estimate_native_build_bytes(tasks: &[VariableTask]) -> Result<u64> {
     let mut estimated = 0_u64;
     for task in tasks {
         let entries = source_entries(task)?;
@@ -976,46 +1042,6 @@ fn estimate_native_build_bytes(options: &GfsBuildOptions, tasks: &[VariableTask]
             .context("native disk estimate overflow")?;
     }
 
-    for (source, contract) in [
-        (
-            options.data_root.join("static/ncep_gfs013/HSURF.om"),
-            gfs013_contract(),
-        ),
-        (
-            options.data_root.join("static/ncep_gfs025/HSURF.om"),
-            gfs025_contract(),
-        ),
-    ] {
-        let source_bytes = source
-            .metadata()
-            .with_context(|| format!("read static source size: {}", source.display()))?
-            .len();
-        let regional_cells = contract
-            .grid
-            .nx
-            .checked_mul(contract.grid.ny)
-            .context("regional static cell count overflow")?;
-        let global_cells = contract
-            .grid
-            .full_nx
-            .context("static grid has no full_nx")?
-            .checked_mul(
-                contract
-                    .grid
-                    .full_ny
-                    .context("static grid has no full_ny")?,
-            )
-            .context("global static cell count overflow")?;
-        estimated = estimated
-            .checked_add(checked_ceil_ratio(
-                source_bytes,
-                regional_cells,
-                global_cells,
-            )?)
-            .and_then(|value| value.checked_add(1024 * 1024))
-            .context("native static byte estimate overflow")?;
-    }
-
     checked_ceil_ratio(estimated, ESTIMATE_NUMERATOR, ESTIMATE_DENOMINATOR)?
         .checked_add(ESTIMATE_OVERHEAD_BYTES)
         .context("native disk estimate overflow")
@@ -1026,7 +1052,7 @@ fn preflight_native_build(
     tasks: &[VariableTask],
     staging: &Path,
 ) -> Result<GfsDiskPreflight> {
-    let estimated_total_bytes = estimate_native_build_bytes(options, tasks)?;
+    let estimated_total_bytes = estimate_native_build_bytes(tasks)?;
     let existing_staging_bytes = if staging.exists() {
         coverage_stats(staging)?.1
     } else {
@@ -1721,87 +1747,6 @@ fn crs_wkt(grid: &NativeGridMetadata) -> String {
     )
 }
 
-fn materialize_static_elevation(
-    decoder: &OfficialDecoder,
-    source: &Path,
-    destination: &Path,
-    contract: &DomainContract,
-) -> Result<()> {
-    if destination.exists() {
-        let metadata = read_native_array_metadata(&File::open(destination)?)?;
-        if metadata.dimensions == [contract.grid.ny, contract.grid.nx]
-            && metadata.data_type == DATA_TYPE_FLOAT_ARRAY
-        {
-            return Ok(());
-        }
-        fs::remove_file(destination)?;
-    }
-    let source_file = Arc::new(
-        File::open(source)
-            .with_context(|| format!("open global static elevation {}", source.display()))?,
-    );
-    let source_metadata = read_native_array_metadata(&source_file)?;
-    if source_metadata.dimensions
-        != [
-            contract
-                .grid
-                .full_ny
-                .context("static grid has no full_ny")?,
-            contract
-                .grid
-                .full_nx
-                .context("static grid has no full_nx")?,
-        ]
-        || source_metadata.data_type != DATA_TYPE_FLOAT_ARRAY
-    {
-        bail!(
-            "global static elevation dimensions/type do not match {}",
-            contract.name
-        );
-    }
-    let metadata = build_v3_array_metadata_blob(
-        "HSURF",
-        source_metadata.data_type,
-        source_metadata.compression,
-        &source_metadata.dimensions,
-        &source_metadata.chunks,
-        source_metadata
-            .lut_size
-            .context("static elevation has no LUT size")?,
-        source_metadata
-            .lut_offset
-            .context("static elevation has no LUT offset")?,
-        source_metadata.scale_factor.unwrap_or(1.0),
-        source_metadata.add_offset.unwrap_or(0.0),
-    );
-    let values = decoder.decode_grid(
-        &metadata,
-        &FullFileRangeReader { file: source_file },
-        &[
-            contract.grid.y0.context("static grid has no y0")?,
-            contract.grid.x0.context("static grid has no x0")?,
-        ],
-        &[contract.grid.ny, contract.grid.nx],
-    )?;
-    let chunks = vec![
-        source_metadata.chunks[0].min(contract.grid.ny),
-        source_metadata.chunks[1].min(contract.grid.nx),
-    ];
-    let scale = source_metadata.scale_factor.unwrap_or(1.0);
-    let mut writer = decoder.create_array_writer(
-        destination,
-        vec![contract.grid.ny, contract.grid.nx],
-        chunks,
-        scale,
-        source_metadata.add_offset.unwrap_or(0.0),
-        source_metadata.data_type,
-        source_metadata.compression,
-    )?;
-    writer.write_f32_block(&values, &[contract.grid.ny, contract.grid.nx])?;
-    writer.finish("HSURF")?;
-    Ok(())
-}
-
 fn build_coverage_marker(
     options: &GfsBuildOptions,
     sources: &[LegacySourceRun],
@@ -1901,20 +1846,7 @@ fn build_coverage_marker(
             }
         }),
     );
-    set(
-        "static_sources",
-        json!({
-            "copernicus_dem90": {
-                "source": "copernicus_dem90",
-                "runtime_path": "copernicus_dem90/static",
-                "storage": "external_env",
-                "environment": "OM_DEM_ROOT",
-                "latitude_chunk_min": 0,
-                "latitude_chunk_max": 58,
-                "file_count": 59
-            }
-        }),
-    );
+    set("static_sources", external_static_sources_marker());
     Ok(Value::Object(marker))
 }
 
@@ -2143,13 +2075,16 @@ fn validate_build_identity(coverage_root: &Path, marker: &GfsCoverageMarker) -> 
     let object = identity
         .as_object()
         .context("native build identity is not an object")?;
+    let expected_static_sources = external_static_sources_marker();
     if object.get("version").and_then(Value::as_u64) != Some(1)
+        || object.get("lifecycle_manager").and_then(Value::as_str) != Some(NATIVE_LIFECYCLE_MANAGER)
         || object.get("algorithm").and_then(Value::as_str) != Some(GFS_MATERIALIZATION_REVISION)
         || object.get("coverage_id").and_then(Value::as_str) != Some(marker.coverage_id.as_str())
         || object.get("latest_run").and_then(Value::as_str)
             != Some(marker.latest_complete_run.as_str())
         || object.get("producer_revision").and_then(Value::as_str)
             != Some(marker.producer_revision.as_str())
+        || object.get("external_static_sources") != Some(&expected_static_sources)
     {
         bail!("native build identity does not match its coverage marker");
     }
@@ -2189,6 +2124,7 @@ fn validate_build_identity(coverage_root: &Path, marker: &GfsCoverageMarker) -> 
 pub fn validate_gfs_coverage(
     coverage_root: &Path,
     dem_root: &Path,
+    model_static_root: &Path,
     decoder: &OfficialDecoder,
 ) -> Result<GfsValidationResult> {
     let root_metadata = fs::symlink_metadata(coverage_root)
@@ -2295,14 +2231,16 @@ pub fn validate_gfs_coverage(
         .static_sources
         .get("copernicus_dem90")
         .context("native GFS marker has no Copernicus DEM90 contract")?;
-    if marker.static_sources.len() != 1
+    if marker.static_sources.len() != 3
         || dem.source != "copernicus_dem90"
         || dem.runtime_path != "copernicus_dem90/static"
         || dem.storage != "external_env"
         || dem.environment != "OM_DEM_ROOT"
-        || dem.latitude_chunk_min != 0
-        || dem.latitude_chunk_max != 58
-        || dem.file_count != 59
+        || dem.latitude_chunk_min != Some(0)
+        || dem.latitude_chunk_max != Some(58)
+        || dem.file_count != Some(59)
+        || dem.bytes.is_some()
+        || dem.sha256.is_some()
     {
         bail!("native GFS Copernicus DEM90 contract is invalid");
     }
@@ -2312,6 +2250,58 @@ pub fn validate_gfs_coverage(
             "native GFS external Copernicus DEM90 root is invalid: {}",
             dem_static_root.display()
         );
+    }
+    if dem_root.metadata()?.dev() == root_metadata.dev() {
+        bail!("native GFS fixed DEM root uses the cycle-data filesystem");
+    }
+    if !model_static_root.is_absolute() || !model_static_root.is_dir() {
+        bail!(
+            "native GFS external model static root is invalid: {}",
+            model_static_root.display()
+        );
+    }
+    if model_static_root.metadata()?.dev() == root_metadata.dev() {
+        bail!("native GFS fixed model static root uses the cycle-data filesystem");
+    }
+    for (key, source_name, relative_path, expected_bytes, expected_sha256) in [
+        (
+            "ncep_gfs013_hsurf",
+            "ncep_gfs013_hsurf",
+            GFS013_HSURF_RELATIVE_PATH,
+            GFS013_HSURF_BYTES,
+            GFS013_HSURF_SHA256,
+        ),
+        (
+            "ncep_gfs025_hsurf",
+            "ncep_gfs025_hsurf",
+            GFS025_HSURF_RELATIVE_PATH,
+            GFS025_HSURF_BYTES,
+            GFS025_HSURF_SHA256,
+        ),
+    ] {
+        let source = marker
+            .static_sources
+            .get(key)
+            .with_context(|| format!("native GFS marker has no {key} contract"))?;
+        if source.source != source_name
+            || source.runtime_path != relative_path
+            || source.storage != "external_env"
+            || source.environment != "OM_MODEL_STATIC_ROOT"
+            || source.latitude_chunk_min.is_some()
+            || source.latitude_chunk_max.is_some()
+            || source.file_count != Some(1)
+            || source.bytes != Some(expected_bytes)
+            || source.sha256.as_deref() != Some(expected_sha256)
+        {
+            bail!("native GFS external model elevation contract is invalid for {key}");
+        }
+        let path = model_static_root.join(relative_path);
+        if !path.is_file() || path.metadata()?.len() != expected_bytes {
+            bail!(
+                "native GFS external model elevation file is invalid: {}",
+                path.display()
+            );
+        }
     }
 
     let mut om_files = 0_u64;
@@ -2443,12 +2433,44 @@ pub fn validate_gfs_coverage(
                 latest_path.display()
             );
         }
-        let static_path = coverage_root.join(contract.name).join("static/HSURF.om");
+        let coverage_static_path = coverage_root.join(contract.name).join("static/HSURF.om");
+        match fs::symlink_metadata(&coverage_static_path) {
+            Ok(_) => {
+                bail!(
+                    "native GFS coverage must not duplicate external model elevation: {}",
+                    coverage_static_path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect native GFS coverage static path: {}",
+                        coverage_static_path.display()
+                    )
+                });
+            }
+        }
+        let static_relative_path = match contract.name {
+            "ncep_gfs013" => GFS013_HSURF_RELATIVE_PATH,
+            "ncep_gfs025" => GFS025_HSURF_RELATIVE_PATH,
+            _ => bail!("unsupported native GFS static domain: {}", contract.name),
+        };
+        let static_path = model_static_root.join(static_relative_path);
         decoded_probes += validate_static_array(
             decoder,
             &static_path,
             "HSURF",
-            Some(&[contract.grid.ny, contract.grid.nx]),
+            Some(&[
+                contract
+                    .grid
+                    .full_ny
+                    .context("static grid has no full_ny")?,
+                contract
+                    .grid
+                    .full_nx
+                    .context("static grid has no full_nx")?,
+            ]),
         )?;
         om_files += 1;
     }
@@ -2478,6 +2500,7 @@ pub fn validate_gfs_coverage(
 pub fn publish_gfs_coverage(
     data_root: &Path,
     dem_root: &Path,
+    model_static_root: &Path,
     coverage_id: &str,
     decoder: &OfficialDecoder,
 ) -> Result<GfsPublishResult> {
@@ -2500,7 +2523,7 @@ pub fn publish_gfs_coverage(
                 staging.display()
             );
         }
-        validate_gfs_coverage(&target, dem_root, decoder)?;
+        validate_gfs_coverage(&target, dem_root, model_static_root, decoder)?;
         true
     } else {
         if !staging_exists {
@@ -2509,7 +2532,7 @@ pub fn publish_gfs_coverage(
                 staging.display()
             );
         }
-        validate_gfs_coverage(&staging, dem_root, decoder)?;
+        validate_gfs_coverage(&staging, dem_root, model_static_root, decoder)?;
         fs::rename(&staging, &target).with_context(|| {
             format!(
                 "promote native GFS staging coverage {} to {}",
@@ -2520,7 +2543,7 @@ pub fn publish_gfs_coverage(
         sync_directory(&coverage_parent)?;
         false
     };
-    let validation = validate_gfs_coverage(&target, dem_root, decoder)?;
+    let validation = validate_gfs_coverage(&target, dem_root, model_static_root, decoder)?;
     if validation.coverage_id != coverage_id {
         bail!("published native GFS coverage identity does not match its directory");
     }
@@ -2578,6 +2601,7 @@ pub fn publish_gfs_coverage(
     let cleanup = prune_completed_gfs_coverages(
         data_root,
         dem_root,
+        model_static_root,
         coverage_id,
         previous_current_id.as_deref(),
         decoder,
@@ -2688,6 +2712,7 @@ fn collect_managed_coverages(coverage_parent: &Path) -> Result<Vec<ManagedCovera
 fn prune_completed_gfs_coverages(
     data_root: &Path,
     dem_root: &Path,
+    model_static_root: &Path,
     current_coverage_id: &str,
     previous_current_id: Option<&str>,
     decoder: &OfficialDecoder,
@@ -2713,12 +2738,13 @@ fn prune_completed_gfs_coverages(
             continue;
         }
         let validation =
-            validate_gfs_coverage(&candidate.path, dem_root, decoder).with_context(|| {
-                format!(
-                    "refusing to remove unvalidated native coverage {}",
-                    candidate.path.display()
-                )
-            })?;
+            validate_gfs_coverage(&candidate.path, dem_root, model_static_root, decoder)
+                .with_context(|| {
+                    format!(
+                        "refusing to remove unvalidated native coverage {}",
+                        candidate.path.display()
+                    )
+                })?;
         if validation.coverage_id != candidate.coverage_id {
             bail!("native cleanup candidate identity changed during validation");
         }
@@ -3121,10 +3147,27 @@ mod tests {
         let revision = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             default_gfs_coverage_id("2026072018", revision).unwrap(),
-            "gfs_native_2026072018_official-hourly-quantized-v5_0123456789ab"
+            "gfs_native_2026072018_official-hourly-quantized-v6-external-static_0123456789ab"
         );
         assert!(default_gfs_coverage_id("2026072021", revision).is_err());
         assert!(default_gfs_coverage_id("2026072018", "not-a-sha").is_err());
+    }
+
+    #[test]
+    fn fixed_gfs_elevation_contract_is_external_and_pinned() {
+        let marker = external_static_sources_marker();
+        let sources = marker.as_object().unwrap();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources["ncep_gfs013_hsurf"]["environment"],
+            "OM_MODEL_STATIC_ROOT"
+        );
+        assert_eq!(sources["ncep_gfs013_hsurf"]["sha256"], GFS013_HSURF_SHA256);
+        assert_eq!(
+            sources["ncep_gfs025_hsurf"]["runtime_path"],
+            GFS025_HSURF_RELATIVE_PATH
+        );
+        assert_eq!(sources["copernicus_dem90"]["environment"], "OM_DEM_ROOT");
     }
 
     #[test]

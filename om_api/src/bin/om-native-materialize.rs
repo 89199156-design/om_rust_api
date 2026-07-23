@@ -38,6 +38,12 @@ enum Command {
             default_value = "/opt/1panel/apps/weather_om_api/static"
         )]
         dem_root: PathBuf,
+        #[arg(
+            long,
+            env = "OM_MODEL_STATIC_ROOT",
+            default_value = "/opt/1panel/apps/weather_om_api"
+        )]
+        model_static_root: PathBuf,
     },
     /// Atomically promote a validated staging coverage and write current marker last.
     Publish {
@@ -49,6 +55,12 @@ enum Command {
             default_value = "/opt/1panel/apps/weather_om_api/static"
         )]
         dem_root: PathBuf,
+        #[arg(
+            long,
+            env = "OM_MODEL_STATIC_ROOT",
+            default_value = "/opt/1panel/apps/weather_om_api"
+        )]
+        model_static_root: PathBuf,
         #[arg(long)]
         coverage_id: String,
     },
@@ -67,6 +79,13 @@ struct BuildArgs {
         default_value = "/opt/1panel/apps/weather_om_api/static"
     )]
     dem_root: PathBuf,
+
+    #[arg(
+        long,
+        env = "OM_MODEL_STATIC_ROOT",
+        default_value = "/opt/1panel/apps/weather_om_api"
+    )]
+    model_static_root: PathBuf,
 
     /// Retained source run to materialize. Defaults to the newest complete
     /// retained GFS release, so production scheduling never hard-codes a batch.
@@ -111,14 +130,22 @@ fn main() -> Result<()> {
         Command::Validate {
             coverage_root,
             dem_root,
-        } => print_json(&validate_gfs_coverage(&coverage_root, &dem_root, &decoder)?),
+            model_static_root,
+        } => print_json(&validate_gfs_coverage(
+            &coverage_root,
+            &dem_root,
+            &model_static_root,
+            &decoder,
+        )?),
         Command::Publish {
             data_root,
             dem_root,
+            model_static_root,
             coverage_id,
         } => print_json(&publish_gfs_coverage(
             &data_root,
             &dem_root,
+            &model_static_root,
             &coverage_id,
             &decoder,
         )?),
@@ -127,6 +154,7 @@ fn main() -> Result<()> {
             let published = publish_gfs_coverage(
                 &args.data_root,
                 &args.dem_root,
+                &args.model_static_root,
                 &built.coverage_id,
                 &decoder,
             )?;
@@ -160,6 +188,7 @@ fn build(
         &GfsBuildOptions {
             data_root: args.data_root.clone(),
             dem_root: args.dem_root.clone(),
+            model_static_root: args.model_static_root.clone(),
             latest_run,
             coverage_id,
             producer_revision,
