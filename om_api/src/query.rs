@@ -9103,6 +9103,30 @@ mod tests {
     }
 
     #[test]
+    fn ecmwf_retained_gust_frame_supplies_official_second_stage_lookahead() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        let kind = InterpolationKind::Hermite {
+            scalefactor: 10.0,
+            bounds: Some((0.0, 10e9)),
+        };
+        let values = vec![3.6, 6.3, 7.1, 6.8];
+        let times = (0..values.len())
+            .map(|index| start + Duration::hours(index as i64 * 3))
+            .collect::<Vec<_>>();
+        let hour_88 = ecmwf_second_stage_value(
+            &values,
+            &times,
+            kind,
+            start + Duration::hours(4),
+            0.0,
+            70.0,
+            3600,
+        );
+
+        assert_eq!(hour_88, 6.7);
+    }
+
+    #[test]
     fn sparse_solar_full_series_keeps_official_nan_d_at_night() {
         let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
         let mut values = vec![f32::NAN; 10];

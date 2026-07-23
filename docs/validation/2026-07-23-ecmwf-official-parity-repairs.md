@@ -96,6 +96,34 @@ official `403.71`.
 Regression:
 `diffuse_and_sunshine_match_captured_ecmwf_sunrise_frame`.
 
+## Rolling wind-gust retention
+
+The next mismatch was `hourly.wind_gusts_10m[88]`: official `6.7 m/s`,
+clone `6.8 m/s`; the clone then returned null from frame 93 onward.
+ECMWF's open-data spatial objects omit this variable in an intermediate
+forecast-hour band, while 6-hour long-range frames reappear after hour 144.
+Open-Meteo's rolling database therefore retains gust frames from an older long
+run when newer objects do not contain the variable.
+
+The former coverage planner only searched the three source runs selected for
+the ordinary stitched window. None of those runs was old enough for the
+long-range gust field, so the first missing regular frame also removed the D
+lookahead used to interpolate frame 88.
+
+The repair adds an explicitly bounded, product-configured older-cycle search
+for variables missing from a selected spatial object. ECMWF searches up to 72
+hours behind the oldest ordinary coverage run; GFS and CAMS retain the default
+zero extra lookback. HTTP/object inventory remains the authority: nonexistent
+short-run or cadence combinations are skipped, and only a source object that
+actually contains the missing variable is bundled. Entries preserve their
+real older source-run identity so the existing first-stage interpolation runs
+within that source run before newest-run overlay, matching the official
+rolling database rather than interpolating across runs.
+
+Regressions:
+`test_missing_variable_fallback_candidates_reach_retained_long_run` and
+`ecmwf_retained_gust_frame_supplies_official_second_stage_lookahead`.
+
 ## Verification contract
 
 Every repair requires the complete Rust unit and API suite, deployment from

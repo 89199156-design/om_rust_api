@@ -403,6 +403,58 @@ def _forecast_hour_for_run(run: Any, valid_time: datetime) -> int | None:
     return forecast_hour
 
 
+def _missing_variable_fallback_candidates(
+    product: ProductConfig,
+    runs: list[Any],
+    *,
+    primary_run: str,
+    valid_time: datetime,
+) -> list[tuple[str, datetime, int]]:
+    """Return newest-first runs that may retain a missing rolling value.
+
+    Some ECMWF variables disappear for an intermediate forecast-hour band and
+    reappear on the 6-hour long-range cadence. Open-Meteo's rolling database
+    keeps the last older-run value at those valid times. The ordinary coverage
+    run list is intentionally small, so an explicitly configured lookback
+    probes older cycle/object pairs until the same retained source can be
+    captured.
+    """
+    valid_time_utc = _as_utc(valid_time)
+    candidates: list[tuple[str, datetime, int]] = []
+    seen: set[str] = set()
+    for run in runs:
+        if run.run_id == primary_run:
+            continue
+        forecast_hour = _forecast_hour_for_run(run, valid_time_utc)
+        if forecast_hour is None:
+            continue
+        base_time = _as_utc(run.base_time_utc)
+        candidates.append((run.run_id, base_time, forecast_hour))
+        seen.add(run.run_id)
+
+    lookback_hours = product.missing_variable_fallback_lookback_hours
+    if lookback_hours > 0 and runs:
+        cadence_hours = max(1, product.run_cadence_hours)
+        oldest_base = min(_as_utc(run.base_time_utc) for run in runs)
+        cursor = oldest_base - timedelta(hours=cadence_hours)
+        cutoff = oldest_base - timedelta(hours=lookback_hours)
+        while cursor >= cutoff:
+            run_id = cursor.strftime("%Y%m%d%H")
+            delta_seconds = (valid_time_utc - cursor).total_seconds()
+            if (
+                run_id not in seen
+                and delta_seconds >= 0
+                and delta_seconds % 3600 == 0
+            ):
+                forecast_hour = int(delta_seconds // 3600)
+                if forecast_hour <= product.forecast_hour_end:
+                    candidates.append((run_id, cursor, forecast_hour))
+                    seen.add(run_id)
+            cursor -= timedelta(hours=cadence_hours)
+
+    return sorted(candidates, key=lambda item: item[1], reverse=True)
+
+
 def _with_interpolation_support_records(
     product: ProductConfig,
     plan: Any,
@@ -1068,26 +1120,19 @@ def _download_openmeteo_product(
             remaining_missing = set(missing_for_object)
             valid_time = _parse_utc(str(object_record["valid_time_utc"]))
             primary_run = str(object_record["source_run"])
-            fallback_runs = sorted(
-                (
-                    run
-                    for run in runs
-                    if run.run_id != primary_run
-                    and _forecast_hour_for_run(run, valid_time) is not None
-                ),
-                key=lambda item: _as_utc(item.base_time_utc),
-                reverse=True,
+            fallback_runs = _missing_variable_fallback_candidates(
+                product,
+                runs,
+                primary_run=primary_run,
+                valid_time=valid_time,
             )
-            for fallback_run in fallback_runs:
+            for fallback_run_id, fallback_base_time, fallback_forecast_hour in fallback_runs:
                 if not remaining_missing:
                     break
-                fallback_forecast_hour = _forecast_hour_for_run(fallback_run, valid_time)
-                if fallback_forecast_hour is None:
-                    continue
                 fallback_url = openmeteo_spatial_object_url(
                     bucket_url,
                     product.openmeteo_model,
-                    reference_time_utc=fallback_run.base_time_utc,
+                    reference_time_utc=fallback_base_time,
                     valid_time_utc=valid_time,
                 )
                 try:
@@ -1099,7 +1144,7 @@ def _download_openmeteo_product(
                     continue
                 fallback_object_record = {
                     "valid_time_utc": object_record["valid_time_utc"],
-                    "source_run": fallback_run.run_id,
+                    "source_run": fallback_run_id,
                     "forecast_hour": fallback_forecast_hour,
                     "coverage_source_run": object_record.get(
                         "coverage_source_run", primary_run

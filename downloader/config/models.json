@@ -170,9 +170,10 @@
         "shortwave_radiation",
         "precipitation",
         "runoff"
-      ],
-      "interpolation_support_hours": 12,
-      "optional_variables": [],
+        ],
+        "interpolation_support_hours": 12,
+        "missing_variable_fallback_lookback_hours": 72,
+        "optional_variables": [],
       "required_pressure_variable_prefixes": [
         "temperature",
         "relative_humidity",

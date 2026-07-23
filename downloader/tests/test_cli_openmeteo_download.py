@@ -257,6 +257,44 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
 
 
 class CliOpenMeteoDownloadTests(unittest.TestCase):
+    def test_missing_variable_fallback_candidates_reach_retained_long_run(self):
+        product = SimpleNamespace(
+            missing_variable_fallback_lookback_hours=72,
+            run_cadence_hours=6,
+            forecast_hour_end=360,
+        )
+        runs = [
+            OmRun(
+                run_id=run_id,
+                base_time_utc=datetime.strptime(run_id, "%Y%m%d%H").replace(
+                    tzinfo=timezone.utc
+                ),
+                max_forecast_hour=360,
+                variables=(),
+                pressure_levels_hpa=(),
+            )
+            for run_id in ("2026072212", "2026072218", "2026072300")
+        ]
+
+        candidates = cli_module._missing_variable_fallback_candidates(
+            product,
+            runs,
+            primary_run="2026072300",
+            valid_time=datetime(2026, 7, 26, 18, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(candidates[0][0], "2026072218")
+        self.assertIn(
+            (
+                "2026072012",
+                datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+                150,
+            ),
+            candidates,
+        )
+        self.assertNotIn("2026072300", [run_id for run_id, _base, _hour in candidates])
+        self.assertNotIn("2026071906", [run_id for run_id, _base, _hour in candidates])
+
     def setUp(self):
         _OpenMeteoDownloadHandler.range_headers = []
         _OpenMeteoDownloadHandler.plain_object_get_count = 0
