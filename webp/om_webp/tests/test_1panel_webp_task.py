@@ -26,6 +26,8 @@ class WebpTaskGateTests(unittest.TestCase):
         )
         self.assertIn('export OM_DEM_ROOT="$dem_root"', content)
         self.assertIn('export OM_MODEL_STATIC_ROOT="$model_static_root"', content)
+        self.assertIn("default_workers=1", content)
+        self.assertIn('workers="${OM_WEBP_WORKERS:-$default_workers}"', content)
 
     def test_ecmwf_task_is_initially_disabled_and_uses_canonical_scope(self):
         payload = values("now", "OM_ECMWF_WEBP_BUILD", "ecmwf_ifs025", 1)

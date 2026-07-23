@@ -6,14 +6,17 @@ case "$requested_scope" in
   gfs)
     scope="gfs"
     ready_group="gfs"
+    default_workers=2
     ;;
   cams)
     scope="cams"
     ready_group="cams"
+    default_workers=2
     ;;
   ecmwf_ifs025|ecmwf|ec)
     scope="ecmwf_ifs025"
     ready_group="ecmwf"
+    default_workers=1
     ;;
   *) echo "invalid scope: $requested_scope" >&2; exit 2 ;;
 esac
@@ -27,7 +30,7 @@ public_root="${OM_WEBP_PUBLIC_ROOT:-/opt/1panel/apps/weather/data}"
 decoder_lib="${OM_OMFILE_LIB:-/opt/1panel/apps/weather_om_api/native/libomfileformat.so}"
 dem_root="${OM_DEM_ROOT:-/opt/1panel/apps/weather_om_api/static}"
 model_static_root="${OM_MODEL_STATIC_ROOT:-/opt/1panel/apps/weather_om_api}"
-workers="${OM_WEBP_WORKERS:-2}"
+workers="${OM_WEBP_WORKERS:-$default_workers}"
 frames="${OM_WEBP_FRAMES:-121}"
 reporter="${OM_TASK_PROGRESS_REPORTER:-/opt/1panel/apps/weather_om_downloader/scripts/task_progress_reporter.py}"
 log_dir="${OM_WEBP_LOG_DIR:-$app_dir/logs}"
