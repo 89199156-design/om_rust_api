@@ -5545,6 +5545,7 @@ fn interpolate_ecmwf_hermite_in_place(
     values: &mut [f32],
     bounds: Option<(f32, f32)>,
     require_full_support: bool,
+    allow_missing_terminal_d: bool,
 ) {
     let mut width = 0usize;
     for index in 0..values.len() {
@@ -5579,7 +5580,13 @@ fn interpolate_ecmwf_hermite_in_place(
         }
         let pos_b = pos_c.saturating_sub(width);
         let pos_a = pos_b.checked_sub(width).unwrap_or(pos_b);
-        if require_full_support && (pos_a == pos_b || !has_distinct_d) {
+        if require_full_support
+            && (pos_a == pos_b
+                || index <= pos_b
+                || !values[pos_a].is_finite()
+                || !values[pos_b].is_finite()
+                || (!has_distinct_d && !allow_missing_terminal_d))
+        {
             continue;
         }
         let b = values[pos_b];
@@ -5612,6 +5619,7 @@ fn ecmwf_first_stage_point(
     latitude: f32,
     longitude: f32,
     require_full_hermite_support: bool,
+    allow_missing_terminal_hermite_d: bool,
 ) {
     match kind {
         InterpolationKind::Direct => {}
@@ -5621,7 +5629,12 @@ fn ecmwf_first_stage_point(
         InterpolationKind::Backwards { .. } => interpolate_ecmwf_backwards_in_place(values, false),
         InterpolationKind::Linear { .. } => interpolate_ecmwf_linear_in_place(values),
         InterpolationKind::Hermite { bounds, .. } => {
-            interpolate_ecmwf_hermite_in_place(values, bounds, require_full_hermite_support)
+            interpolate_ecmwf_hermite_in_place(
+                values,
+                bounds,
+                require_full_hermite_support,
+                allow_missing_terminal_hermite_d,
+            )
         }
         InterpolationKind::SolarBackwardsAveraged { .. } => {
             interpolate_solar_backwards_with_dt_in_place(
@@ -5697,6 +5710,17 @@ fn ecmwf_regularize_source_run(
     }
 
     let kind = ecmwf_interpolation_kind(raw_variable);
+    let is_gust = raw_variable == "wind_gusts_10m";
+    let allow_missing_terminal_hermite_d = is_gust
+        && product.manifest.latest_complete_run.as_deref() == Some(source_run)
+        && product
+            .manifest
+            .coverage_plan
+            .iter()
+            .filter(|entry| entry.source_run == source_run)
+            .map(|entry| entry.forecast_hour)
+            .max()
+            == Some(max_hour);
     let width = longitudes.len();
     for point in 0..grid_len {
         let mut values = frames.iter().map(|frame| frame[point]).collect::<Vec<_>>();
@@ -5706,7 +5730,8 @@ fn ecmwf_regularize_source_run(
             start,
             latitudes[point / width] as f32,
             longitudes[point % width] as f32,
-            raw_variable == "wind_gusts_10m",
+            is_gust,
+            allow_missing_terminal_hermite_d,
         );
         for (frame, value) in frames.iter_mut().zip(values) {
             frame[point] = value;
@@ -9155,11 +9180,83 @@ mod tests {
     #[test]
     fn ecmwf_gust_first_stage_leaves_boundary_gaps_for_older_complete_run() {
         let mut values = vec![6.3, f32::NAN, 6.6, f32::NAN, 6.9, f32::NAN, 9.6];
-        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 10e9)), true);
+        interpolate_ecmwf_hermite_in_place(
+            &mut values,
+            Some((0.0, 10e9)),
+            true,
+            false,
+        );
 
         assert!(values[1].is_nan());
         assert!((values[3] - 6.6).abs() < 1e-6);
         assert!(values[5].is_nan());
+    }
+
+    #[test]
+    fn ecmwf_gust_first_stage_does_not_bridge_an_unsupported_internal_window() {
+        let mut values = vec![
+            6.3,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            7.1,
+            f32::NAN,
+            6.8,
+        ];
+        interpolate_ecmwf_hermite_in_place(
+            &mut values,
+            Some((0.0, 10e9)),
+            true,
+            false,
+        );
+
+        assert!(values[1..4].iter().all(|value| value.is_nan()));
+        assert!(values[5].is_nan());
+    }
+
+    #[test]
+    fn ecmwf_gust_terminal_tail_uses_c_as_missing_d_only_at_true_horizon() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap();
+        let kind = InterpolationKind::Hermite {
+            scalefactor: 10.0,
+            bounds: Some((0.0, 10e9)),
+        };
+        let mut values = vec![3.1, f32::NAN, 3.5, f32::NAN, 2.1];
+        ecmwf_first_stage_point(
+            &mut values,
+            kind,
+            start,
+            0.0,
+            70.0,
+            true,
+            true,
+        );
+
+        assert!(values[1].is_nan());
+        assert_eq!(values[3], 2.8);
+
+        values[1] = 3.4;
+        let times = (0..values.len())
+            .map(|index| start + Duration::hours(index as i64 * 3))
+            .collect::<Vec<_>>();
+        let hourly = (0..=12)
+            .map(|hour| {
+                ecmwf_second_stage_value(
+                    &values,
+                    &times,
+                    kind,
+                    start + Duration::hours(hour),
+                    0.0,
+                    70.0,
+                    3600,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            hourly,
+            vec![3.1, 3.2, 3.3, 3.4, 3.5, 3.5, 3.5, 3.3, 3.1, 2.8, 2.5, 2.2, 2.1]
+        );
     }
 
     #[test]
@@ -10737,7 +10834,15 @@ mod output_tests {
         };
         let raw = vec![0.93, 0.22, 2.17, f32::NAN, -1.64, f32::NAN, -1.01];
         let mut staged = raw.clone();
-        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5, false);
+        ecmwf_first_stage_point(
+            &mut staged,
+            kind,
+            start,
+            31.25,
+            121.5,
+            false,
+            false,
+        );
         assert_eq!(staged, vec![0.95, 0.2, 2.15, 0.3, -1.65, -1.55, -1.0]);
 
         let regular_times = (0..staged.len())
@@ -10753,7 +10858,7 @@ mod output_tests {
             3600,
         );
         let mut unquantized = raw;
-        interpolate_ecmwf_hermite_in_place(&mut unquantized, None, false);
+        interpolate_ecmwf_hermite_in_place(&mut unquantized, None, false, false);
         let direct_hour = ecmwf_second_stage_value(
             &unquantized,
             &regular_times,
