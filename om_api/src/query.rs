@@ -8878,6 +8878,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dew_point_preserves_open_meteo_float_order_at_vpd_rounding_boundary() {
+        // Frozen ECMWF p0146 at 2026-07-28T11:00Z. The model value is
+        // elevation-corrected from 336 m to the requested DEM elevation of
+        // 387 m before the derived VPD is calculated.
+        let temperature = 21.9_f32 + (336.0 - 387.0) * 0.0065;
+        let deficit = vapor_pressure_deficit(temperature, dew_point(temperature, 80.0));
+
+        assert_eq!(
+            json_value_for_variable("vapor_pressure_deficit", deficit),
+            serde_json::json!(0.51)
+        );
+    }
+
+    #[test]
     fn combined_soil_layer_preserves_official_float_weight_order() {
         let value = weighted_soil_layer_0_to_100cm(0.354, 0.356, 0.343);
         assert_eq!(
@@ -10559,8 +10573,14 @@ fn relative_humidity_to_cloud_cover(relative_humidity: f32, pressure_hpa: f32) -
 fn dew_point(temperature: f32, relative_humidity: f32) -> f32 {
     let beta = 17.625_f32;
     let lambda = 243.04_f32;
-    let x = (relative_humidity / 100.0).ln() + ((beta * temperature) / (lambda + temperature));
-    lambda * x / (beta - x)
+    let log_relative_humidity = (relative_humidity / 100.0).ln();
+    let temperature_term = (beta * temperature) / (lambda + temperature);
+    // Keep the same single-precision operation order as
+    // Meteorology.dewpoint in the pinned Open-Meteo Swift source. Combining
+    // the two denominator terms first is mathematically equivalent, but can
+    // cross a public two-decimal rounding boundary in downstream VPD.
+    lambda * (log_relative_humidity + temperature_term)
+        / (beta - log_relative_humidity - temperature_term)
 }
 
 fn wet_bulb_temperature(temperature: f32, relative_humidity: f32) -> f32 {
