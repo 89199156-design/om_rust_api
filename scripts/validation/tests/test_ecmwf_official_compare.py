@@ -1071,6 +1071,26 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
                 failure["request_payload_sha256"],
             )
 
+    def test_incomplete_chunked_response_is_a_retryable_transport_failure(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = compare.http.client.IncompleteRead(
+            b'{"partial":true',
+            5058,
+        )
+        with mock.patch.object(compare.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(
+                compare.HttpRequestError,
+                "IncompleteRead",
+            ):
+                compare._request_once(
+                    "POST",
+                    "https://api.open-meteo.com/v1/ecmwf",
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    timeout=30,
+                )
+
     def test_sentinel_change_between_public_batches_invalidates_snapshot(self) -> None:
         with self.small_contract():
             fake = FakeApi(sentinel_changes=True)

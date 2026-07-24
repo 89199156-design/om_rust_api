@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import datetime as dt
 from email.utils import parsedate_to_datetime
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -1024,7 +1025,13 @@ def _request_once(
             headers=_safe_headers(exc.headers),
             elapsed_seconds=time.monotonic() - started,
         )
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        http.client.IncompleteRead,
+        TimeoutError,
+        socket.timeout,
+        OSError,
+    ) as exc:
         raise HttpRequestError(f"{method} transport failure for {url}: {type(exc).__name__}: {exc}") from exc
 
 
