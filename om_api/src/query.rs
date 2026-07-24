@@ -8988,6 +8988,40 @@ mod tests {
     }
 
     #[test]
+    fn dominant_wind_direction_canonicalizes_sub_ulp_north_boundary() {
+        // Frozen ECMWF p0487 spatial-archive frames for 2026-07-30. Their
+        // reconstructed u sum is less than one ULP of the northward v sum;
+        // the official temporal API returns the equivalent canonical 0.
+        let speed = [
+            f32::from_bits(0x3f3a5eed),
+            f32::from_bits(0x3f9bb7fe),
+            f32::from_bits(0x3f9bb7fe),
+            f32::from_bits(0x3eb89aaf),
+            f32::from_bits(0x3fe4f92f),
+            f32::from_bits(0x3fdc3833),
+            f32::from_bits(0x3fd9f9e5),
+            f32::from_bits(0x3f80a36f),
+        ];
+        let direction = [
+            f32::from_bits(0x42d3e414),
+            f32::from_bits(0x42c6ecac),
+            f32::from_bits(0x42c6ecac),
+            f32::from_bits(0x4397d855),
+            f32::from_bits(0x43944852),
+            f32::from_bits(0x43a23b2a),
+            f32::from_bits(0x43b2511a),
+            f32::from_bits(0x43b1250e),
+        ];
+        assert_eq!(
+            json_value_for_variable(
+                "wind_direction_100m",
+                dominant_wind_direction(&speed, &direction),
+            ),
+            serde_json::json!(0)
+        );
+    }
+
+    #[test]
     fn hj633_co_interpolation_does_not_ceil_exact_integer_due_to_f32_noise() {
         assert_eq!(
             hj633_2026_iaqi(0.6, &HJ633_CO_DAILY, &HJ633_AQI_BREAKPOINTS, 500.0, 1,),
@@ -10520,6 +10554,13 @@ fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
             -1.0 * speed * (direction * SWIFT_FLOAT_PI / 180.0).cos()
         })
         .sum::<f32>();
+    // The temporal API and spatial OM archive can differ by a final component
+    // quantization ULP. Canonicalize only a numerically indistinguishable
+    // northward vector; larger positive components still preserve official
+    // 360-degree output (including the frozen p0014 boundary).
+    if v < 0.0 && u.abs() <= f32::EPSILON * v.abs() {
+        return 0.0;
+    }
     wind_direction(u, v)
 }
 
