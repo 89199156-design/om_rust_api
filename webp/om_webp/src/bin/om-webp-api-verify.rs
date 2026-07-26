@@ -17,6 +17,7 @@ use std::time::Instant;
 
 const WIDTH: usize = 597;
 const HEIGHT: usize = 495;
+const GFS_100_TO_120_WIND_SCALE: f32 = 1.020_684_4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Scope {
@@ -219,16 +220,32 @@ const GFS_LAYERS: &[LayerSpec] = &[
     scalar("cloud_mid_1", "cloud_cover_mid"),
     scalar("cloud_low_1", "cloud_cover_low"),
     scalar("t2m", "temperature_2m"),
+    scalar("surface_temperature", "surface_temperature"),
+    scalar("t80m", "temperature_80m"),
+    scalar("t100m", "temperature_100m"),
+    scalar("t120m", "temperature_120m"),
     scalar("d2m", "dew_point_2m"),
     scalar("r2", "relative_humidity_2m"),
-    LayerSpec {
-        name: "wind",
-        variable: "wind_u_component_10m",
-        variable_v: Some("wind_v_component_10m"),
-        multiplier: 1.0,
-        encoding: Encoding::Wind,
-        derive: Derive::None,
-    },
+    wind("wind", "wind_u_component_10m", "wind_v_component_10m", 1.0),
+    wind(
+        "wind_80m",
+        "wind_u_component_80m",
+        "wind_v_component_80m",
+        1.0,
+    ),
+    wind(
+        "wind_100m",
+        "wind_u_component_100m",
+        "wind_v_component_100m",
+        1.0,
+    ),
+    wind(
+        "wind_120m",
+        "wind_u_component_100m",
+        "wind_v_component_100m",
+        GFS_100_TO_120_WIND_SCALE,
+    ),
+    scalar("freezing_level_height", "freezing_level_height"),
     scalar("tp", "precipitation"),
     scaled("snod", "snow_depth", 1000.0),
     scalar("gust", "wind_gusts_10m"),
@@ -248,24 +265,24 @@ const CAMS_LAYERS: &[LayerSpec] = &[
     scalar("dust", "dust"),
 ];
 
-// Free deterministic ECMWF IFS025 does not provide the GFS gust, visibility,
-// or UV-index layers. Keep all shared client encodings byte-for-byte equal.
+// The public API verifier omits ECMWF gust because its sparse long-range
+// cadence is covered separately. Unsupported GFS-only layers are not checked.
 const ECMWF_IFS025_LAYERS: &[LayerSpec] = &[
     scalar("cloud_total_1", "cloud_cover"),
     scalar("cloud_high_1", "cloud_cover_high"),
     scalar("cloud_mid_1", "cloud_cover_mid"),
     scalar("cloud_low_1", "cloud_cover_low"),
     scalar("t2m", "temperature_2m"),
+    scalar("surface_temperature", "surface_temperature"),
     scalar("d2m", "dew_point_2m"),
     scalar("r2", "relative_humidity_2m"),
-    LayerSpec {
-        name: "wind",
-        variable: "wind_u_component_10m",
-        variable_v: Some("wind_v_component_10m"),
-        multiplier: 1.0,
-        encoding: Encoding::Wind,
-        derive: Derive::None,
-    },
+    wind("wind", "wind_u_component_10m", "wind_v_component_10m", 1.0),
+    wind(
+        "wind_100m",
+        "wind_u_component_100m",
+        "wind_v_component_100m",
+        1.0,
+    ),
     scalar("tp", "precipitation"),
     scaled("snod", "snow_depth", 1000.0),
     derived("precip_phase", Derive::PrecipPhase),
@@ -286,6 +303,22 @@ const fn scaled(name: &'static str, variable: &'static str, multiplier: f32) -> 
         variable_v: None,
         multiplier,
         encoding: Encoding::Scalar,
+        derive: Derive::None,
+    }
+}
+
+const fn wind(
+    name: &'static str,
+    variable: &'static str,
+    variable_v: &'static str,
+    multiplier: f32,
+) -> LayerSpec {
+    LayerSpec {
+        name,
+        variable,
+        variable_v: Some(variable_v),
+        multiplier,
+        encoding: Encoding::Wind,
         derive: Derive::None,
     }
 }
@@ -667,8 +700,9 @@ fn compare_layer(
                     sample.latitude,
                     sample.longitude,
                 )?;
-                let u = round_variable_output_value(layer.variable, u);
-                let v = round_variable_output_value(layer.variable_v.expect("wind v"), v);
+                let u = round_variable_output_value(layer.variable, u) * layer.multiplier;
+                let v = round_variable_output_value(layer.variable_v.expect("wind v"), v)
+                    * layer.multiplier;
                 point_value = Some(u);
                 encode_wind(Some(u), Some(v))
             }
@@ -791,10 +825,25 @@ mod tests {
         assert_eq!(scope.product_dir(), "ecmwf_ifs025");
         assert_eq!(scope.api_model(), Some("ecmwf_ifs025"));
         assert_eq!(scope.weather_model(), WeatherModel::EcmwfIfs025);
-        assert_eq!(scope.layers().len(), 15);
-        for unavailable in ["gust", "vis", "uv_index"] {
+        assert_eq!(scope.layers().len(), 17);
+        for unavailable in [
+            "gust",
+            "vis",
+            "uv_index",
+            "t80m",
+            "t100m",
+            "t120m",
+            "wind_80m",
+            "wind_120m",
+            "freezing_level_height",
+        ] {
             assert!(scope.layers().iter().all(|layer| layer.name != unavailable));
         }
+        assert!(scope
+            .layers()
+            .iter()
+            .any(|layer| layer.name == "surface_temperature"));
+        assert!(scope.layers().iter().any(|layer| layer.name == "wind_100m"));
     }
 
     #[test]

@@ -16,7 +16,9 @@ EXPECTED = {
         "manifest": "gfs013_surface_data.json",
         "layers": {
             "cloud_total_1", "cloud_high_1", "cloud_mid_1", "cloud_low_1",
-            "t2m", "d2m", "r2", "wind", "tp", "snod", "gust", "vis",
+            "t2m", "surface_temperature", "t80m", "t100m", "t120m",
+            "d2m", "r2", "wind", "wind_80m", "wind_100m", "wind_120m",
+            "freezing_level_height", "tp", "snod", "gust", "vis",
             "precip_phase", "thunderstorm_code", "cape", "prmsl", "sp", "uv_index",
         },
     },
@@ -32,7 +34,8 @@ EXPECTED = {
         "manifest": "ecmwf_ifs025_data.json",
         "layers": {
             "cloud_total_1", "cloud_high_1", "cloud_mid_1", "cloud_low_1",
-            "t2m", "d2m", "r2", "wind", "tp", "snod", "gust", "precip_phase",
+            "t2m", "surface_temperature", "d2m", "r2", "wind", "wind_100m",
+            "tp", "snod", "gust", "precip_phase",
             "thunderstorm_code", "cape", "prmsl", "sp",
         },
     },
@@ -76,7 +79,8 @@ def main() -> None:
         assert set(catalog["products"][group]["layers"]) == expected["layers"]
         if group == "ecmwf_ifs025":
             assert set(catalog["products"][group]["unavailable_layers"]) == {
-                "vis", "uv_index", "showers"
+                "vis", "uv_index", "showers", "t80m", "t100m", "t120m",
+                "wind_80m", "wind_120m", "freezing_level_height"
             }
         batch = manifest["batch"]
         expected_files = {f"{timestamp}_{batch}.webp" for timestamp in manifest["files"]}

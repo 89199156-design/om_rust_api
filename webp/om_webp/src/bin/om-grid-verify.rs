@@ -67,10 +67,18 @@ const GFS_VARIABLES: &[&str] = &[
     "cloud_cover_mid",
     "cloud_cover_low",
     "temperature_2m",
+    "surface_temperature",
+    "temperature_80m",
+    "temperature_100m",
     "dew_point_2m",
     "relative_humidity_2m",
     "wind_u_component_10m",
     "wind_v_component_10m",
+    "wind_u_component_80m",
+    "wind_v_component_80m",
+    "wind_u_component_100m",
+    "wind_v_component_100m",
+    "freezing_level_height",
     "precipitation",
     "snow_depth",
     "wind_gusts_10m",
@@ -90,10 +98,13 @@ const ECMWF_IFS025_VARIABLES: &[&str] = &[
     "cloud_cover_mid",
     "cloud_cover_low",
     "temperature_2m",
+    "surface_temperature",
     "dew_point_2m",
     "relative_humidity_2m",
     "wind_u_component_10m",
     "wind_v_component_10m",
+    "wind_u_component_100m",
+    "wind_v_component_100m",
     "precipitation",
     "snow_depth",
     "weather_code",
@@ -247,7 +258,7 @@ mod tests {
         assert_eq!(args.scope.name(), "ecmwf_ifs025");
         assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs025);
         assert!(!args.scope.tolerate_unavailable_variables());
-        assert_eq!(ECMWF_IFS025_VARIABLES.len(), 15);
+        assert_eq!(ECMWF_IFS025_VARIABLES.len(), 18);
         assert!(!ECMWF_IFS025_VARIABLES.contains(&"wind_gusts_10m"));
         assert!(!ECMWF_IFS025_VARIABLES.contains(&"visibility"));
         assert!(!ECMWF_IFS025_VARIABLES.contains(&"uv_index"));

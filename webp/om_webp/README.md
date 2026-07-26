@@ -4,7 +4,7 @@ Rust renderer for the Shanghai production node. It reads `/data/om_raw`
 directly through the same `om-api` snapshot, interpolation, product-mixing and
 weather-code code paths used by the point API. It never calls the HTTP API.
 
-The production inventory contains 18 GFS layers, 4 CAMS layers, and 16 ECMWF
+The production inventory contains 26 GFS layers, 4 CAMS layers, and 18 ECMWF
 IFS 0.25 degree layers. Each product renders exactly 121 WebP files per variable
 at one-hour intervals, from latest run hour 0 through hour 120. The longer OM
 windows are used by the database and API, not by WebP. Images use lossless RGBA
@@ -12,11 +12,11 @@ WebP with the published scalar/vector encoding contract.
 
 ECMWF uses the same layer names, units, precision, and pixel encoding as the
 equivalent GFS product. The free deterministic IFS025 long-cycle feed publishes
-10-metre gusts, but does not publish visibility or UV index, so `vis` and
-`uv_index` are intentionally absent from `ecmwf_ifs025`; they are never
-synthesized. The feed also has no raw showers field, so no showers layer is
-added. Weather code and precipitation phase use the ECMWF derivation path in
-`om-api`.
+10-metre gusts, 100-metre wind, and surface temperature. It does not publish
+visibility, UV index, GFS 80/120-metre fields, or freezing-level height, so
+those layers are intentionally absent from `ecmwf_ifs025`; they are never
+synthesized. The feed also has no raw showers field. Weather code and
+precipitation phase use the ECMWF derivation path in `om-api`.
 
 Each source `release_id` is built under `data/staging`. A complete immutable
 release is moved to `data/releases`, then the public product symlink is switched
