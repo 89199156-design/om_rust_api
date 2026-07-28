@@ -44,8 +44,6 @@ TASK_BY_GROUP = {
     "cams": "OM_CAMS_DOWNLOAD",
     "ecmwf": "OM_ECMWF_DOWNLOAD",
 }
-INITIAL_DISABLED_TASKS = {"OM_ECMWF_DOWNLOAD"}
-DEFAULT_ECMWF_REFERENCE_TIME = "2026-07-23T00:00:00Z"
 REMOVED_PLACEHOLDER_TASKS = (
     "OM_BUILD_GFS013_SURFACE",
     "OM_BUILD_GFS_POINT_PACKAGE",
@@ -119,13 +117,6 @@ def download_group_script(
         "--object-range-max-bytes 8388608 "
         f"--output {shell_path(DOWNLOAD_ROOT)} "
         + "".join(publish_args)
-        + (
-            '--reference-time "${OM_ECMWF_REFERENCE_TIME:-'
-            + DEFAULT_ECMWF_REFERENCE_TIME
-            + '}" '
-            if group == "ecmwf"
-            else ""
-        )
         + '--now "$(date -u +%Y-%m-%dT%H:00:00Z)"'
     )
     return "\n".join(
@@ -206,7 +197,7 @@ def downloader_tasks() -> list[tuple[str, str, str]]:
     return [
         ("OM_GFS_DOWNLOAD", "0 * * * *&&20 * * * *&&40 * * * *", download_group_script("gfs")),
         ("OM_CAMS_DOWNLOAD", "10 * * * *&&30 * * * *&&50 * * * *", download_group_script("cams")),
-        ("OM_ECMWF_DOWNLOAD", "20 14 * * *", download_group_script("ecmwf")),
+        ("OM_ECMWF_DOWNLOAD", "3 * * * *", download_group_script("ecmwf")),
     ]
 
 
@@ -220,7 +211,7 @@ def api_publisher_tasks(*, raw_root: Path) -> list[tuple[str, str, str]]:
         ),
         (
             "OM_ECMWF_DOWNLOAD",
-            "20 14 * * *",
+            "3 * * * *",
             download_group_script("ecmwf", publish_root=raw_root),
         ),
     ]
@@ -324,7 +315,7 @@ def api_source_sync_tasks(
         ),
         (
             "OM_ECMWF_DOWNLOAD",
-            "20 14 * * *",
+            "3 * * * *",
             download_group_script("ecmwf", publish_root=raw_root),
         ),
     ]
@@ -373,7 +364,7 @@ def _cronjob_values(timestamp: str, name: str, spec: str, script: str, group_id:
         "retry_times": 0,
         "timeout": 21600,
         "retain_copies": 7,
-        "status": "Disable" if name in INITIAL_DISABLED_TASKS else "Enable",
+        "status": "Enable",
         "entry_ids": "",
         "secret": "",
         "group_id": group_id,

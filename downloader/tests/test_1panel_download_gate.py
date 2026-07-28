@@ -13,15 +13,16 @@ from scripts.install_1panel_v2_cronjobs import (
 
 
 class DownloadTaskGateTests(unittest.TestCase):
-    def test_ecmwf_task_is_frozen_on_data_disk_and_initially_disabled(self):
+    def test_ecmwf_production_task_tracks_latest_run_and_is_enabled(self):
         tasks = {name: script for name, _spec, script in api_publisher_tasks(raw_root=Path("/data/om_raw"))}
         script = tasks["OM_ECMWF_DOWNLOAD"]
         self.assertIn("--download-openmeteo-group ecmwf", script)
         self.assertIn("--output /data/om_downloader", script)
         self.assertIn("--publish-openmeteo-group-to /data/om_raw", script)
-        self.assertIn("OM_ECMWF_REFERENCE_TIME:-2026-07-23T00:00:00Z", script)
+        self.assertNotIn("--reference-time", script)
+        self.assertNotIn("OM_ECMWF_REFERENCE_TIME", script)
         payload = _cronjob_values("now", "OM_ECMWF_DOWNLOAD", "spec", script, 1)
-        self.assertEqual(payload["status"], "Disable")
+        self.assertEqual(payload["status"], "Enable")
 
     def test_reinstall_preserves_existing_enabled_or_disabled_status(self):
         payload = _existing_cronjob_values(

@@ -90,7 +90,7 @@ class InstallScriptTests(unittest.TestCase):
                     "OM_CAMS_DOWNLOAD",
                     "10 * * * *&&30 * * * *&&50 * * * *",
                 ),
-                ("OM_ECMWF_DOWNLOAD", "20 14 * * *"),
+                ("OM_ECMWF_DOWNLOAD", "3 * * * *"),
             ],
         )
         for name, _spec, script in publisher_tasks:
@@ -148,7 +148,7 @@ class InstallScriptTests(unittest.TestCase):
                 "5,15,25,35,45,55 * * * *",
                 "2-59/5 * * * *",
                 "2-59/5 * * * *",
-                "20 14 * * *",
+                "3 * * * *",
             ],
         )
         scripts = {name: script for name, _spec, script in tasks}
