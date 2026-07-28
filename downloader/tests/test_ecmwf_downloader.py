@@ -1,6 +1,8 @@
+import argparse
 import json
 import importlib.util
 import re
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -237,6 +239,132 @@ class EcmwfDownloaderTests(unittest.TestCase):
         forwarded = release.call_args.args[0]
         self.assertEqual(forwarded.download_openmeteo_group, "ecmwf")
         self.assertEqual(forwarded.reference_time, "2026-07-23T00:00:00Z")
+
+    def test_ecmwf_production_group_dispatches_three_release_reconciliation(self):
+        with (
+            patch.object(
+                cli_module,
+                "_reconcile_ecmwf_retention_window",
+                return_value=0,
+            ) as reconcile,
+            patch.object(
+                cli_module,
+                "_download_openmeteo_group_release",
+                side_effect=AssertionError("production must use retained-release reconciliation"),
+            ),
+        ):
+            result = cli_module.main(
+                [
+                    "--download-openmeteo-group",
+                    "ecmwf",
+                    "--config",
+                    "config/models.json",
+                    "--now",
+                    "2026-07-28T03:00:00Z",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        reconcile.assert_called_once()
+        forwarded = reconcile.call_args.args[0]
+        self.assertIsNone(forwarded.reference_time)
+        self.assertEqual(
+            forwarded.retain_complete_releases,
+            cli_module.ECMWF_COMPLETE_RUN_RETENTION,
+        )
+        self.assertEqual(cli_module.ECMWF_COMPLETE_RUN_RETENTION, 3)
+        self.assertEqual(cli_module._effective_group_retention("ecmwf", 1), 3)
+
+    def test_ecmwf_reconciliation_backfills_three_releases_before_activation(self):
+        runs = ("2026072718", "2026072712", "2026072706")
+        plans = [
+            (run, {"ecmwf_ifs025": (None, [], SimpleNamespace(latest_complete_run=run))})
+            for run in runs
+        ]
+        retained = {
+            run: {"latest_complete_run": run, "status": "complete"}
+            for run in runs
+        }
+
+        def download_release(*_args, **kwargs):
+            plan = kwargs["plan_by_product_override"]["ecmwf_ifs025"][2]
+            print(json.dumps({"status": "complete", "latest_complete_run": plan.latest_complete_run}))
+            return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(
+                config="config/models.json",
+                retain_complete_releases=3,
+                now="2026-07-28T03:00:00Z",
+                openmeteo_bucket_url="https://example.test",
+                output=directory,
+                publish_openmeteo_group_to=str(Path(directory) / "api"),
+            )
+            with (
+                patch.object(
+                    cli_module,
+                    "load_models",
+                    return_value=SimpleNamespace(
+                        products={"ecmwf_ifs025": _product()}
+                    ),
+                ),
+                patch.object(
+                    cli_module,
+                    "_discover_recent_ecmwf_retention_plans",
+                    return_value=plans,
+                ),
+                patch.object(
+                    cli_module,
+                    "prune_expired_group_releases",
+                    return_value=[],
+                ),
+                patch.object(
+                    cli_module,
+                    "_matching_group_releases",
+                    side_effect=[{}, retained],
+                ),
+                patch.object(
+                    cli_module,
+                    "_download_openmeteo_group_release",
+                    side_effect=download_release,
+                ) as download,
+                patch.object(
+                    cli_module,
+                    "retain_group_release_from_mirror",
+                    return_value={"status": "retained"},
+                ) as retain,
+                patch.object(
+                    cli_module,
+                    "_clear_group_download_payloads",
+                    return_value=[],
+                ),
+                patch.object(
+                    cli_module,
+                    "_read_json_if_exists",
+                    return_value={"latest_complete_run": "2026072400"},
+                ),
+                patch.object(
+                    cli_module,
+                    "activate_group_release",
+                    return_value={"status": "activated"},
+                ) as activate,
+                redirect_stdout(StringIO()),
+            ):
+                result = cli_module._reconcile_ecmwf_retention_window(
+                    args,
+                    argparse.ArgumentParser(),
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(download.call_count, 3)
+        downloaded_runs = [
+            call.kwargs["plan_by_product_override"]["ecmwf_ifs025"][2].latest_complete_run
+            for call in download.call_args_list
+        ]
+        self.assertEqual(downloaded_runs, list(reversed(runs)))
+        self.assertEqual(retain.call_count, 3)
+        activate.assert_called_once()
+        self.assertEqual(activate.call_args.args[2], retained[runs[0]])
 
     def test_ecmwf_grid_matches_public_ifs025_om_dimensions(self):
         grid = grid_spec_for_openmeteo_model("ecmwf_ifs025", dimensions=(721, 1440))
