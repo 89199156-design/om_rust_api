@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -1008,12 +1009,19 @@ def prune_expired_group_releases(
     now_utc: datetime | None = None,
     retain_complete_releases: int = DEFAULT_COMPLETE_RELEASE_RETENTION,
     preserve_current: bool = False,
+    retain_runs: Collection[str] | None = None,
 ) -> list[str]:
     if group not in OPENMETEO_GROUP_PRODUCTS:
         raise ValueError(f"unknown Open-Meteo group: {group}")
     if retain_complete_releases < DEFAULT_COMPLETE_RELEASE_RETENTION:
         raise ValueError(
             f"retain_complete_releases must be at least {DEFAULT_COMPLETE_RELEASE_RETENTION}"
+        )
+    retained_run_filter = set(retain_runs) if retain_runs is not None else None
+    if retained_run_filter is not None and len(retained_run_filter) != retain_complete_releases:
+        raise ValueError(
+            "retain_runs must contain exactly "
+            f"{retain_complete_releases} distinct source runs"
         )
     del now_utc
 
@@ -1079,7 +1087,14 @@ def prune_expired_group_releases(
         release_id = str(payload.get("release_id") or group_release_id(payload))
         if preserve_release_id is not None and release_id == preserve_release_id:
             continue
-        if run in retained_runs or len(retained_runs) >= retain_complete_releases:
+        if (
+            (retained_run_filter is not None and run not in retained_run_filter)
+            or run in retained_runs
+            or (
+                retained_run_filter is None
+                and len(retained_runs) >= retain_complete_releases
+            )
+        ):
             expired_releases.append(release)
             continue
         retained_runs.add(run)

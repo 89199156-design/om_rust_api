@@ -15,6 +15,7 @@ from om_downloader.mirror_sync import (
     sync_from_manifest_url,
     sync_group_from_mirror,
 )
+from om_downloader.static_assets import OPENMETEO_STATIC_ASSETS
 
 
 class _SyncHandler(BaseHTTPRequestHandler):
@@ -991,6 +992,68 @@ class MirrorSyncTests(unittest.TestCase):
         )
         self.assertEqual(len(retained), 5)
         self.assertTrue(duplicate_removed)
+
+    def test_exact_run_filter_removes_newer_obsolete_release_without_dropping_oldest_target(self):
+        target_runs = [
+            "2026072712",
+            "2026072700",
+            "2026072618",
+            "2026072612",
+            "2026072606",
+        ]
+
+        def release(run: str) -> dict:
+            static = OPENMETEO_STATIC_ASSETS["ecmwf_ifs025"]
+            payload = {
+                "group": "ecmwf",
+                "status": "complete",
+                "latest_complete_run": run,
+                "static_assets": {
+                    "ecmwf_ifs025": {
+                        "model": "ecmwf_ifs025",
+                        "path": static.relative_path.as_posix(),
+                        "bytes": static.bytes,
+                        "sha256": static.sha256,
+                        "storage": "external_env",
+                        "environment": "OM_MODEL_STATIC_ROOT",
+                        "source_url": "https://example.invalid/data/ecmwf_ifs025/static/HSURF.om",
+                    }
+                },
+                "product_manifests": {
+                    "ecmwf_ifs025": {
+                        "coverage_id": f"ecmwf_ifs025_{run}",
+                        "status": "complete",
+                        "latest_complete_run": run,
+                    }
+                },
+            }
+            payload["release_id"] = group_release_id(payload)
+            return payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases_root = root / "groups" / "ecmwf" / "releases"
+            releases_root.mkdir(parents=True)
+            for run in [*target_runs, "2026072706"]:
+                payload = release(run)
+                (releases_root / f"{payload['release_id']}.json").write_text(
+                    json.dumps(payload),
+                    encoding="utf-8",
+                )
+
+            prune_expired_group_releases(
+                root,
+                "ecmwf",
+                retain_complete_releases=5,
+                retain_runs=target_runs,
+            )
+
+            retained_runs = {
+                json.loads(path.read_text(encoding="utf-8"))["latest_complete_run"]
+                for path in releases_root.glob("*.json")
+            }
+
+        self.assertEqual(retained_runs, set(target_runs))
 
 
 if __name__ == "__main__":

@@ -2464,6 +2464,7 @@ def _reconcile_ecmwf_retention_window(
         "ecmwf",
         retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
         preserve_current=True,
+        retain_runs=target_runs,
     )
     pre_pruned_raw_paths: list[str] = []
     if source_root.resolve(strict=False) != api_root.resolve(strict=False):
@@ -2472,6 +2473,7 @@ def _reconcile_ecmwf_retention_window(
             "ecmwf",
             retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
             preserve_current=True,
+            retain_runs=target_runs,
         )
 
     products = [product]
@@ -2548,6 +2550,7 @@ def _reconcile_ecmwf_retention_window(
         api_root,
         "ecmwf",
         retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
+        retain_runs=target_runs,
     )
     print(
         json.dumps(
