@@ -714,41 +714,55 @@ fn validate_group_release_id(release_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_group_release_candidates(data_root: &Path) -> Result<Vec<(Value, LegacyGroupRelease)>> {
-    let mut candidate_paths = Vec::new();
-    let current = data_root.join("groups/gfs/current/ready_for_processing.json");
-    if current.is_file() {
-        candidate_paths.push(current);
+fn load_group_release_candidate(path: &Path) -> Result<Option<(Value, LegacyGroupRelease)>> {
+    let value: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read GFS source release: {}", path.display()))?,
+    )?;
+    let Ok(release) = serde_json::from_value::<LegacyGroupRelease>(value.clone()) else {
+        return Ok(None);
+    };
+    if release.group != "gfs" || release.status != "complete" {
+        return Ok(None);
     }
+    parse_run(&release.latest_complete_run)
+        .with_context(|| format!("invalid GFS source release run in {}", path.display()))?;
+    validate_group_release_id(&release.release_id)?;
+    Ok(Some((value, release)))
+}
+
+fn load_group_release_candidates(data_root: &Path) -> Result<Vec<(Value, LegacyGroupRelease)>> {
+    let mut releases = Vec::new();
     let releases_root = data_root.join("groups/gfs/releases");
     if releases_root.is_dir() {
         let mut release_paths = fs::read_dir(&releases_root)?
             .map(|entry| entry.map(|value| value.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
         release_paths.sort();
-        candidate_paths.extend(
-            release_paths
-                .into_iter()
-                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json")),
-        );
+        for path in release_paths
+            .into_iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            if let Some(candidate) = load_group_release_candidate(&path)? {
+                releases.push(candidate);
+            }
+        }
     }
 
-    let mut releases = Vec::new();
-    for path in candidate_paths {
-        let value: Value = serde_json::from_slice(
-            &fs::read(&path)
-                .with_context(|| format!("read GFS source release: {}", path.display()))?,
-        )?;
-        let Ok(release) = serde_json::from_value::<LegacyGroupRelease>(value.clone()) else {
-            continue;
-        };
-        if release.group != "gfs" || release.status != "complete" {
-            continue;
+    let current = data_root.join("groups/gfs/current/ready_for_processing.json");
+    if current.is_file() {
+        if let Some(candidate) = load_group_release_candidate(&current)? {
+            // During deferred activation, a run that was formerly a full
+            // current release can already have a new immutable short-run
+            // identity in the exact three-short/two-full window. The retained
+            // release is authoritative for materialization; current remains
+            // only as the live rollback-safe API marker until publication.
+            if !releases
+                .iter()
+                .any(|(_, release)| release.latest_complete_run == candidate.1.latest_complete_run)
+            {
+                releases.push(candidate);
+            }
         }
-        parse_run(&release.latest_complete_run)
-            .with_context(|| format!("invalid GFS source release run in {}", path.display()))?;
-        validate_group_release_id(&release.release_id)?;
-        releases.push((value, release));
     }
     Ok(releases)
 }
@@ -3060,6 +3074,61 @@ mod tests {
             runs.iter().map(|value| value.2).collect::<Vec<_>>(),
             [5, 5, 5, 384, 384]
         );
+    }
+
+    #[test]
+    fn retained_release_supersedes_same_run_current_identity_during_deferred_activation() {
+        fn marker(run: &str, release_id: &str, suffix: &str) -> Value {
+            let products = GFS_PRODUCTS
+                .iter()
+                .map(|product| {
+                    (
+                        (*product).to_string(),
+                        json!({
+                            "coverage_id": format!("{product}_{run}_{suffix}"),
+                            "status": "complete",
+                            "latest_complete_run": run
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            json!({
+                "group": "gfs",
+                "status": "complete",
+                "release_id": release_id,
+                "latest_complete_run": run,
+                "product_manifests": products
+            })
+        }
+
+        let root = tempdir().unwrap();
+        let current = root
+            .path()
+            .join("groups/gfs/current/ready_for_processing.json");
+        let retained = root
+            .path()
+            .join("groups/gfs/releases/gfs-bbbbbbbbbbbbbbbb.json");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        atomic_write_json(
+            &current,
+            &marker("2026072618", "gfs-aaaaaaaaaaaaaaaa", "209h"),
+        )
+        .unwrap();
+        atomic_write_json(
+            &retained,
+            &marker("2026072618", "gfs-bbbbbbbbbbbbbbbb", "6h"),
+        )
+        .unwrap();
+
+        let candidates = load_group_release_candidates(root.path()).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1.release_id, "gfs-bbbbbbbbbbbbbbbb");
+        assert!(release_coverage_ids(&candidates[0].1)
+            .unwrap()
+            .values()
+            .all(|coverage_id| coverage_id.ends_with("_6h")));
     }
 
     #[test]
