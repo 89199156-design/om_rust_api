@@ -720,6 +720,43 @@ def _manifest_with_reuse_flags(manifest: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _plan_requires_initial_fallback(plan: Any) -> bool:
+    return any(
+        slot.source_run == plan.latest_complete_run and int(slot.forecast_hour) == 0
+        for slot in plan.slots
+    )
+
+
+def _repair_non_applicable_initial_fallback_manifest(
+    manifest: dict[str, Any] | None,
+    plan: Any,
+    product: ProductConfig,
+    output_root: Path,
+) -> dict[str, Any] | None:
+    """Reuse a valid bundle rejected only by an inapplicable f000 fallback gate."""
+    if (
+        not manifest
+        or manifest.get("status") != "incomplete"
+        or _plan_requires_initial_fallback(plan)
+        or set(manifest.get("missing_initial_fallback_variables") or ())
+        != set(product.required_initial_fallback_variables)
+        or manifest.get("missing_bundle_required_variables")
+        or manifest.get("missing_pressure_levels_hpa")
+    ):
+        return manifest
+    repaired = json.loads(json.dumps(manifest))
+    repaired["initial_fallback_requirement_applies"] = False
+    repaired["missing_initial_fallback_variables"] = []
+    repaired["status"] = "complete"
+    if not _manifest_matches_plan(repaired, plan, product, output_root):
+        return manifest
+    atomic_write_json(
+        output_root / "published" / product.name / "latest.json",
+        repaired,
+    )
+    return repaired
+
+
 def _clear_group_published_data(
     output_root: Path,
     *,
@@ -964,6 +1001,12 @@ def _download_openmeteo_product(
     coverage_id = _coverage_id_for_plan(product, plan)
     existing_manifest_path = output_root / "published" / product.name / "latest.json"
     existing_manifest = _read_json_if_exists(existing_manifest_path)
+    existing_manifest = _repair_non_applicable_initial_fallback_manifest(
+        existing_manifest,
+        plan,
+        product,
+        output_root,
+    )
     if _manifest_matches_plan(existing_manifest, plan, product, output_root):
         reused_manifest = _manifest_with_reuse_flags(existing_manifest)
         atomic_write_json(existing_manifest_path, reused_manifest)
@@ -1453,8 +1496,14 @@ def _download_openmeteo_product(
         and entry.get("source_run") != plan.latest_complete_run
         and int(entry.get("forecast_hour", -1)) == product.run_cadence_hours
     }
-    missing_initial_fallback_variables = sorted(
-        set(product.required_initial_fallback_variables) - set(initial_substitutions)
+    initial_fallback_requirement_applies = _plan_requires_initial_fallback(plan)
+    missing_initial_fallback_variables = (
+        sorted(set(product.required_initial_fallback_variables) - set(initial_substitutions))
+        if initial_fallback_requirement_applies
+        else []
+    )
+    manifest["initial_fallback_requirement_applies"] = (
+        initial_fallback_requirement_applies
     )
     manifest["initial_frame_substitutions"] = initial_substitutions
     manifest["missing_initial_fallback_variables"] = missing_initial_fallback_variables

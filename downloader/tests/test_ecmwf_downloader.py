@@ -65,6 +65,93 @@ def _product() -> ProductConfig:
 
 
 class EcmwfDownloaderTests(unittest.TestCase):
+    def test_initial_fallback_gate_applies_only_when_plan_contains_latest_f000(self):
+        base = datetime(2026, 7, 27, tzinfo=UTC)
+        without_f000 = SimpleNamespace(
+            latest_complete_run="2026072700",
+            slots=(SimpleNamespace(source_run="2026072700", forecast_hour=12),),
+        )
+        with_f000 = SimpleNamespace(
+            latest_complete_run="2026072712",
+            slots=(SimpleNamespace(source_run="2026072712", forecast_hour=0),),
+        )
+
+        self.assertFalse(cli_module._plan_requires_initial_fallback(without_f000))
+        self.assertTrue(cli_module._plan_requires_initial_fallback(with_f000))
+
+    def test_previous_complete_bundle_is_repaired_without_redownload_when_f000_is_absent(self):
+        product = _product()
+        base = datetime(2026, 7, 27, tzinfo=UTC)
+        valid_time = base + timedelta(hours=12)
+        plan = SimpleNamespace(
+            latest_complete_run="2026072700",
+            required_start_utc=valid_time,
+            public_start_utc=valid_time,
+            required_end_utc=valid_time,
+            slots=(SimpleNamespace(source_run="2026072700", forecast_hour=12),),
+        )
+        coverage_id = cli_module._coverage_id_for_plan(product, plan)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle = (
+                root
+                / "published"
+                / product.name
+                / "coverages"
+                / coverage_id
+                / f"{product.name}.omranges"
+            )
+            bundle.parent.mkdir(parents=True)
+            bundle.write_bytes(b"abc")
+            manifest = {
+                "model": product.name,
+                "coverage_id": coverage_id,
+                "config_fingerprint": cli_module.product_config_fingerprint(product),
+                "status": "incomplete",
+                "latest_complete_run": plan.latest_complete_run,
+                "required_start_utc": "2026-07-27T12:00:00Z",
+                "public_start_utc": "2026-07-27T12:00:00Z",
+                "required_end_utc": "2026-07-27T12:00:00Z",
+                "valid_time_count": 1,
+                "missing_initial_fallback_variables": list(
+                    product.required_initial_fallback_variables
+                ),
+                "missing_bundle_required_variables": [],
+                "missing_pressure_levels_hpa": [],
+                "files": [
+                    {
+                        "kind": "om_coverage_bundle",
+                        "path": f"coverages/{coverage_id}/{product.name}.omranges",
+                        "bytes": 3,
+                        "downloaded_bytes": 3,
+                        "sha256": (
+                            "ba7816bf8f01cfea414140de5dae2223"
+                            "b00361a396177a9cb410ff61f20015ad"
+                        ),
+                        "entries": [{"bundle_offset": 0, "bundle_bytes": 3}],
+                    }
+                ],
+                "bytes": 3,
+                "downloaded_bytes": 3,
+            }
+
+            repaired = cli_module._repair_non_applicable_initial_fallback_manifest(
+                manifest,
+                plan,
+                product,
+                root,
+            )
+
+            self.assertEqual(repaired["status"], "complete")
+            self.assertFalse(repaired["initial_fallback_requirement_applies"])
+            self.assertEqual(repaired["missing_initial_fallback_variables"], [])
+            persisted = json.loads(
+                (root / "published" / product.name / "latest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(persisted, repaired)
+
     def test_api_downloader_and_validator_share_exact_public_catalog(self):
         validator_path = Path("../scripts/validation/ecmwf_variable_catalog.py")
         spec = importlib.util.spec_from_file_location("validator_ecmwf_catalog", validator_path)
