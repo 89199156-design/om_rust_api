@@ -1,7 +1,8 @@
 use crate::official::OfficialDecoder;
 use crate::query::{
-    ecmwf_public_hourly_variables, forecast_for_query, route_forecast, PointQuery, RouteQuery,
-    WeatherModel, ECMWF_PUBLIC_DAILY_VARIABLES,
+    ecmwf_public_hourly_variables, forecast_for_query, route_forecast, validate_cams_query,
+    validate_explicit_variables, validate_gfs_query, PointQuery, RouteQuery, WeatherModel,
+    ECMWF_PUBLIC_DAILY_VARIABLES,
 };
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{Context, Result};
@@ -213,14 +214,10 @@ pub fn router(state: AppState) -> Router {
             "/.well-known/weather-attribution.json",
             get(weather_attribution),
         )
-        .route("/v1/forecast", get(forecast))
+        .route("/v1/gfs", get(gfs_forecast))
         .route("/v1/ecmwf", get(ecmwf_forecast).post(ecmwf_forecast_post))
-        .route(
-            "/v1/ecmwf/forecast",
-            get(ecmwf_forecast).post(ecmwf_forecast_post),
-        )
         .route("/v1/ecmwf/catalog", get(ecmwf_catalog))
-        .route("/v1/air-quality", get(air_quality))
+        .route("/v1/cams", get(cams_forecast))
         .route("/v1/route", post(route))
         .route("/v1/ecmwf/route", post(ecmwf_route))
         .with_state(state)
@@ -349,12 +346,13 @@ pub async fn serve(
     Ok(())
 }
 
-async fn forecast(
+async fn gfs_forecast(
     State(state): State<AppState>,
-    Query(query): Query<PointQuery>,
+    Query(mut query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let model = WeatherModel::parse(query.models.as_deref())?;
-    let (snapshot, model_run) = state.weather_snapshot(model)?;
+    validate_gfs_query(&query)?;
+    query.models = Some("gfs".to_string());
+    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::Gfs)?;
     let decoder = state.decoder.clone();
     let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
@@ -369,6 +367,7 @@ async fn ecmwf_forecast(
     State(state): State<AppState>,
     Query(mut query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_explicit_variables(&query)?;
     query.models = Some("ecmwf_ifs025".to_string());
     let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
     let decoder = state.decoder.clone();
@@ -385,6 +384,7 @@ async fn ecmwf_forecast_post(
     State(state): State<AppState>,
     Json(mut query): Json<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_explicit_variables(&query)?;
     query.models = Some("ecmwf_ifs025".to_string());
     let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
     let decoder = state.decoder.clone();
@@ -441,17 +441,19 @@ async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json:
     })))
 }
 
-async fn air_quality(
+async fn cams_forecast(
     State(state): State<AppState>,
-    Query(query): Query<PointQuery>,
+    Query(mut query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_cams_query(&query)?;
+    query.models = Some("gfs".to_string());
     let snapshot = state.snapshot()?;
     let decoder = state.decoder.clone();
     let payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
     })
     .await
-    .context("air-quality worker failed")??;
+    .context("CAMS forecast worker failed")??;
     Ok(Json(payload))
 }
 
@@ -515,7 +517,7 @@ mod tests {
     async fn source_offer_is_present_on_root_and_api_errors() {
         let root = TempDir::new().unwrap();
         let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
-        for uri in ["/", "/v1/forecast"] {
+        for uri in ["/", "/v1/gfs"] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -529,6 +531,36 @@ mod tests {
                 response.headers().get("x-source-code").unwrap(),
                 SOURCE_REPOSITORY
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_model_routes_enforce_explicit_model_specific_variables() {
+        let root = TempDir::new().unwrap();
+        let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
+
+        for uri in ["/v1/forecast", "/v1/air-quality", "/v1/ecmwf/forecast"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        for uri in [
+            "/v1/gfs?latitude=31.23&longitude=121.47",
+            "/v1/ecmwf?latitude=31.23&longitude=121.47",
+            "/v1/cams?latitude=31.23&longitude=121.47",
+            "/v1/gfs?latitude=31.23&longitude=121.47&hourly=pm2_5",
+            "/v1/cams?latitude=31.23&longitude=121.47&hourly=temperature_2m",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
     }
 

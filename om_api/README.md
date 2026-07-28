@@ -96,16 +96,16 @@ OM_OMFILE_LIB=/opt/1panel/apps/weather_om_api/native/libomfileformat.so \
 Client examples:
 
 ```text
-GET /v1/forecast?latitude=31.23&longitude=121.47&hourly=temperature_2m,weather_code&forecast_hours=24
-GET /v1/air-quality?latitude=31.23&longitude=121.47&hourly=pm2_5,pm10,aerosol_optical_depth&forecast_hours=24
-GET /v1/air-quality?latitude=31.23&longitude=121.47&hourly=chinese_aqi&daily=chinese_aqi,chinese_aqi_o3&start_date=2026-07-12&end_date=2026-07-12
+GET /v1/gfs?latitude=31.23&longitude=121.47&hourly=temperature_2m,weather_code&forecast_hours=24
+GET /v1/cams?latitude=31.23&longitude=121.47&hourly=pm2_5,pm10,aerosol_optical_depth&forecast_hours=24
+GET /v1/cams?latitude=31.23&longitude=121.47&hourly=chinese_aqi&daily=chinese_aqi,chinese_aqi_o3&start_date=2026-07-12&end_date=2026-07-12
 POST /v1/route
 ```
 
 Daily weather:
 
 ```text
-GET /v1/forecast?latitude=31.23&longitude=121.47&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_max,precipitation_sum,precipitation_hours,weather_code,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant&start_date=2026-07-13&end_date=2026-07-13&timezone=Asia%2FShanghai
+GET /v1/gfs?latitude=31.23&longitude=121.47&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_max,precipitation_sum,precipitation_hours,weather_code,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant&start_date=2026-07-13&end_date=2026-07-13&timezone=Asia%2FShanghai
 ```
 
 - Daily values use the natural-day UTC offset selected by `timezone`. With no

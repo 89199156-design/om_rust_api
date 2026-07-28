@@ -248,7 +248,7 @@ async fn gfs_nan_fallback_uses_only_the_other_retained_full_run() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -297,7 +297,7 @@ async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -345,7 +345,7 @@ async fn gfs_newest_covering_short_run_overrides_previous_complete_run() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
     )
     .await;
 
@@ -393,7 +393,7 @@ async fn gfs_null_short_run_falls_back_only_to_previous_complete_run() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
     )
     .await;
 
@@ -430,7 +430,7 @@ async fn rain_remains_null_when_any_direct_component_is_null() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=rain&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=rain&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -467,7 +467,7 @@ async fn cams_nan_fallback_uses_previous_retained_run() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -504,7 +504,7 @@ async fn cams_nan_fallback_stops_after_previous_retained_run() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -546,7 +546,7 @@ async fn cams_latest_tail_does_not_fall_back_to_third_retained_run() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T12:00&end_hour=2026-07-08T12:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm10&start_hour=2026-07-08T12:00&end_hour=2026-07-08T12:00",
     )
     .await;
 
@@ -606,7 +606,7 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
     )
     .await;
 
@@ -658,7 +658,7 @@ async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
     )
     .await;
 
@@ -772,7 +772,7 @@ async fn cams_co_history_rounds_each_source_before_mixing() {
 
     let (status, body) = request_json(
         router(AppState::new(root.path().to_path_buf(), None).unwrap()),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-20T13:00&end_hour=2026-07-20T13:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-20T13:00&end_hour=2026-07-20T13:00",
     )
     .await;
 
@@ -813,7 +813,7 @@ async fn cams_global_hermite_uses_c_when_second_lookahead_is_missing() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=ozone&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=ozone&start_hour=2026-07-08T05:00&end_hour=2026-07-08T05:00",
     )
     .await;
 
@@ -870,7 +870,7 @@ async fn cams_carbon_monoxide_smooths_three_hours_before_greenhouse_gap() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=carbon_monoxide&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
     )
     .await;
 
@@ -964,7 +964,7 @@ async fn cams_carbon_monoxide_hermite_extrapolates_greenhouse_tail_before_mixing
     let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     for (hour, expected) in [(0, 187.0), (1, 218.0), (2, 218.5), (3, 202.0)] {
         let url = format!(
-            "/v1/air-quality?latitude=-90&longitude=-180&hourly=ozone,carbon_monoxide&start_hour=2026-07-25T{hour:02}:00&end_hour=2026-07-25T{hour:02}:00"
+            "/v1/cams?latitude=-90&longitude=-180&hourly=ozone,carbon_monoxide&start_hour=2026-07-25T{hour:02}:00&end_hour=2026-07-25T{hour:02}:00"
         );
         let (status, body) = request_json(router(state.clone()), &url).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1076,7 +1076,7 @@ async fn chinese_daily_aqi_uses_hj663_08_to_24_o3_windows() {
     let app = router(state);
     let (status, body) = request_json(
         app.clone(),
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-08T15:00&end_hour=2026-07-08T15:00&daily=chinese_aqi,chinese_aqi_o3,chinese_aqi_pm2_5,pm2_5_mean,pm10_mean,nitrogen_dioxide_mean,ozone_maximum_8h_mean,sulphur_dioxide_mean,carbon_monoxide_mean&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=chinese_aqi&start_hour=2026-07-08T15:00&end_hour=2026-07-08T15:00&daily=chinese_aqi,chinese_aqi_o3,chinese_aqi_pm2_5,pm2_5_mean,pm10_mean,nitrogen_dioxide_mean,ozone_maximum_8h_mean,sulphur_dioxide_mean,carbon_monoxide_mean&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
 
@@ -1109,7 +1109,7 @@ async fn chinese_daily_aqi_uses_hj663_08_to_24_o3_windows() {
 
     let (daily_only_status, daily_only_body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&daily=chinese_aqi&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/cams?latitude=-90&longitude=-180&daily=chinese_aqi&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
     assert_eq!(daily_only_status, StatusCode::OK, "{daily_only_body}");
@@ -1153,7 +1153,7 @@ async fn chinese_daily_air_quality_keeps_date_when_one_pollutant_is_missing() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&daily=pm2_5_mean,pm10_mean,chinese_aqi&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/cams?latitude=-90&longitude=-180&daily=pm2_5_mean,pm10_mean,chinese_aqi&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
 
@@ -1187,7 +1187,7 @@ async fn missing_historical_release_coverage_does_not_block_current_cams_api() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm2_5&forecast_hours=1",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm2_5&forecast_hours=1",
     )
     .await;
 
@@ -1213,7 +1213,7 @@ async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
     )
     .await;
 
@@ -1252,7 +1252,7 @@ async fn chinese_hourly_aqi_uses_current_one_hour_concentrations() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5,chinese_aqi_o3&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=chinese_aqi_pm2_5,chinese_aqi_o3&start_hour=2026-07-08T23:00&end_hour=2026-07-08T23:00",
     )
     .await;
 
@@ -1415,7 +1415,7 @@ async fn forecast_endpoint_returns_point_data_without_client_manifest() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m,weather_code,wind_speed_10m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m,weather_code,wind_speed_10m&forecast_hours=1",
     )
     .await;
 
@@ -1435,7 +1435,7 @@ async fn forecast_endpoint_uses_official_json_precision_time_and_units() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,weather_code,wind_speed_10m,wind_direction_10m,pressure_msl&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,weather_code,wind_speed_10m,wind_direction_10m,pressure_msl&forecast_hours=1",
     )
     .await;
 
@@ -1471,7 +1471,7 @@ async fn forecast_endpoint_matches_official_float_rounding_at_decimal_half() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1",
     )
     .await;
 
@@ -1526,7 +1526,7 @@ async fn forecast_endpoint_exposes_all_soil_temperature_and_moisture_layers() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=soil_temperature_0_to_10cm,soil_temperature_10_to_40cm,soil_temperature_40_to_100cm,soil_temperature_100_to_200cm,soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_moisture_40_to_100cm,soil_moisture_100_to_200cm&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=soil_temperature_0_to_10cm,soil_temperature_10_to_40cm,soil_temperature_40_to_100cm,soil_temperature_100_to_200cm,soil_moisture_0_to_10cm,soil_moisture_10_to_40cm,soil_moisture_40_to_100cm,soil_moisture_100_to_200cm&forecast_hours=1",
     )
     .await;
 
@@ -1558,7 +1558,7 @@ async fn forecast_endpoint_hides_radiation_and_internal_wind_components() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=shortwave_radiation,wind_u_component_10m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=shortwave_radiation,wind_u_component_10m&forecast_hours=1",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1637,7 +1637,7 @@ async fn forecast_endpoint_rounds_weather_code_inputs_before_deriving() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=precipitation,showers,weather_code&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation,showers,weather_code&forecast_hours=1",
     )
     .await;
 
@@ -1678,7 +1678,7 @@ async fn forecast_endpoint_derives_weather_code_from_rounded_cloud_cover() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=cloud_cover,weather_code&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=cloud_cover,weather_code&forecast_hours=1",
     )
     .await;
 
@@ -1718,7 +1718,7 @@ async fn forecast_endpoint_expands_sparse_backwards_sum_to_hourly_values() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=precipitation&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
     )
     .await;
 
@@ -1779,7 +1779,7 @@ async fn forecast_endpoint_interpolates_sparse_temperature_with_hermite() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T06:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T06:00",
     )
     .await;
 
@@ -1826,7 +1826,7 @@ async fn forecast_endpoint_interpolates_sparse_uv_with_official_solar_method() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=90&longitude=-180&hourly=uv_index_clear_sky&start_hour=2026-07-08T12:00&end_hour=2026-07-08T18:00",
+        "/v1/gfs?latitude=90&longitude=-180&hourly=uv_index_clear_sky&start_hour=2026-07-08T12:00&end_hour=2026-07-08T18:00",
     )
     .await;
 
@@ -1889,7 +1889,7 @@ async fn forecast_endpoint_uses_model_stride_for_hermite_padding() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=cloud_cover&start_hour=2026-07-08T18:00&end_hour=2026-07-08T21:00",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=cloud_cover&start_hour=2026-07-08T18:00&end_hour=2026-07-08T21:00",
     )
     .await;
 
@@ -1923,7 +1923,7 @@ async fn forecast_endpoint_preserves_official_wind_direction_360_boundary() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=wind_direction_10m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=wind_direction_10m&forecast_hours=1",
     )
     .await;
 
@@ -1939,7 +1939,7 @@ async fn forecast_endpoint_derives_dew_point_from_temperature_and_relative_humid
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=dew_point_2m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=dew_point_2m&forecast_hours=1",
     )
     .await;
 
@@ -2005,7 +2005,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1",
     )
     .await;
 
@@ -2022,7 +2022,7 @@ async fn air_quality_endpoint_reads_cams_product_directly() {
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm2_5&forecast_hours=1",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm2_5&forecast_hours=1",
     )
     .await;
 
@@ -2069,7 +2069,7 @@ async fn air_quality_endpoint_prefers_greenhouse_gas_carbon_monoxide() {
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=carbon_monoxide&forecast_hours=1",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=carbon_monoxide&forecast_hours=1",
     )
     .await;
 
@@ -2085,7 +2085,7 @@ async fn air_quality_endpoint_returns_chinese_aqi_derivative_aliases() {
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=chinese_aqi_no2,chinese_aqi_nitrogen_dioxide&forecast_hours=1",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=chinese_aqi_no2,chinese_aqi_nitrogen_dioxide&forecast_hours=1",
     )
     .await;
 
@@ -2131,7 +2131,7 @@ async fn air_quality_sparse_variable_hour_returns_null_without_failing_group() {
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=pm2_5,dust&forecast_hours=1",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=pm2_5,dust&forecast_hours=1",
     )
     .await;
 
@@ -2181,7 +2181,7 @@ async fn air_quality_endpoint_interpolates_sparse_cams_variables_with_hermite() 
 
     let (status, body) = request_json(
         app,
-        "/v1/air-quality?latitude=-90&longitude=-180&hourly=dust&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=dust&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
     )
     .await;
 
@@ -2200,7 +2200,7 @@ async fn pressure_profile_endpoint_uses_official_units() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_1000hPa,relative_humidity_1000hPa,geopotential_height_1000hPa,geopotential_height_300hPa,vertical_velocity_1000hPa&forecast_hours=1",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_1000hPa,relative_humidity_1000hPa,geopotential_height_1000hPa,geopotential_height_300hPa,vertical_velocity_1000hPa&forecast_hours=1",
     )
     .await;
 
@@ -2755,7 +2755,7 @@ async fn land_cell_selection_requires_dem_before_serving() {
 
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1&cell_selection=land",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&forecast_hours=1&cell_selection=land",
     )
     .await;
 
@@ -2824,7 +2824,7 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+        "/v1/gfs?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
     )
     .await;
 
@@ -2869,7 +2869,7 @@ async fn daily_weather_supports_multiple_coordinates() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90,-89&longitude=-180,-179&daily=temperature_2m_max,precipitation_sum&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+        "/v1/gfs?latitude=-90,-89&longitude=-180,-179&daily=temperature_2m_max,precipitation_sum&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
     )
     .await;
 
@@ -2898,7 +2898,7 @@ async fn explicit_timezone_applies_to_hour_selection_and_output() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00&timezone=Asia%2FShanghai",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00&timezone=Asia%2FShanghai",
     )
     .await;
 
@@ -2918,7 +2918,7 @@ async fn daily_weather_rejects_non_exact_features() {
 
     let (auto_status, auto_body) = request_json(
         app.clone(),
-        "/v1/forecast?latitude=-90&longitude=-180&daily=temperature_2m_max&start_date=2026-07-08&end_date=2026-07-08&timezone=auto",
+        "/v1/gfs?latitude=-90&longitude=-180&daily=temperature_2m_max&start_date=2026-07-08&end_date=2026-07-08&timezone=auto",
     )
     .await;
     assert_eq!(auto_status, StatusCode::BAD_REQUEST);
@@ -2929,7 +2929,7 @@ async fn daily_weather_rejects_non_exact_features() {
 
     let (sunrise_status, sunrise_body) = request_json(
         app,
-        "/v1/forecast?latitude=-90&longitude=-180&daily=sunrise&start_date=2026-07-08&end_date=2026-07-08",
+        "/v1/gfs?latitude=-90&longitude=-180&daily=sunrise&start_date=2026-07-08&end_date=2026-07-08",
     )
     .await;
     assert_eq!(sunrise_status, StatusCode::BAD_REQUEST);

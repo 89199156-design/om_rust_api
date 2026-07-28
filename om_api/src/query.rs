@@ -327,12 +327,55 @@ pub fn parse_csv_f64(value: &str, name: &str) -> Result<Vec<f64>> {
 
 pub fn parse_variables(value: Option<&str>) -> Vec<String> {
     value
-        .unwrap_or("temperature_2m")
+        .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn requested_variables(query: &PointQuery) -> (Vec<String>, Vec<String>) {
+    (
+        parse_variables(query.hourly.as_deref()),
+        parse_variables(query.daily.as_deref()),
+    )
+}
+
+pub fn validate_explicit_variables(query: &PointQuery) -> Result<()> {
+    let (hourly, daily) = requested_variables(query);
+    if hourly.is_empty() && daily.is_empty() {
+        bail!("at least one hourly or daily variable must be specified");
+    }
+    Ok(())
+}
+
+pub fn validate_gfs_query(query: &PointQuery) -> Result<()> {
+    validate_explicit_variables(query)?;
+    let (hourly, daily) = requested_variables(query);
+    if hourly.iter().any(|variable| is_air_quality_variable(variable))
+        || daily
+            .iter()
+            .any(|variable| is_chinese_air_quality_daily_variable(variable))
+    {
+        bail!("CAMS variables must be requested from /v1/cams");
+    }
+    Ok(())
+}
+
+pub fn validate_cams_query(query: &PointQuery) -> Result<()> {
+    validate_explicit_variables(query)?;
+    let (hourly, daily) = requested_variables(query);
+    if hourly
+        .iter()
+        .any(|variable| !is_air_quality_variable(variable))
+        || daily
+            .iter()
+            .any(|variable| !is_chinese_air_quality_daily_variable(variable))
+    {
+        bail!("only CAMS air-quality and aerosol variables are available from /v1/cams");
+    }
+    Ok(())
 }
 
 const PUBLIC_PRESSURE_LEVELS: &[u16] = &[
@@ -884,6 +927,9 @@ fn forecast_for_query_for_model(
     } else {
         parse_variables(query.hourly.as_deref())
     };
+    if variables.is_empty() && daily_variables.is_empty() {
+        bail!("at least one hourly or daily variable must be specified");
+    }
     validate_public_hourly_variables(&variables)?;
     if !daily_variables
         .iter()
