@@ -21,6 +21,7 @@ from .coverage import (
     build_complete_run_coverage_plan,
     build_product_coverage_plan,
     build_run_forecast_hour_coverage_plan,
+    build_run_native_forecast_hour_coverage_plan,
     required_start_for_anchors,
 )
 from .locking import file_lock
@@ -77,7 +78,12 @@ GFS_PARTIAL_RUN_RETENTION = 3
 GFS_PARTIAL_FORECAST_HOUR_END = 5
 GFS_TOTAL_RELEASE_RETENTION = GFS_COMPLETE_RUN_RETENTION + GFS_PARTIAL_RUN_RETENTION
 CAMS_COMPLETE_RUN_RETENTION = 3
-ECMWF_COMPLETE_RUN_RETENTION = 3
+ECMWF_COMPLETE_RUN_RETENTION = GFS_COMPLETE_RUN_RETENTION
+ECMWF_PARTIAL_RUN_RETENTION = GFS_PARTIAL_RUN_RETENTION
+ECMWF_PARTIAL_FORECAST_HOUR_END = 6
+ECMWF_TOTAL_RELEASE_RETENTION = (
+    ECMWF_COMPLETE_RUN_RETENTION + ECMWF_PARTIAL_RUN_RETENTION
+)
 
 APP_LOG_RETENTION_DAYS = 45
 APP_LOG_MAX_BYTES = 4 * 1024 * 1024
@@ -89,7 +95,7 @@ def _effective_group_retention(group: str, requested: int) -> int:
     if group == "cams":
         return max(requested, CAMS_COMPLETE_RUN_RETENTION)
     if group == "ecmwf":
-        return max(requested, ECMWF_COMPLETE_RUN_RETENTION)
+        return max(requested, ECMWF_TOTAL_RELEASE_RETENTION)
     return requested
 
 
@@ -2300,9 +2306,9 @@ def _discover_recent_ecmwf_retention_plans(
     *,
     now_utc: datetime,
     bucket_url: str,
-    count: int = ECMWF_COMPLETE_RUN_RETENTION,
+    count: int = ECMWF_TOTAL_RELEASE_RETENTION,
 ) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
-    """Discover recent ECMWF releases with each short run stitched to a long tail."""
+    """Discover two full ECMWF releases followed by three short history releases."""
     if count < 1:
         raise ValueError("ECMWF retention count must be positive")
     latest = load_openmeteo_spatial_latest(
@@ -2332,12 +2338,24 @@ def _discover_recent_ecmwf_retention_plans(
             and catalog.completed
             and catalog.reference_time_utc == candidate
         ):
-            plan_data = _build_product_plan(
-                product,
-                now_utc=now_utc,
-                bucket_url=bucket_url,
-                reference_time_utc=candidate,
-            )
+            if len(discovered) < ECMWF_COMPLETE_RUN_RETENTION:
+                plan_data = _build_product_plan(
+                    product,
+                    now_utc=now_utc,
+                    bucket_url=bucket_url,
+                    reference_time_utc=candidate,
+                )
+            else:
+                run = om_run_from_spatial_catalog(product.name, catalog)
+                plan_data = (
+                    catalog,
+                    [run],
+                    build_run_native_forecast_hour_coverage_plan(
+                        product,
+                        run,
+                        forecast_hour_end=ECMWF_PARTIAL_FORECAST_HOUR_END,
+                    ),
+                )
             run_id = candidate.strftime("%Y%m%d%H")
             discovered.append((run_id, {product.name: plan_data}))
             if len(discovered) == count:
@@ -2354,10 +2372,10 @@ def _reconcile_ecmwf_retention_window(
 ) -> int:
     if not args.config:
         parser.error("--config is required with --download-openmeteo-group")
-    if args.retain_complete_releases != ECMWF_COMPLETE_RUN_RETENTION:
+    if args.retain_complete_releases != ECMWF_TOTAL_RELEASE_RETENTION:
         parser.error(
             "ECMWF requires --retain-complete-releases "
-            f"{ECMWF_COMPLETE_RUN_RETENTION}"
+            f"{ECMWF_TOTAL_RELEASE_RETENTION}"
         )
 
     config = load_models(Path(args.config))
@@ -2379,7 +2397,7 @@ def _reconcile_ecmwf_retention_window(
     pre_pruned_source_paths = prune_expired_group_releases(
         source_root,
         "ecmwf",
-        retain_complete_releases=ECMWF_COMPLETE_RUN_RETENTION,
+        retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
         preserve_current=True,
     )
     pre_pruned_raw_paths: list[str] = []
@@ -2387,7 +2405,7 @@ def _reconcile_ecmwf_retention_window(
         pre_pruned_raw_paths = prune_expired_group_releases(
             api_root,
             "ecmwf",
-            retain_complete_releases=ECMWF_COMPLETE_RUN_RETENTION,
+            retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
             preserve_current=True,
         )
 
@@ -2464,7 +2482,7 @@ def _reconcile_ecmwf_retention_window(
     pruned = prune_expired_group_releases(
         api_root,
         "ecmwf",
-        retain_complete_releases=ECMWF_COMPLETE_RUN_RETENTION,
+        retain_complete_releases=ECMWF_TOTAL_RELEASE_RETENTION,
     )
     print(
         json.dumps(
@@ -2474,10 +2492,12 @@ def _reconcile_ecmwf_retention_window(
                 "reason": (
                     None
                     if missing_runs
-                    else "three most recent stitched releases already retained"
+                    else "target retention window already complete"
                 ),
                 "latest_complete_run": newest_run,
-                "retained_complete_runs": target_runs,
+                "retained_complete_runs": target_runs[:ECMWF_COMPLETE_RUN_RETENTION],
+                "retained_partial_runs": target_runs[ECMWF_COMPLETE_RUN_RETENTION:],
+                "partial_forecast_hour_end": ECMWF_PARTIAL_FORECAST_HOUR_END,
                 "downloaded_missing_runs": list(reversed(missing_runs)),
                 "download_results": download_results,
                 "retain_results": retain_results,
@@ -2907,7 +2927,12 @@ def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.Argumen
     if args.download_openmeteo_group == "gfs":
         return _reconcile_gfs_retention_window(args, parser)
     if args.download_openmeteo_group == "ecmwf" and not args.reference_time:
-        return _reconcile_ecmwf_retention_window(args, parser)
+        effective_args = copy(args)
+        effective_args.retain_complete_releases = _effective_group_retention(
+            "ecmwf",
+            args.retain_complete_releases,
+        )
+        return _reconcile_ecmwf_retention_window(effective_args, parser)
     if args.download_openmeteo_group != "cams":
         return _download_openmeteo_group_release(args, parser)
     effective_args = args

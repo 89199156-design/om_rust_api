@@ -19,6 +19,7 @@ class DownloadTaskGateTests(unittest.TestCase):
         self.assertIn("--download-openmeteo-group ecmwf", script)
         self.assertIn("--output /data/om_downloader", script)
         self.assertIn("--publish-openmeteo-group-to /data/om_raw", script)
+        self.assertIn("--retain-complete-releases 5", script)
         self.assertNotIn("--reference-time", script)
         self.assertNotIn("OM_ECMWF_REFERENCE_TIME", script)
         payload = _cronjob_values("now", "OM_ECMWF_DOWNLOAD", "spec", script, 1)

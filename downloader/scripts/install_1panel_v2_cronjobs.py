@@ -26,6 +26,11 @@ GFS_MATERIALIZER = APP_DIR / "scripts" / "materialize_openmeteo_gfs.sh"
 DOWNLOAD_ROOT = Path("/data/om_downloader")
 STRICT_DATA_ROOT = Path("/data")
 DATA_MINIMUM_FREE_BYTES = 10 * 1024 * 1024 * 1024
+ECMWF_COMPLETE_RUN_RETENTION = 2
+ECMWF_PARTIAL_RUN_RETENTION = 3
+ECMWF_TOTAL_RELEASE_RETENTION = (
+    ECMWF_COMPLETE_RUN_RETENTION + ECMWF_PARTIAL_RUN_RETENTION
+)
 LOG_DIR = APP_DIR / "logs"
 PRODUCTS = (
     "gfs013_surface",
@@ -101,6 +106,11 @@ def download_group_script(
         publish_args = [f"--publish-openmeteo-group-to {shell_path(publish_root)} "]
         if group == "gfs":
             publish_args.append("--defer-openmeteo-gfs-activation ")
+    retention_args = (
+        f"--retain-complete-releases {ECMWF_TOTAL_RELEASE_RETENTION} "
+        if group == "ecmwf"
+        else ""
+    )
     command = (
         "/usr/bin/python3 -m om_downloader.cli "
         f"--download-openmeteo-group {group} "
@@ -117,6 +127,7 @@ def download_group_script(
         "--object-range-max-bytes 8388608 "
         f"--output {shell_path(DOWNLOAD_ROOT)} "
         + "".join(publish_args)
+        + retention_args
         + '--now "$(date -u +%Y-%m-%dT%H:00:00Z)"'
     )
     return "\n".join(

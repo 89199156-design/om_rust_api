@@ -12,7 +12,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from om_downloader import cli as cli_module
-from om_downloader.coverage import build_product_coverage_plan
+from om_downloader.coverage import (
+    build_product_coverage_plan,
+    build_run_native_forecast_hour_coverage_plan,
+)
 from om_downloader.metadata import OmRun
 from om_downloader.model_config import Bounds, ProductConfig, load_models
 from om_downloader.om_catalog import (
@@ -240,7 +243,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
         self.assertEqual(forwarded.download_openmeteo_group, "ecmwf")
         self.assertEqual(forwarded.reference_time, "2026-07-23T00:00:00Z")
 
-    def test_ecmwf_production_group_dispatches_three_release_reconciliation(self):
+    def test_ecmwf_production_group_dispatches_gfs_batch_window_reconciliation(self):
         with (
             patch.object(
                 cli_module,
@@ -270,13 +273,27 @@ class EcmwfDownloaderTests(unittest.TestCase):
         self.assertIsNone(forwarded.reference_time)
         self.assertEqual(
             forwarded.retain_complete_releases,
-            cli_module.ECMWF_COMPLETE_RUN_RETENTION,
+            cli_module.ECMWF_TOTAL_RELEASE_RETENTION,
         )
-        self.assertEqual(cli_module.ECMWF_COMPLETE_RUN_RETENTION, 3)
-        self.assertEqual(cli_module._effective_group_retention("ecmwf", 1), 3)
+        self.assertEqual(
+            cli_module.ECMWF_COMPLETE_RUN_RETENTION,
+            cli_module.GFS_COMPLETE_RUN_RETENTION,
+        )
+        self.assertEqual(
+            cli_module.ECMWF_PARTIAL_RUN_RETENTION,
+            cli_module.GFS_PARTIAL_RUN_RETENTION,
+        )
+        self.assertEqual(cli_module.ECMWF_TOTAL_RELEASE_RETENTION, 5)
+        self.assertEqual(cli_module._effective_group_retention("ecmwf", 1), 5)
 
-    def test_ecmwf_reconciliation_backfills_three_releases_before_activation(self):
-        runs = ("2026072718", "2026072712", "2026072706")
+    def test_ecmwf_reconciliation_backfills_two_full_and_three_short_releases(self):
+        runs = (
+            "2026072718",
+            "2026072712",
+            "2026072706",
+            "2026072700",
+            "2026072618",
+        )
         plans = [
             (run, {"ecmwf_ifs025": (None, [], SimpleNamespace(latest_complete_run=run))})
             for run in runs
@@ -292,9 +309,10 @@ class EcmwfDownloaderTests(unittest.TestCase):
             return 0
 
         with tempfile.TemporaryDirectory() as directory:
+            output = StringIO()
             args = SimpleNamespace(
                 config="config/models.json",
-                retain_complete_releases=3,
+                retain_complete_releases=5,
                 now="2026-07-28T03:00:00Z",
                 openmeteo_bucket_url="https://example.test",
                 output=directory,
@@ -348,7 +366,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
                     "activate_group_release",
                     return_value={"status": "activated"},
                 ) as activate,
-                redirect_stdout(StringIO()),
+                redirect_stdout(output),
             ):
                 result = cli_module._reconcile_ecmwf_retention_window(
                     args,
@@ -356,15 +374,40 @@ class EcmwfDownloaderTests(unittest.TestCase):
                 )
 
         self.assertEqual(result, 0)
-        self.assertEqual(download.call_count, 3)
+        self.assertEqual(download.call_count, 5)
         downloaded_runs = [
             call.kwargs["plan_by_product_override"]["ecmwf_ifs025"][2].latest_complete_run
             for call in download.call_args_list
         ]
         self.assertEqual(downloaded_runs, list(reversed(runs)))
-        self.assertEqual(retain.call_count, 3)
+        self.assertEqual(retain.call_count, 5)
         activate.assert_called_once()
         self.assertEqual(activate.call_args.args[2], retained[runs[0]])
+        report = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(report["retained_complete_runs"], list(runs[:2]))
+        self.assertEqual(report["retained_partial_runs"], list(runs[2:]))
+        self.assertEqual(report["partial_forecast_hour_end"], 6)
+
+    def test_ecmwf_short_release_keeps_native_frames_through_six_hours(self):
+        base = datetime(2026, 7, 27, 6, tzinfo=UTC)
+        run = OmRun(
+            run_id="2026072706",
+            base_time_utc=base,
+            max_forecast_hour=144,
+            variables=(),
+            pressure_levels_hpa=(),
+            valid_times_utc=_valid_times(base, short=True),
+        )
+        plan = build_run_native_forecast_hour_coverage_plan(
+            _product(),
+            run,
+            forecast_hour_end=cli_module.ECMWF_PARTIAL_FORECAST_HOUR_END,
+        )
+        self.assertEqual(
+            [slot.forecast_hour for slot in plan.slots],
+            [0, 3, 6],
+        )
+        self.assertEqual(plan.required_end_utc, base + timedelta(hours=6))
 
     def test_ecmwf_grid_matches_public_ifs025_om_dimensions(self):
         grid = grid_spec_for_openmeteo_model("ecmwf_ifs025", dimensions=(721, 1440))

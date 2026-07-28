@@ -58,10 +58,13 @@ impl OmDataSnapshot {
             )?;
         }
         load_group_products(&data_root, "ecmwf", ECMWF_PRODUCTS, &mut products)?;
-        // An ECMWF coverage already contains the explicitly selected short
-        // run and preceding long-run tail. Older group releases must not be
-        // consulted: doing so can silently fill fields absent from the frozen
-        // free-model run with values from a different model cycle.
+        load_group_release_history(
+            &data_root,
+            "ecmwf",
+            ECMWF_PRODUCTS,
+            &products,
+            &mut historical_products,
+        )?;
         Ok(Self {
             data_root,
             products,

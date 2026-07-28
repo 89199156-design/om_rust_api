@@ -1,5 +1,7 @@
 use crate::dem::read_dem90;
-use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
+use crate::manifest::{
+    ArrayMetadata, BundleEntry, CoveragePlanEntry, EntryKey, ProductSnapshot,
+};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
@@ -4986,19 +4988,15 @@ fn read_direct_grid_series(
     };
     let products = snapshot.product_snapshots(product_name);
     if product_name == "ecmwf_ifs025" {
-        let product = products
-            .first()
-            .context("ECMWF IFS025 product snapshot is not available")?;
-        let mut values = read_ecmwf_product_grid_series(
-            product,
+        let mut values = read_ecmwf_window_grid_series(
+            &products,
             decoder,
             variable,
             &raw_variable,
             times,
             latitudes,
             longitudes,
-        )?
-        .with_context(|| format!("variable/time is not available: {raw_variable}"))?;
+        )?;
         for frame in &mut values {
             for value in frame {
                 *value = apply_elevation_correction(product_name, variable, *value);
@@ -6103,6 +6101,146 @@ fn read_ecmwf_product_grid_series(
         }
     }
     Ok(Some(output))
+}
+
+fn ecmwf_coverage_bounds(
+    coverage_plan: &[CoveragePlanEntry],
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let first = coverage_plan
+        .iter()
+        .map(|entry| entry.valid_time_utc)
+        .min();
+    let last = coverage_plan
+        .iter()
+        .map(|entry| entry.valid_time_utc)
+        .max();
+    first.zip(last)
+}
+
+fn ecmwf_snapshot_is_full(product: &ProductSnapshot) -> bool {
+    ecmwf_coverage_is_full(&product.manifest.coverage_plan)
+}
+
+fn ecmwf_coverage_is_full(coverage_plan: &[CoveragePlanEntry]) -> bool {
+    ecmwf_coverage_bounds(coverage_plan)
+        .is_some_and(|(first, last)| last - first > Duration::hours(6))
+}
+
+fn ecmwf_snapshot_covers_time(product: &ProductSnapshot, time: DateTime<Utc>) -> bool {
+    ecmwf_coverage_bounds(&product.manifest.coverage_plan)
+        .is_some_and(|(first, last)| time >= first && time <= last)
+}
+
+fn fill_nan_from_fallback(values: &mut [f32], fallback: &[f32]) {
+    for (value, fallback_value) in values.iter_mut().zip(fallback) {
+        if value.is_nan() && fallback_value.is_finite() {
+            *value = *fallback_value;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_ecmwf_window_grid_series(
+    products: &[Arc<ProductSnapshot>],
+    decoder: &OfficialDecoder,
+    variable: &str,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<Vec<f32>>> {
+    if products.is_empty() {
+        bail!("ECMWF IFS025 product snapshot is not available");
+    }
+    let grid_len = latitudes.len() * longitudes.len();
+    let primary = times
+        .iter()
+        .map(|time| {
+            products
+                .iter()
+                .position(|product| ecmwf_snapshot_covers_time(product, *time))
+        })
+        .collect::<Vec<_>>();
+    let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
+
+    for product_index in 0..products.len() {
+        let requested = primary
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| (*selected == Some(product_index)).then_some(index))
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            continue;
+        }
+        let requested_times = requested
+            .iter()
+            .map(|index| times[*index])
+            .collect::<Vec<_>>();
+        let frames = read_ecmwf_product_grid_series(
+            &products[product_index],
+            decoder,
+            variable,
+            raw_variable,
+            &requested_times,
+            latitudes,
+            longitudes,
+        )?
+        .with_context(|| format!("variable/time is not available: {raw_variable}"))?;
+        for (index, frame) in requested.into_iter().zip(frames) {
+            output[index] = frame;
+        }
+    }
+
+    let full_products = products
+        .iter()
+        .enumerate()
+        .filter(|(_, product)| ecmwf_snapshot_is_full(product))
+        .take(2)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let fallback_product = primary
+        .iter()
+        .enumerate()
+        .map(|(time_index, selected)| {
+            if !output[time_index].iter().any(|value| value.is_nan()) {
+                return None;
+            }
+            full_products.iter().copied().find(|candidate| {
+                Some(*candidate) != *selected
+                    && ecmwf_snapshot_covers_time(&products[*candidate], times[time_index])
+            })
+        })
+        .collect::<Vec<_>>();
+    for product_index in full_products {
+        let requested = fallback_product
+            .iter()
+            .enumerate()
+            .filter_map(|(index, selected)| (*selected == Some(product_index)).then_some(index))
+            .collect::<Vec<_>>();
+        if requested.is_empty() {
+            continue;
+        }
+        let requested_times = requested
+            .iter()
+            .map(|index| times[*index])
+            .collect::<Vec<_>>();
+        let Some(frames) = read_ecmwf_product_grid_series(
+            &products[product_index],
+            decoder,
+            variable,
+            raw_variable,
+            &requested_times,
+            latitudes,
+            longitudes,
+        )?
+        else {
+            continue;
+        };
+        for (index, fallback_frame) in requested.into_iter().zip(frames) {
+            fill_nan_from_fallback(&mut output[index], &fallback_frame);
+        }
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11262,6 +11400,60 @@ mod output_tests {
         let wrongly_hourly = backwards_sunshine_duration(200.0, daily[4], 3_600, 31.25, 121.5);
         assert_ne!(daily_sunshine.to_bits(), wrongly_hourly.to_bits());
         assert!(daily_sunshine <= 10_800.0);
+    }
+
+    #[test]
+    fn ecmwf_short_window_covers_one_six_hour_run_interval() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 27, 6, 0, 0).unwrap();
+        let coverage = [0, 3, 6]
+            .into_iter()
+            .map(|forecast_hour| CoveragePlanEntry {
+                valid_time_utc: start + Duration::hours(forecast_hour),
+                source_run: "2026072706".to_string(),
+                forecast_hour,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ecmwf_coverage_bounds(&coverage),
+            Some((start, start + Duration::hours(6)))
+        );
+        assert!(!ecmwf_coverage_is_full(&coverage));
+        assert!(start + Duration::hours(5) >= coverage[0].valid_time_utc);
+    }
+
+    #[test]
+    fn ecmwf_nan_fallback_is_one_way_and_keeps_finite_primary_values() {
+        let mut primary = vec![25.0, f32::NAN, f32::NAN];
+        let previous_complete = vec![30.0, 26.0, f32::NAN];
+
+        fill_nan_from_fallback(&mut primary, &previous_complete);
+
+        assert_eq!(primary[0], 25.0);
+        assert_eq!(primary[1], 26.0);
+        assert!(primary[2].is_nan());
+    }
+
+    #[test]
+    fn ecmwf_daily_sum_requires_front_hours_to_be_filled_before_aggregation() {
+        let mut day = vec![f32::NAN, f32::NAN, 0.3, 0.6, 0.0, 0.9, 0.0, 1.2];
+        assert!(
+            aggregate_daily_weather_values(
+                DailyWeatherAggregation::Sum("precipitation"),
+                &day,
+                3,
+            )
+            .is_nan()
+        );
+
+        fill_nan_from_fallback(&mut day[..2], &[0.0, 0.3]);
+
+        let total = aggregate_daily_weather_values(
+            DailyWeatherAggregation::Sum("precipitation"),
+            &day,
+            3,
+        );
+        assert!((total - 3.3).abs() < 1e-6);
     }
 
     #[test]
