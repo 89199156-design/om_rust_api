@@ -159,6 +159,8 @@ def _read_range_once(url: str, byte_range: ByteRange, timeout: int) -> bytes:
     key, connection = _thread_connection(url, timeout)
     deadline_expired = threading.Event()
     response_holder: list[Any] = []
+    partial_payload: bytes | None = None
+    status: int | None = None
 
     def abort_request() -> None:
         deadline_expired.set()
@@ -188,7 +190,14 @@ def _read_range_once(url: str, byte_range: ByteRange, timeout: int) -> bytes:
         response_holder.append(response)
         try:
             status = int(response.status)
-            payload = response.read()
+            try:
+                payload = response.read()
+            except IncompleteRead as exc:
+                partial_payload = bytes(exc.partial)
+                _close_thread_connection(key)
+                if status != 206 or not partial_payload:
+                    raise
+                payload = partial_payload
         finally:
             if response.getheader("Connection", "").lower() == "close":
                 _close_thread_connection(key)
@@ -209,7 +218,7 @@ def _read_range_once(url: str, byte_range: ByteRange, timeout: int) -> bytes:
     finally:
         deadline.cancel()
 
-    if deadline_expired.is_set():
+    if deadline_expired.is_set() and partial_payload is None:
         _close_thread_connection(key)
         raise TimeoutError(
             f"range request exceeded {timeout}s hard deadline: {byte_range.as_header()}"
@@ -225,10 +234,25 @@ def _read_range_once(url: str, byte_range: ByteRange, timeout: int) -> bytes:
 
 def _read_range(url: str, byte_range: ByteRange, timeout: int) -> bytes:
     attempts = len(READ_RANGE_RETRY_DELAYS) + 1
+    payload_parts: list[bytes] = []
+    remaining = byte_range
     for attempt in range(attempts):
         try:
-            payload = _read_range_once(url, byte_range, timeout)
-            break
+            payload = _read_range_once(url, remaining, timeout)
+            if len(payload) > remaining.length:
+                raise ValueError(
+                    f"range request returned {len(payload)} bytes, expected at most "
+                    f"{remaining.length}"
+                )
+            if payload:
+                payload_parts.append(payload)
+                if len(payload) == remaining.length:
+                    return b"".join(payload_parts)
+                remaining = ByteRange(remaining.start + len(payload), remaining.end)
+            elif attempt == attempts - 1:
+                raise ValueError(
+                    f"range request returned 0 bytes for {remaining.as_header()}"
+                )
         except _RetryableRangeStatus as exc:
             if attempt == attempts - 1:
                 raise ValueError(f"range request failed with HTTP {exc.status}") from exc
@@ -238,15 +262,16 @@ def _read_range(url: str, byte_range: ByteRange, timeout: int) -> bytes:
         except TRANSIENT_CONNECTION_ERRORS as exc:
             if attempt == attempts - 1:
                 raise ValueError(
-                    f"range request failed after {attempts} attempts for {byte_range.as_header()}"
+                    f"range request failed after {attempts} attempts for {remaining.as_header()}"
                 ) from exc
-        time.sleep(READ_RANGE_RETRY_DELAYS[attempt])
+        if attempt < attempts - 1:
+            time.sleep(READ_RANGE_RETRY_DELAYS[attempt])
 
-    if len(payload) != byte_range.length:
-        raise ValueError(
-            f"range request returned {len(payload)} bytes, expected {byte_range.length}"
-        )
-    return payload
+    downloaded = sum(len(part) for part in payload_parts)
+    raise ValueError(
+        f"range request returned {downloaded} bytes, expected {byte_range.length} "
+        f"after {attempts} attempts"
+    )
 
 
 def fetch_byte_range(url: str, start: int, end: int, *, timeout: int = 30) -> bytes:

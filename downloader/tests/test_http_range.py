@@ -2,6 +2,7 @@ import tempfile
 import time
 import threading
 import unittest
+import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -21,6 +22,8 @@ class _RangeHandler(BaseHTTPRequestHandler):
     fail_once_ranges: set[str] = set()
     failed_ranges: set[str] = set()
     fail_always_ranges: set[str] = set()
+    truncate_once_ranges: dict[str, int] = {}
+    truncated_ranges: set[str] = set()
     head_failures_remaining = 0
     head_count = 0
     active_requests = 0
@@ -83,6 +86,17 @@ class _RangeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Content-Range", f"bytes {start}-{end}/{len(self.content)}")
         self.end_headers()
+        truncate_at = self.truncate_once_ranges.get(range_header)
+        if truncate_at is not None and range_header not in self.truncated_ranges:
+            self.truncated_ranges.add(range_header)
+            self.wfile.write(payload[:truncate_at])
+            self.wfile.flush()
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            return
         self.wfile.write(payload)
 
     def assertEqual(self, left, right):
@@ -97,6 +111,8 @@ class HttpRangeTests(unittest.TestCase):
         _RangeHandler.fail_once_ranges = set()
         _RangeHandler.failed_ranges = set()
         _RangeHandler.fail_always_ranges = set()
+        _RangeHandler.truncate_once_ranges = {}
+        _RangeHandler.truncated_ranges = set()
         _RangeHandler.head_failures_remaining = 0
         _RangeHandler.head_count = 0
         _RangeHandler.active_requests = 0
@@ -174,6 +190,21 @@ class HttpRangeTests(unittest.TestCase):
             self.assertEqual(output.read_bytes(), bytes([2, 3, 4, 5]))
             self.assertEqual(_RangeHandler.range_headers, ["bytes=2-5", "bytes=2-5"])
             self.assertEqual(record["downloaded_bytes"], 4)
+
+    def test_download_byte_ranges_resumes_after_incomplete_response(self):
+        _RangeHandler.truncate_once_ranges = {"bytes=2-13": 5}
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "partial.om"
+            record = download_byte_ranges(
+                self.url,
+                [ByteRange(2, 13)],
+                output,
+                relative_to=Path(tmp),
+            )
+
+            self.assertEqual(output.read_bytes(), bytes(range(2, 14)))
+            self.assertEqual(_RangeHandler.range_headers, ["bytes=2-13", "bytes=7-13"])
+            self.assertEqual(record["downloaded_bytes"], 12)
 
     def test_download_byte_ranges_keeps_existing_file_when_later_range_fails(self):
         _RangeHandler.fail_always_ranges = {"bytes=10-13"}
