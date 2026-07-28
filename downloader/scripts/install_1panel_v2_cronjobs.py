@@ -174,7 +174,11 @@ def download_group_script(
             f"  export OM_TURBOPFOR_LIB={shell_path(NATIVE_LIB)}",
             f"  export OM_STRICT_DATA_ROOT={shell_path(STRICT_DATA_ROOT)}",
             f"  export OM_DATA_MIN_FREE_BYTES={DATA_MINIMUM_FREE_BYTES}",
-            f"  {command}",
+            (
+                f"  {command} || return $?"
+                if group == "gfs" and publish_root is not None
+                else f"  {command}"
+            ),
             *(
                 [
                     f"  /usr/bin/env bash {shell_path(GFS_MATERIALIZER)} "

@@ -106,6 +106,10 @@ class InstallScriptTests(unittest.TestCase):
             "materialize_openmeteo_gfs.sh --raw-root /tmp/raw",
             publisher_scripts["OM_GFS_DOWNLOAD"],
         )
+        self.assertIn(
+            '--now "$(date -u +%Y-%m-%dT%H:00:00Z)" || return $?',
+            publisher_scripts["OM_GFS_DOWNLOAD"],
+        )
         self.assertNotIn(
             "materialize_openmeteo_gfs.sh",
             publisher_scripts["OM_CAMS_DOWNLOAD"],
