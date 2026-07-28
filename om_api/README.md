@@ -16,6 +16,11 @@ Open-Meteo `.omranges` bundles from `/data/om_raw` and returns point JSON
 directly. Clients do not fetch `latest.json` or any manifest before requesting
 point data.
 
+Point weather responses include `model_run` (for example `2026072800`). The
+value is the active OM group batch loaded atomically with the point snapshot;
+it is not derived from a WebP manifest and does not expose retained-release
+composition.
+
 Official logic baseline:
 
 - Open-Meteo upstream: `4efb9c49fb4a3718ed385fb22580d2e0fc56bdb2`

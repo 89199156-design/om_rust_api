@@ -107,6 +107,26 @@ class InstallScriptTests(unittest.TestCase):
             publisher_scripts["OM_GFS_DOWNLOAD"],
         )
         self.assertIn(
+            "weather_om_webp/scripts/run_scope.sh gfs",
+            publisher_scripts["OM_GFS_DOWNLOAD"],
+        )
+        self.assertIn(
+            "weather_om_webp/scripts/run_scope.sh cams",
+            publisher_scripts["OM_CAMS_DOWNLOAD"],
+        )
+        self.assertIn(
+            "weather_om_webp/scripts/run_scope.sh ecmwf_ifs025",
+            publisher_scripts["OM_ECMWF_DOWNLOAD"],
+        )
+        self.assertLess(
+            publisher_scripts["OM_GFS_DOWNLOAD"].index(
+                "materialize_openmeteo_gfs.sh --raw-root /tmp/raw"
+            ),
+            publisher_scripts["OM_GFS_DOWNLOAD"].index(
+                "weather_om_webp/scripts/run_scope.sh gfs"
+            ),
+        )
+        self.assertIn(
             '--now "$(date -u +%Y-%m-%dT%H:00:00Z)" || return $?',
             publisher_scripts["OM_GFS_DOWNLOAD"],
         )
@@ -117,6 +137,7 @@ class InstallScriptTests(unittest.TestCase):
         for _name, _spec, script in downloader_tasks():
             self.assertNotIn("materialize_openmeteo_gfs.sh", script)
             self.assertNotIn("--defer-openmeteo-gfs-activation", script)
+            self.assertNotIn("weather_om_webp/scripts/run_scope.sh", script)
 
         removed_names = (
             "OM_BUILD_GFS013_SURFACE",

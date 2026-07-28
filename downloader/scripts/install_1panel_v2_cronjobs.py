@@ -23,6 +23,8 @@ CONFIG = APP_DIR / "config" / "models.json"
 PYTHON = Path("/usr/bin/python3")
 PROGRESS_REPORTER = APP_DIR / "scripts" / "task_progress_reporter.py"
 GFS_MATERIALIZER = APP_DIR / "scripts" / "materialize_openmeteo_gfs.sh"
+WEBP_APP_DIR = Path("/opt/1panel/apps/weather_om_webp")
+WEBP_RUNNER = WEBP_APP_DIR / "scripts" / "run_scope.sh"
 DOWNLOAD_ROOT = Path("/data/om_downloader")
 STRICT_DATA_ROOT = Path("/data")
 DATA_MINIMUM_FREE_BYTES = 10 * 1024 * 1024 * 1024
@@ -48,6 +50,11 @@ TASK_BY_GROUP = {
     "gfs": "OM_GFS_DOWNLOAD",
     "cams": "OM_CAMS_DOWNLOAD",
     "ecmwf": "OM_ECMWF_DOWNLOAD",
+}
+WEBP_SCOPE_BY_GROUP = {
+    "gfs": "gfs",
+    "cams": "cams",
+    "ecmwf": "ecmwf_ifs025",
 }
 REMOVED_PLACEHOLDER_TASKS = (
     "OM_BUILD_GFS013_SURFACE",
@@ -185,6 +192,14 @@ def download_group_script(
                     f"--raw-root {shell_path(publish_root)}"
                 ]
                 if group == "gfs" and publish_root is not None
+                else []
+            ),
+            *(
+                [
+                    f"  /usr/bin/env bash {shell_path(WEBP_RUNNER)} "
+                    f"{WEBP_SCOPE_BY_GROUP[group]}"
+                ]
+                if publish_root is not None
                 else []
             ),
             "}",

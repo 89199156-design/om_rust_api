@@ -33,17 +33,13 @@ pool; production defaults to two workers to remain suitable for lightweight
 servers. `OM_WEBP_WORKERS` can override the limit; `--workers 0` deliberately
 uses every available CPU and is reserved for isolated/offline rendering.
 
-```bash
-/usr/bin/env bash /opt/1panel/apps/weather_om_webp/scripts/run_scope.sh gfs
-/usr/bin/env bash /opt/1panel/apps/weather_om_webp/scripts/run_scope.sh cams
-```
-
-The native 1Panel jobs `OM_GFS_WEBP_BUILD` and `OM_CAMS_WEBP_BUILD` are
-scheduled only by 1Panel. Their panel scripts query `agent.db` before starting;
-an older active instance or any running OM download/WebP peer exits
-successfully without creating a separate lock. They compare the source
-`release_id` with the local completion marker, so unchanged releases also exit
-immediately without loading the OM snapshot.
+The production download job for each model invokes `run_scope.sh` only after
+that same job has downloaded, generated, and published its OM point release.
+WebP is therefore the final stage of one continuous production pipeline, not a
+separate polling job. The legacy 1Panel rows `OM_GFS_WEBP_BUILD`,
+`OM_CAMS_WEBP_BUILD`, and `OM_ECMWF_WEBP_BUILD` remain disabled for operational
+history and cannot render independently. A download job is successful only
+after the WebP marker references the same immutable source `release_id`.
 
 Production binaries are built and installed from a clean Git worktree with:
 

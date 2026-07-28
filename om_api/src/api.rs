@@ -1,7 +1,7 @@
 use crate::official::OfficialDecoder;
 use crate::query::{
     ecmwf_public_hourly_variables, forecast_for_query, route_forecast, PointQuery, RouteQuery,
-    ECMWF_PUBLIC_DAILY_VARIABLES,
+    WeatherModel, ECMWF_PUBLIC_DAILY_VARIABLES,
 };
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{Context, Result};
@@ -113,6 +113,22 @@ impl AppState {
             .read()
             .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
         Ok(guard.snapshot.clone())
+    }
+
+    fn weather_snapshot(&self, model: WeatherModel) -> Result<(Arc<OmDataSnapshot>, String)> {
+        let guard = self
+            .cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
+        let identity = match model {
+            WeatherModel::Gfs => guard.identity.gfs_ready.as_ref(),
+            WeatherModel::EcmwfIfs025 => guard.identity.ecmwf_ready.as_ref(),
+        }
+        .context("weather OM group marker is unavailable")?;
+        if identity.status != "complete" || identity.latest_complete_run.is_empty() {
+            anyhow::bail!("weather OM group marker is not complete");
+        }
+        Ok((guard.snapshot.clone(), identity.latest_complete_run.clone()))
     }
 
     fn refresh_if_changed(&self) -> Result<bool> {
@@ -337,13 +353,15 @@ async fn forecast(
     State(state): State<AppState>,
     Query(query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let snapshot = state.snapshot()?;
+    let model = WeatherModel::parse(query.models.as_deref())?;
+    let (snapshot, model_run) = state.weather_snapshot(model)?;
     let decoder = state.decoder.clone();
-    let payload = tokio::task::spawn_blocking(move || {
+    let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
     })
     .await
     .context("forecast worker failed")??;
+    attach_model_run(&mut payload, &model_run)?;
     Ok(Json(payload))
 }
 
@@ -352,13 +370,14 @@ async fn ecmwf_forecast(
     Query(mut query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     query.models = Some("ecmwf_ifs025".to_string());
-    let snapshot = state.snapshot()?;
+    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
     let decoder = state.decoder.clone();
-    let payload = tokio::task::spawn_blocking(move || {
+    let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
     })
     .await
     .context("ECMWF forecast worker failed")??;
+    attach_model_run(&mut payload, &model_run)?;
     Ok(Json(payload))
 }
 
@@ -367,14 +386,38 @@ async fn ecmwf_forecast_post(
     Json(mut query): Json<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     query.models = Some("ecmwf_ifs025".to_string());
-    let snapshot = state.snapshot()?;
+    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
     let decoder = state.decoder.clone();
-    let payload = tokio::task::spawn_blocking(move || {
+    let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
     })
     .await
     .context("ECMWF POST forecast worker failed")??;
+    attach_model_run(&mut payload, &model_run)?;
     Ok(Json(payload))
+}
+
+fn attach_model_run(payload: &mut serde_json::Value, model_run: &str) -> Result<()> {
+    fn attach(response: &mut serde_json::Value, model_run: &str) -> Result<()> {
+        response
+            .as_object_mut()
+            .context("forecast response is not an object")?
+            .insert(
+                "model_run".to_string(),
+                serde_json::Value::String(model_run.to_string()),
+            );
+        Ok(())
+    }
+
+    match payload {
+        serde_json::Value::Array(responses) => {
+            for response in responses {
+                attach(response, model_run)?;
+            }
+            Ok(())
+        }
+        response => attach(response, model_run),
+    }
 }
 
 async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
@@ -533,7 +576,8 @@ mod tests {
         let error_text = error["error"].as_str().unwrap();
         assert!(
             error_text.contains("product is not available")
-                || error_text.contains("requires DEM/static grid selection data"),
+                || error_text.contains("requires DEM/static grid selection data")
+                || error_text.contains("weather OM group marker is unavailable"),
             "unexpected domain error after valid POST decode: {error_text}"
         );
     }

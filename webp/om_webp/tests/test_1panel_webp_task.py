@@ -29,16 +29,22 @@ class WebpTaskGateTests(unittest.TestCase):
         self.assertIn("default_workers=1", content)
         self.assertIn('workers="${OM_WEBP_WORKERS:-$default_workers}"', content)
 
-    def test_ecmwf_task_is_initially_disabled_and_uses_canonical_scope(self):
-        payload = values("now", "OM_ECMWF_WEBP_BUILD", "ecmwf_ifs025", 1)
-        self.assertEqual(payload["status"], "Disable")
-        self.assertIn("run_scope.sh ecmwf_ifs025", payload["script"])
+    def test_standalone_tasks_are_disabled_and_do_not_render(self):
+        for name, scope in (
+            ("OM_GFS_WEBP_BUILD", "gfs"),
+            ("OM_CAMS_WEBP_BUILD", "cams"),
+            ("OM_ECMWF_WEBP_BUILD", "ecmwf_ifs025"),
+        ):
+            payload = values("now", name, scope, 1)
+            self.assertEqual(payload["status"], "Disable")
+            self.assertIn("WebP由对应下载任务连续生成", payload["script"])
+            self.assertNotIn("run_scope.sh", payload["script"])
 
-    def test_existing_job_update_preserves_scheduler_runtime_fields(self):
+    def test_existing_job_update_forces_disabled_status(self):
         payload = existing_job_values(
             {"spec": "5 * * * *", "status": "Disable", "entry_ids": "1", "is_executing": 1}
         )
-        self.assertEqual(payload, {"spec": "5 * * * *"})
+        self.assertEqual(payload, {"spec": "5 * * * *", "status": "Disable"})
 
     def database(
         self,

@@ -1424,6 +1424,7 @@ async fn forecast_endpoint_returns_point_data_without_client_manifest() {
     assert_eq!(body["hourly"]["temperature_2m"][0], 12.5);
     assert_eq!(body["hourly"]["weather_code"][0], 0);
     assert_eq!(body["hourly"]["wind_speed_10m"][0], 5.0);
+    assert_eq!(body["model_run"], "2026070800");
 }
 
 #[tokio::test]
@@ -2010,6 +2011,7 @@ async fn forecast_uses_group_ready_coverage_instead_of_product_current() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["hourly"]["temperature_2m"][0], 12.5);
+    assert_eq!(body["model_run"], "2026070800");
 }
 
 #[tokio::test]
@@ -2877,6 +2879,7 @@ async fn daily_weather_supports_multiple_coordinates() {
     assert!(responses[0].get("location_id").is_none());
     assert_eq!(responses[1]["location_id"], serde_json::json!(1));
     for response in responses {
+        assert_eq!(response["model_run"], "2026070800");
         assert_eq!(
             response["daily"]["temperature_2m_max"],
             serde_json::json!([23.0])

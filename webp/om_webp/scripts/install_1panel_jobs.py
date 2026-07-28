@@ -7,7 +7,11 @@ from pathlib import Path
 
 AGENT_DB = Path("/opt/1panel/db/agent.db")
 APP_DIR = Path("/opt/1panel/apps/weather_om_webp")
-INITIAL_DISABLED_TASKS = {"OM_ECMWF_WEBP_BUILD"}
+DISABLED_STANDALONE_TASKS = {
+    "OM_GFS_WEBP_BUILD",
+    "OM_CAMS_WEBP_BUILD",
+    "OM_ECMWF_WEBP_BUILD",
+}
 
 
 def now_text() -> str:
@@ -37,13 +41,7 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
-            f"TASK_STATE=$(/usr/bin/python3 {APP_DIR}/scripts/check_1panel_webp_task.py --database {AGENT_DB} --current-task {name})",
-            'case "$TASK_STATE" in',
-            f"  run\\|*) printf '%s\\n' \"检查｜任务：{scope.upper()} WebP｜状态：允许执行｜${{TASK_STATE#run|}}\" ;;",
-            f"  skip\\|*) printf '%s\\n' \"跳过｜任务：{scope.upper()} WebP｜原因：${{TASK_STATE#skip|}}\"; exit 0 ;;",
-            f"  *) printf '%s\\n' \"失败｜任务：{scope.upper()} WebP｜原因：未知任务状态 $TASK_STATE\" >&2; exit 2 ;;",
-            "esac",
-            f"exec sudo -n -H -u ubuntu /usr/bin/env bash {APP_DIR}/scripts/run_scope.sh {scope}",
+            f"printf '%s\\n' '停用｜任务：{scope.upper()} WebP｜原因：WebP由对应下载任务连续生成'",
         ]
     )
     return {
@@ -72,7 +70,7 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
         "retry_times": 0,
         "timeout": 21600,
         "retain_copies": 7,
-        "status": "Disable" if name in INITIAL_DISABLED_TASKS else "Enable",
+        "status": "Disable",
         "entry_ids": "",
         "secret": "",
         "group_id": group_id,
@@ -84,11 +82,11 @@ def values(timestamp: str, name: str, scope: str, group_id: int) -> dict[str, ob
 
 
 def existing_job_values(payload: dict[str, object]) -> dict[str, object]:
-    """Keep scheduler-owned runtime fields when updating an existing job."""
+    """Keep runtime fields but force standalone WebP schedules disabled."""
     return {
         key: value
         for key, value in payload.items()
-        if key not in {"entry_ids", "is_executing", "status"}
+        if key not in {"entry_ids", "is_executing"}
     }
 
 

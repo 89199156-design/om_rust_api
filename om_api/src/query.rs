@@ -52,7 +52,7 @@ pub enum WeatherModel {
 }
 
 impl WeatherModel {
-    fn parse(value: Option<&str>) -> Result<Self> {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
         let value = value.unwrap_or("gfs").trim().to_ascii_lowercase();
         match value.as_str() {
             "" | "gfs" | "ncep_gfs" | "ncep_gfs013" => Ok(Self::Gfs),
