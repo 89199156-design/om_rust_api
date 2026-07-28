@@ -409,6 +409,75 @@ class EcmwfDownloaderTests(unittest.TestCase):
         )
         self.assertEqual(plan.required_end_utc, base + timedelta(hours=6))
 
+    def test_ecmwf_discovery_uses_latest_two_remote_long_runs_and_three_predecessors(self):
+        references = [
+            datetime(2026, 7, 27, hour, tzinfo=UTC)
+            for hour in (0, 6, 12, 18)
+        ]
+        references += [
+            datetime(2026, 7, 26, hour, tzinfo=UTC)
+            for hour in (6, 12, 18)
+        ]
+        catalogs = {
+            reference: OpenMeteoSpatialCatalog(
+                model="ecmwf_ifs025",
+                completed=True,
+                reference_time_utc=reference,
+                valid_times_utc=_valid_times(
+                    reference,
+                    short=reference.hour not in (0, 12),
+                ),
+                variables=("temperature_2m", "wind_gusts_10m"),
+            )
+            for reference in references
+        }
+
+        def build_full(
+            product,
+            *,
+            now_utc,
+            bucket_url,
+            reference_time_utc,
+        ):
+            del product, now_utc, bucket_url
+            return (
+                catalogs[reference_time_utc],
+                [],
+                SimpleNamespace(
+                    latest_complete_run=reference_time_utc.strftime("%Y%m%d%H")
+                ),
+            )
+
+        with (
+            patch.object(
+                cli_module,
+                "load_openmeteo_spatial_latest",
+                return_value=catalogs[datetime(2026, 7, 27, 18, tzinfo=UTC)],
+            ),
+            patch.object(
+                cli_module,
+                "load_openmeteo_spatial_run",
+                side_effect=lambda _model, reference, **_kwargs: catalogs[reference],
+            ),
+            patch.object(cli_module, "_build_product_plan", side_effect=build_full),
+        ):
+            plans = cli_module._discover_recent_ecmwf_retention_plans(
+                _product(),
+                now_utc=datetime(2026, 7, 28, 4, tzinfo=UTC),
+                bucket_url="https://example.test",
+            )
+
+        self.assertEqual(
+            [run for run, _plan in plans],
+            [
+                "2026072712",
+                "2026072700",
+                "2026072618",
+                "2026072612",
+                "2026072606",
+            ],
+        )
+
     def test_ecmwf_grid_matches_public_ifs025_om_dimensions(self):
         grid = grid_spec_for_openmeteo_model("ecmwf_ifs025", dimensions=(721, 1440))
         selection = regular_grid_ranges(grid, Bounds(68.0, -2.0, 142.0, 60.0))

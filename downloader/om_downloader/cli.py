@@ -2308,15 +2308,19 @@ def _discover_recent_ecmwf_retention_plans(
     bucket_url: str,
     count: int = ECMWF_TOTAL_RELEASE_RETENTION,
 ) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
-    """Discover two full ECMWF releases followed by three short history releases."""
-    if count < 1:
-        raise ValueError("ECMWF retention count must be positive")
+    """Discover the latest two 00Z/12Z long runs and their three predecessors."""
+    if count != ECMWF_TOTAL_RELEASE_RETENTION:
+        raise ValueError(
+            f"ECMWF retention count must be {ECMWF_TOTAL_RELEASE_RETENTION}"
+        )
     latest = load_openmeteo_spatial_latest(
         product.openmeteo_model,
         bucket_url=bucket_url,
     )
     candidate = latest.reference_time_utc
     discovered: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
+    complete_runs: list[datetime] = []
+    required_partial_runs: set[datetime] = set()
     max_probes = max(24, count * 8)
     for _probe in range(max_probes):
         try:
@@ -2338,14 +2342,26 @@ def _discover_recent_ecmwf_retention_plans(
             and catalog.completed
             and catalog.reference_time_utc == candidate
         ):
-            if len(discovered) < ECMWF_COMPLETE_RUN_RETENTION:
+            if (
+                len(complete_runs) < ECMWF_COMPLETE_RUN_RETENTION
+                and candidate.hour in (0, 12)
+            ):
                 plan_data = _build_product_plan(
                     product,
                     now_utc=now_utc,
                     bucket_url=bucket_url,
                     reference_time_utc=candidate,
                 )
-            else:
+                complete_runs.append(candidate)
+                run_id = candidate.strftime("%Y%m%d%H")
+                discovered.append((run_id, {product.name: plan_data}))
+                if len(complete_runs) == ECMWF_COMPLETE_RUN_RETENTION:
+                    previous_complete = complete_runs[-1]
+                    required_partial_runs = {
+                        previous_complete - timedelta(hours=offset)
+                        for offset in (6, 12, 18)
+                    }
+            elif candidate in required_partial_runs:
                 run = om_run_from_spatial_catalog(product.name, catalog)
                 plan_data = (
                     catalog,
@@ -2356,8 +2372,8 @@ def _discover_recent_ecmwf_retention_plans(
                         forecast_hour_end=ECMWF_PARTIAL_FORECAST_HOUR_END,
                     ),
                 )
-            run_id = candidate.strftime("%Y%m%d%H")
-            discovered.append((run_id, {product.name: plan_data}))
+                run_id = candidate.strftime("%Y%m%d%H")
+                discovered.append((run_id, {product.name: plan_data}))
             if len(discovered) == count:
                 return discovered
         candidate -= timedelta(hours=product.run_cadence_hours)
