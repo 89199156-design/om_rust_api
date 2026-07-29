@@ -970,6 +970,70 @@ class MirrorSyncTests(unittest.TestCase):
             )
             self.assertTrue((mirror_root / product / "coverages" / new_coverage).exists())
 
+    def test_prune_accepts_gfs_current_from_before_product_expansion(self):
+        legacy_products = GFS_GROUP_PRODUCTS[:3]
+        run = "2026072018"
+        legacy = {
+            "group": "gfs",
+            "status": "complete",
+            "latest_complete_run": run,
+            "static_assets": {},
+            "product_manifests": {
+                product: {
+                    "coverage_id": f"{product}_{run}",
+                    "status": "complete",
+                    "latest_complete_run": run,
+                }
+                for product in legacy_products
+            },
+        }
+        legacy["release_id"] = group_release_id(
+            legacy,
+            allow_legacy_products=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "group manifest is not complete"):
+            group_release_id(legacy)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases_root = root / "groups" / "gfs" / "releases"
+            current_root = root / "groups" / "gfs" / "current"
+            releases_root.mkdir(parents=True)
+            current_root.mkdir(parents=True)
+            (releases_root / f"{legacy['release_id']}.json").write_text(
+                json.dumps(legacy),
+                encoding="utf-8",
+            )
+            current = dict(legacy)
+            current["runtime_format"] = "openmeteo-native-v1"
+            (current_root / "ready_for_processing.json").write_text(
+                json.dumps(current),
+                encoding="utf-8",
+            )
+            coverage_paths = []
+            for product in legacy_products:
+                coverage_path = (
+                    root
+                    / product
+                    / "coverages"
+                    / legacy["product_manifests"][product]["coverage_id"]
+                )
+                coverage_path.mkdir(parents=True)
+                coverage_paths.append(coverage_path)
+
+            prune_expired_group_releases(
+                root,
+                "gfs",
+                retain_complete_releases=5,
+                preserve_current=True,
+            )
+
+            self.assertTrue(
+                (releases_root / f"{legacy['release_id']}.json").exists()
+            )
+            self.assertTrue(all(path.exists() for path in coverage_paths))
+
     def test_native_current_and_duplicate_do_not_consume_gfs_retention_slots(self):
         products = GFS_GROUP_PRODUCTS
         runs = ["2026072018", "2026072012", "2026072006", "2026072000", "2026071918"]

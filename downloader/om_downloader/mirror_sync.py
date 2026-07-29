@@ -118,7 +118,12 @@ def _parse_utc(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _products_from_group_manifest(group_manifest: dict[str, Any], group: str) -> tuple[str, ...]:
+def _products_from_group_manifest(
+    group_manifest: dict[str, Any],
+    group: str,
+    *,
+    allow_legacy_products: bool = False,
+) -> tuple[str, ...]:
     summaries = group_manifest.get("product_manifests")
     if not isinstance(summaries, dict):
         raise ValueError(f"group manifest has invalid product summaries: {group}")
@@ -126,9 +131,14 @@ def _products_from_group_manifest(group_manifest: dict[str, Any], group: str) ->
     unexpected = sorted(set(summaries) - set(allowed))
     if unexpected:
         raise ValueError(f"group manifest contains unknown products: {', '.join(unexpected)}")
-    missing = [product for product in MINIMUM_GROUP_PRODUCTS[group] if product not in summaries]
-    if missing:
-        raise ValueError(f"group manifest missing products: {', '.join(missing)}")
+    if not allow_legacy_products:
+        missing = [
+            product for product in MINIMUM_GROUP_PRODUCTS[group] if product not in summaries
+        ]
+        if missing:
+            raise ValueError(f"group manifest missing products: {', '.join(missing)}")
+    elif not summaries:
+        raise ValueError(f"group manifest has no product summaries: {group}")
     return tuple(product for product in allowed if product in summaries)
 
 
@@ -256,14 +266,26 @@ def _promote_static_asset_stages(stages: list[dict[str, Any]]) -> list[dict[str,
     return results
 
 
-def group_release_id(group_manifest: dict[str, Any]) -> str:
+def group_release_id(
+    group_manifest: dict[str, Any],
+    *,
+    allow_legacy_products: bool = False,
+) -> str:
     group = str(group_manifest.get("group") or "")
     if group not in OPENMETEO_GROUP_PRODUCTS:
         raise ValueError(f"unknown Open-Meteo group: {group}")
-    if not _group_manifest_is_complete(group_manifest, group):
+    if not _group_manifest_is_complete(
+        group_manifest,
+        group,
+        allow_legacy_products=allow_legacy_products,
+    ):
         raise ValueError(f"group manifest is not complete: {group}")
     product_manifests = group_manifest["product_manifests"]
-    products = _products_from_group_manifest(group_manifest, group)
+    products = _products_from_group_manifest(
+        group_manifest,
+        group,
+        allow_legacy_products=allow_legacy_products,
+    )
     summary = {
         product: {
             key: product_manifests.get(product, {}).get(key)
@@ -271,19 +293,32 @@ def group_release_id(group_manifest: dict[str, Any]) -> str:
         }
         for product in products
     }
-    static_summary = {
-        model: {
-            "path": record.get("path"),
-            "bytes": record.get("bytes"),
-            "sha256": record.get("sha256"),
-            "storage": record.get("storage"),
-            "environment": record.get("environment"),
+    if allow_legacy_products:
+        raw_static_assets = group_manifest.get("static_assets", {})
+        static_summary = {
+            model: {
+                "path": record.get("path"),
+                "bytes": record.get("bytes"),
+                "sha256": record.get("sha256"),
+                "storage": record.get("storage"),
+                "environment": record.get("environment"),
+            }
+            for model, record in sorted(raw_static_assets.items())
         }
-        for model, (_spec, record) in _static_assets_from_group_manifest(
-            group_manifest,
-            group,
-        ).items()
-    }
+    else:
+        static_summary = {
+            model: {
+                "path": record.get("path"),
+                "bytes": record.get("bytes"),
+                "sha256": record.get("sha256"),
+                "storage": record.get("storage"),
+                "environment": record.get("environment"),
+            }
+            for model, (_spec, record) in _static_assets_from_group_manifest(
+                group_manifest,
+                group,
+            ).items()
+        }
     identity: dict[str, Any] = {"group": group, "products": summary}
     if static_summary:
         identity["static_assets"] = static_summary
@@ -481,15 +516,39 @@ def sync_from_manifest_path(manifest_path: Path, output_root: Path) -> dict[str,
     )
 
 
-def _group_manifest_is_complete(group_manifest: dict[str, Any], group: str) -> bool:
+def _group_manifest_is_complete(
+    group_manifest: dict[str, Any],
+    group: str,
+    *,
+    allow_legacy_products: bool = False,
+) -> bool:
     if group_manifest.get("group") != group or group_manifest.get("status") != "complete":
         return False
     latest_complete_run = group_manifest.get("latest_complete_run")
     if not isinstance(latest_complete_run, str) or not latest_complete_run:
         return False
     try:
-        products = _products_from_group_manifest(group_manifest, group)
-        _static_assets_from_group_manifest(group_manifest, group)
+        products = _products_from_group_manifest(
+            group_manifest,
+            group,
+            allow_legacy_products=allow_legacy_products,
+        )
+        if allow_legacy_products:
+            raw_static_assets = group_manifest.get("static_assets", {})
+            allowed_static_assets = {
+                model for model in products if model in OPENMETEO_STATIC_ASSETS
+            }
+            if (
+                not isinstance(raw_static_assets, dict)
+                or not all(
+                    isinstance(model, str) and isinstance(record, dict)
+                    for model, record in raw_static_assets.items()
+                )
+                or not set(raw_static_assets).issubset(allowed_static_assets)
+            ):
+                return False
+        else:
+            _static_assets_from_group_manifest(group_manifest, group)
     except ValueError:
         return False
     summaries = group_manifest["product_manifests"]
@@ -697,6 +756,8 @@ def _group_release_sort_key(payload: dict[str, Any]) -> tuple[str, str, str]:
 def _load_complete_group_releases(
     output_root: Path,
     group: str,
+    *,
+    allow_legacy_products: bool = False,
 ) -> list[tuple[Path, dict[str, Any]]]:
     releases: list[tuple[Path, dict[str, Any]]] = []
     root = _release_root(output_root, group)
@@ -704,7 +765,11 @@ def _load_complete_group_releases(
         return releases
     for path in root.glob("*.json"):
         payload = _load_json(path)
-        if _group_manifest_is_complete(payload, group):
+        if _group_manifest_is_complete(
+            payload,
+            group,
+            allow_legacy_products=allow_legacy_products,
+        ):
             releases.append((path, payload))
     releases.sort(key=lambda item: _group_release_sort_key(item[1]), reverse=True)
     return releases
@@ -1045,13 +1110,20 @@ def prune_expired_group_releases(
     except FileNotFoundError:
         pass
 
-    releases = _load_complete_group_releases(output_root, group)
+    releases = _load_complete_group_releases(
+        output_root,
+        group,
+        allow_legacy_products=True,
+    )
     current_path = output_root / "groups" / group / "current" / "ready_for_processing.json"
     current_release_id: str | None = None
     current_is_native = False
     if current_path.exists():
         current = _load_json(current_path)
-        current_release_id = group_release_id(current)
+        current_release_id = group_release_id(
+            current,
+            allow_legacy_products=True,
+        )
         current_is_native = current.get("runtime_format") == "openmeteo-native-v1"
         if not current_is_native and all(
             payload.get("release_id") != current_release_id for _, payload in releases
@@ -1059,7 +1131,11 @@ def prune_expired_group_releases(
             payload = json.loads(json.dumps(current))
             payload["release_id"] = current_release_id
             _atomic_write_json(_release_path(output_root, group, current_release_id), payload)
-            releases = _load_complete_group_releases(output_root, group)
+            releases = _load_complete_group_releases(
+                output_root,
+                group,
+                allow_legacy_products=True,
+            )
 
     # Old native publishers briefly wrote a second, non-canonical release for
     # the same source run.  Prefer the canonical legacy source release before
@@ -1069,7 +1145,7 @@ def prune_expired_group_releases(
         key=lambda release: (
             str(release[1].get("latest_complete_run") or ""),
             str(release[1].get("release_id") or "")
-            == group_release_id(release[1]),
+            == group_release_id(release[1], allow_legacy_products=True),
             str(release[1].get("synced_at") or ""),
             str(release[1].get("release_id") or ""),
         ),
@@ -1085,7 +1161,13 @@ def prune_expired_group_releases(
             (
                 release
                 for release in releases
-                if str(release[1].get("release_id") or group_release_id(release[1]))
+                if str(
+                    release[1].get("release_id")
+                    or group_release_id(
+                        release[1],
+                        allow_legacy_products=True,
+                    )
+                )
                 == preserve_release_id
             ),
             None,
@@ -1096,7 +1178,10 @@ def prune_expired_group_releases(
     for release in releases:
         payload = release[1]
         run = str(payload.get("latest_complete_run") or "")
-        release_id = str(payload.get("release_id") or group_release_id(payload))
+        release_id = str(
+            payload.get("release_id")
+            or group_release_id(payload, allow_legacy_products=True)
+        )
         if preserve_release_id is not None and release_id == preserve_release_id:
             continue
         if (
