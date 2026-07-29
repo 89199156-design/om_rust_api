@@ -8,12 +8,13 @@
 - 35 个随机网格邻近非网格点；
 - 30 个区域内均匀随机非网格点。
 
-所有请求使用 `cell_selection=nearest`，以明确覆盖精确网格读取与空间插值。GFS 和
-ECMWF 会直接比较双方共同支持的全部官方小时变量与全部官方日聚合变量，其中包括
+所有请求使用 `cell_selection=nearest`，以明确覆盖精确网格读取与非网格点选择。GFS
+和 ECMWF 会直接比较双方共同支持的全部地面小时变量与全部官方日聚合变量，其中包括
 `precipitation_probability_max`、`precipitation_probability_min` 和
-`precipitation_probability_mean`。压力层只包含官方同模型实际提供的共同层级和变量。
-CAMS 官方 API 不提供日字段和中国 AQI 字段，因此 CAMS 只比较官方提供的全部共同
-小时字段；本服独有的中国 AQI、CAMS 日统计及其他独有派生输出不参与官方一致性判定。
+`precipitation_probability_mean`。压力层字段全部排除，因为本验证针对公共点位预报
+契约，而不是比较双方压力层库存。CAMS 官方 API 不提供日字段和中国 AQI 字段，因此
+CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQI、CAMS 日统计及其他独有
+派生输出不参与官方一致性判定。
 
 ## 访问与快照
 
@@ -35,9 +36,36 @@ python3 scripts/validation/official_100_point_compare.py validate \
   --local-base http://127.0.0.1:8088
 ```
 
-本地 API 严格按点串行访问。每个成功点生成一份不可变回执；遇到首个差异时立即
-停止，并把模型、点位、变量、小时或日期、官方值和本地值写入 `report.json`。
-修复后再次执行相同命令会复用官方快照和已通过的点位回执。
+本地 API 严格按点串行访问，并默认把小时和日字段分别按 12 个一组拆成小请求。
+请求前会检查 Linux 可用内存、I/O PSI 和本机 `om-api` 进程数：内存或 I/O 暂时
+紧张时等待，检测到超过两个 `om-api`（生产实例加一个验证探针）时直接拒绝运行。
+点间和字段组间默认保留节流间隔，并使用输出目录内的进程锁禁止两个验证器并发。
+
+每次复验的本地响应写入独立 `local/attempts/<尝试标识>/`，不会覆盖官方快照，
+也不会与修复前的本地失败响应冲突。每个成功点生成一份不可变回执；遇到首个差异
+时立即停止，并把模型、点位、字段组、变量、小时或日期、官方值和本地值写入
+`report.json`。修复后再次执行会复用官方快照和已通过点位的回执。
+
+在小内存生产服务器上需要验证另一数据根时，必须使用资源隔离运行器，不能手工
+无限制地再启动一个探针 API：
+
+```bash
+scripts/validation/run_safe_official_100_validation.sh \
+  --models ec \
+  --output /data/validation/official-100/<批次标识> \
+  --data-root /data/validation/<EC 混合批次数据根>
+```
+
+可先加 `--point-limit 1` 做受控冒烟测试；报告状态会是 `partial`，不会被误报为
+100 点通过。正式一致性验证必须使用默认的 100 点。
+
+运行器只读取已经保存的官方快照，不访问官方 API。它会：
+
+- 用文件锁保证全机只有一个官方验证任务；
+- 若已有第二个非生产 `om-api`、下载器或 WebP 进程则拒绝启动；
+- 将探针限制为 `MemoryHigh=1100M`、`MemoryMax=1400M`、单核 CPU 和低 I/O 权重；
+- 将 Python 验证器限制为 384 MiB、25% 单核 CPU 和低 I/O 权重；
+- 无论验证成功或失败都停止探针 API。
 
 ## 生产批次冻结
 

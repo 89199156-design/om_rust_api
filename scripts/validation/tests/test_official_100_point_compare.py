@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -55,6 +57,12 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(compare.CAMS_DAILY, ())
         self.assertNotIn("chinese_aqi", compare.CAMS_HOURLY_LOCAL)
 
+    def test_weather_scope_excludes_all_pressure_level_fields(self) -> None:
+        self.assertFalse(any("hPa" in variable for variable in compare.GFS_HOURLY))
+        self.assertFalse(
+            any("hPa" in variable for variable in compare.ECMWF_SURFACE_HOURLY)
+        )
+
     def test_cams_direct_comparison_does_not_require_daily_period(self) -> None:
         original = compare.MODEL_SPECS["cams"]
         compare.MODEL_SPECS["cams"] = {
@@ -80,6 +88,55 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(payload["cell_selection"], "nearest")
         self.assertIn("precipitation_probability", payload["hourly"])
         self.assertIn("precipitation_probability_max", payload["daily"])
+
+    def test_local_request_plan_chunks_hourly_and_daily_separately(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "local_hourly": ("h1", "h2", "h3"),
+            "daily": ("d1", "d2"),
+        }
+        try:
+            plan = compare.request_plan("gfs", 2)
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+        self.assertEqual(
+            plan,
+            [
+                {"period": "hourly", "variables": ("h1", "h2")},
+                {"period": "hourly", "variables": ("h3",)},
+                {"period": "daily", "variables": ("d1", "d2")},
+            ],
+        )
+
+    def test_local_url_can_request_one_period_chunk(self) -> None:
+        url = compare.local_url(
+            "http://127.0.0.1:8088",
+            "gfs",
+            compare.sample_points()[0],
+            hourly=("temperature_2m", "precipitation_probability"),
+            daily=(),
+        )
+        self.assertIn(
+            "hourly=temperature_2m,precipitation_probability",
+            url,
+        )
+        self.assertNotIn("daily=", url)
+
+    def test_resource_guard_refuses_a_third_local_api(self) -> None:
+        with (
+            mock.patch.object(compare, "local_om_api_process_count", return_value=3),
+            self.assertRaisesRegex(compare.ValidationError, "3 om-api processes"),
+        ):
+            compare.wait_for_safe_local_resources(
+                local_base="http://127.0.0.1:18089",
+                min_available_memory_mib=0,
+                max_io_full_pressure_avg10=100,
+                max_local_om_api_processes=2,
+                wait_timeout_seconds=0,
+                poll_seconds=0.01,
+            )
 
     def test_existing_full_manifest_allows_model_subset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -238,6 +295,158 @@ class Official100PointCompareTests(unittest.TestCase):
             self.assertEqual(difference["reason"], "missing_official_time")
             self.assertEqual(difference["time"], "c")
             self.assertEqual(difference["local_end"], "b")
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_validate_model_checkpoints_progress_and_throttles(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "local_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        response = {
+            "hourly": {
+                "time": ["2026-07-29T00:00"],
+                "temperature_2m": [25.0],
+            }
+        }
+        official_raw = compare.canonical_bytes([response] * compare.POINT_COUNT)
+        local_raw = compare.canonical_bytes(response)
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                output = Path(temporary_directory)
+                official_dir = output / "gfs" / "official"
+                official_dir.mkdir(parents=True)
+                official_dir.joinpath("response.json").write_bytes(official_raw)
+                official_dir.joinpath("metadata.json").write_bytes(
+                    compare.pretty_bytes(
+                        {
+                            "response_sha256": compare.sha256_bytes(official_raw),
+                            "official_request_count": 1,
+                        }
+                    )
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        compare,
+                        "request_json",
+                        return_value=(local_raw, {}, 0.01),
+                    ) as request,
+                    mock.patch.object(compare.time, "sleep") as sleep,
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    report = compare.validate_model(
+                        "gfs",
+                        output,
+                        "http://127.0.0.1:8088",
+                        10.0,
+                        0,
+                        0.25,
+                    )
+
+            self.assertEqual(request.call_count, compare.POINT_COUNT)
+            self.assertEqual(sleep.call_count, compare.POINT_COUNT - 1)
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["points_completed"], compare.POINT_COUNT)
+            self.assertIsNone(report["current_point"])
+            self.assertEqual(report["point_delay_seconds"], 0.25)
+            self.assertIn("started_at", report)
+            events = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            self.assertEqual(events[0]["event"], "point_started")
+            self.assertEqual(events[-1]["event"], "point_passed")
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_validate_model_uses_separate_attempt_scoped_field_chunks(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("h1", "h2"),
+            "local_hourly": ("h1", "h2"),
+            "daily": ("d1",),
+        }
+        response = {
+            "hourly": {"time": ["h"], "h1": [1], "h2": [2]},
+            "daily": {"time": ["d"], "d1": [3]},
+        }
+        official_raw = compare.canonical_bytes([response] * compare.POINT_COUNT)
+
+        def fake_request(_method, url, **_kwargs):
+            if "hourly=h1" in url:
+                value = {"hourly": {"time": ["h"], "h1": [1]}}
+            elif "hourly=h2" in url:
+                value = {"hourly": {"time": ["h"], "h2": [2]}}
+            else:
+                self.assertIn("daily=d1", url)
+                value = {"daily": {"time": ["d"], "d1": [3]}}
+            return compare.canonical_bytes(value), {}, 0.01
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                output = Path(temporary_directory)
+                official_dir = output / "gfs" / "official"
+                official_dir.mkdir(parents=True)
+                official_dir.joinpath("response.json").write_bytes(official_raw)
+                official_dir.joinpath("metadata.json").write_bytes(
+                    compare.pretty_bytes(
+                        {
+                            "response_sha256": compare.sha256_bytes(official_raw),
+                            "official_request_count": 1,
+                        }
+                    )
+                )
+                with (
+                    mock.patch.object(compare, "request_json", side_effect=fake_request)
+                    as request,
+                    mock.patch.object(compare, "wait_for_safe_local_resources")
+                    as resource_guard,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    resource_guard.return_value = {
+                        "available_memory_mib": 2048,
+                        "io_full_pressure_avg10": 0,
+                        "local_om_api_processes": 2,
+                    }
+                    report = compare.validate_model(
+                        "gfs",
+                        output,
+                        "http://127.0.0.1:8088",
+                        10.0,
+                        0,
+                        0,
+                        field_chunk_size=1,
+                        request_delay_seconds=0,
+                        attempt_id="attempt-a",
+                        point_limit=1,
+                    )
+                receipt = json.loads(
+                    (output / "gfs" / "receipts" / "000_p000.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                local_parts = sorted(
+                    (
+                        output
+                        / "gfs"
+                        / "local"
+                        / "attempts"
+                        / "attempt-a"
+                        / "000_p000"
+                    ).glob("*.json")
+                )
+
+            self.assertEqual(request.call_count, 3)
+            self.assertEqual(resource_guard.call_count, 3)
+            self.assertEqual(report["status"], "partial")
+            self.assertEqual(report["points_target"], 1)
+            self.assertEqual(report["local_requests_per_point"], 3)
+            self.assertEqual(report["local_requests_completed"], 3)
+            self.assertEqual(receipt["local_request_count"], 3)
+            self.assertEqual(len(receipt["local_response_parts"]), 3)
+            self.assertEqual(len(local_parts), 3)
         finally:
             compare.MODEL_SPECS["gfs"] = original
 

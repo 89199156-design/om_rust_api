@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, 
 use chrono_tz::Tz;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,10 @@ pub fn with_ecmwf_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Res
 
 fn current_weather_model() -> WeatherModel {
     REQUEST_WEATHER_MODEL.with(|current| *current.borrow())
+}
+
+fn derives_diffuse_radiation(model: WeatherModel) -> bool {
+    model == WeatherModel::EcmwfIfs025
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1763,13 +1767,22 @@ fn daily_weather_value(
         1
     };
     let times = daily_sample_times(start, end, step_hours);
-    let values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
+    let mut values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
+    round_daily_source_values(source, &mut values);
 
     Ok(aggregate_daily_weather_values(
         aggregation,
         &values,
         step_hours,
     ))
+}
+
+fn round_daily_source_values(source: &str, values: &mut [f32]) {
+    if source == "precipitation_probability" {
+        values
+            .iter_mut()
+            .for_each(|value| *value = round_variable_output_value(source, *value));
+    }
 }
 
 fn aggregate_daily_weather_values(
@@ -1851,6 +1864,11 @@ fn read_daily_series(
     latitude: f64,
     longitude: f64,
 ) -> Result<Vec<f32>> {
+    if variable == "precipitation_probability" && current_weather_model() == WeatherModel::Gfs {
+        return read_gfs_precipitation_probability_point_series(
+            snapshot, decoder, times, latitude, longitude,
+        );
+    }
     if let Some(decoder) = decoder {
         match read_variable_grid_series(
             snapshot,
@@ -2486,7 +2504,7 @@ pub fn read_variable_value(
                 longitude,
             );
         }
-        "diffuse_radiation" if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+        "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
             let shortwave = read_direct(
                 snapshot,
                 decoder,
@@ -2513,7 +2531,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let diffuse = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+            let diffuse = if derives_diffuse_radiation(current_weather_model()) {
                 let sampling = weather_model_sampling(snapshot, decoder, latitude, longitude)?;
                 backwards_diffuse_radiation(
                     shortwave,
@@ -2532,7 +2550,7 @@ pub fn read_variable_value(
                     longitude,
                 )?
             };
-            return Ok(shortwave - diffuse);
+            return Ok((shortwave - diffuse).max(0.0));
         }
         "shortwave_radiation_instant"
         | "diffuse_radiation_instant"
@@ -3020,12 +3038,25 @@ pub fn read_variable_grid_series(
     decoder: &OfficialDecoder,
     variable: &str,
     times: &[DateTime<Utc>],
-    latitudes: &[f64],
-    longitudes: &[f64],
+    requested_latitudes: &[f64],
+    requested_longitudes: &[f64],
 ) -> Result<Vec<Vec<f32>>> {
-    if times.is_empty() || latitudes.is_empty() || longitudes.is_empty() {
+    if times.is_empty() || requested_latitudes.is_empty() || requested_longitudes.is_empty() {
         bail!("regional grid series dimensions must not be empty");
     }
+    let selected_sampling = if requested_latitudes.len() == 1 && requested_longitudes.len() == 1 {
+        current_product_sampling(current_weather_model().primary_product())
+    } else {
+        None
+    };
+    let selected_latitudes = selected_sampling.map(|sampling| [sampling.latitude]);
+    let selected_longitudes = selected_sampling.map(|sampling| [sampling.longitude]);
+    let latitudes = selected_latitudes
+        .as_ref()
+        .map_or(requested_latitudes, |values| values.as_slice());
+    let longitudes = selected_longitudes
+        .as_ref()
+        .map_or(requested_longitudes, |values| values.as_slice());
     if variable == "precipitation_probability" && current_weather_model() == WeatherModel::Gfs {
         return read_gfs_precipitation_probability_grid_series(
             snapshot, decoder, times, latitudes, longitudes,
@@ -3440,7 +3471,7 @@ pub fn read_variable_grid_series(
                 })
                 .collect())
         }
-        "diffuse_radiation" => {
+        "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
             let shortwave = read_direct_grid_series(
                 snapshot,
                 decoder,
@@ -3471,6 +3502,15 @@ pub fn read_variable_grid_series(
                 })
                 .collect())
         }
+        "diffuse_radiation" => read_direct_grid_series(
+            snapshot,
+            decoder,
+            "diffuse_radiation",
+            times,
+            latitudes,
+            longitudes,
+            true,
+        ),
         "direct_radiation" => Ok(combine2(
             read_direct_grid_series(
                 snapshot,
@@ -3489,7 +3529,7 @@ pub fn read_variable_grid_series(
                 latitudes,
                 longitudes,
             )?,
-            |shortwave, diffuse| shortwave - diffuse,
+            |shortwave, diffuse| (shortwave - diffuse).max(0.0),
         )),
         "shortwave_radiation_instant"
         | "direct_radiation_instant"
@@ -3934,6 +3974,16 @@ fn read_gfs_precipitation_probability_grid_series(
     longitudes: &[f64],
 ) -> Result<Vec<Vec<f32>>> {
     let grid_len = latitudes.len() * longitudes.len();
+    if grid_len == 1 {
+        return read_gfs_precipitation_probability_point_series(
+            snapshot,
+            Some(decoder),
+            times,
+            latitudes[0],
+            longitudes[0],
+        )
+        .map(|values| values.into_iter().map(|value| vec![value]).collect());
+    }
     let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
         if snapshot.product(product_name).is_none() {
             return Ok(None);
@@ -5273,6 +5323,18 @@ fn read_gfs_product_history_grid_with_rounding(
     } else {
         (latitudes, longitudes)
     };
+    if is_gfs_probability_product(product_name) && raw_variable == "precipitation_probability" {
+        return read_gfs_probability_history_grid_with_rounding(
+            &products,
+            decoder,
+            raw_variable,
+            time,
+            latitudes,
+            longitudes,
+            round_values,
+        )
+        .map(Some);
+    }
     if let Some(primary) = products
         .iter()
         .find(|product| product_covers_time(product, raw_variable, time))
@@ -5478,6 +5540,10 @@ fn is_gfs_product(product_name: &str) -> bool {
         product_name,
         "gfs013_surface" | "gfs025" | "gfs_pressure_profile" | "ncep_gefs025" | "ncep_gefs05"
     )
+}
+
+fn is_gfs_probability_product(product_name: &str) -> bool {
+    matches!(product_name, "ncep_gefs025" | "ncep_gefs05")
 }
 
 fn is_ecmwf_product(product_name: &str) -> bool {
@@ -6755,6 +6821,17 @@ fn read_product_history_value_with_rounding(
 ) -> Result<f32> {
     let products = snapshot.product_snapshots(product_name);
     if is_gfs_product(product_name) {
+        if is_gfs_probability_product(product_name) && raw_variable == "precipitation_probability" {
+            return read_gfs_probability_history_value_with_rounding(
+                &products,
+                decoder,
+                raw_variable,
+                time,
+                latitude,
+                longitude,
+                round_values,
+            );
+        }
         if let Some(primary) = products
             .iter()
             .find(|product| product_covers_time(product, raw_variable, time))
@@ -6844,6 +6921,259 @@ fn read_product_history_value_with_rounding(
         return Ok(f32::NAN);
     }
     bail!("variable/time is not available: {} {}", raw_variable, time)
+}
+
+fn gfs_history_native_times(
+    products: &[Arc<ProductSnapshot>],
+    raw_variable: &str,
+) -> Vec<DateTime<Utc>> {
+    products
+        .iter()
+        .flat_map(|product| {
+            product
+                .entries
+                .keys()
+                .filter(|key| key.variable == raw_variable)
+                .map(|key| key.valid_time_utc)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn gfs_probability_interpolation_position(
+    native_times: &[DateTime<Utc>],
+    time: DateTime<Utc>,
+) -> Option<(usize, f32, i64)> {
+    if native_times.is_empty() || time < native_times[0] {
+        return None;
+    }
+    match native_times.binary_search(&time) {
+        Ok(index) => Some((
+            index,
+            0.0,
+            interpolation_stride_seconds(native_times, index),
+        )),
+        Err(next_index) if next_index > 0 && next_index < native_times.len() => {
+            let index = next_index - 1;
+            let stride_seconds = (native_times[next_index] - native_times[index]).num_seconds();
+            if stride_seconds <= 0 {
+                return None;
+            }
+            Some((
+                index,
+                (time - native_times[index]).num_seconds() as f32 / stride_seconds as f32,
+                stride_seconds,
+            ))
+        }
+        Err(next_index) if next_index == native_times.len() && native_times.len() > 1 => {
+            let index = native_times.len() - 1;
+            let stride_seconds = (native_times[index] - native_times[index - 1]).num_seconds();
+            let elapsed = (time - native_times[index]).num_seconds();
+            if stride_seconds <= 0 || elapsed >= stride_seconds {
+                return None;
+            }
+            Some((
+                index,
+                elapsed as f32 / stride_seconds as f32,
+                stride_seconds,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn newest_gfs_history_product_for_time<'a>(
+    products: &'a [Arc<ProductSnapshot>],
+    raw_variable: &str,
+    time: DateTime<Utc>,
+) -> Option<&'a ProductSnapshot> {
+    let key = EntryKey {
+        variable: raw_variable.to_string(),
+        valid_time_utc: time,
+    };
+    products
+        .iter()
+        .find(|product| product.entries.contains_key(&key))
+        .map(AsRef::as_ref)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_history_value_with_rounding(
+    products: &[Arc<ProductSnapshot>],
+    decoder: Option<&OfficialDecoder>,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+    round_values: bool,
+) -> Result<f32> {
+    let regular_seconds = products
+        .iter()
+        .flat_map(|product| native_times_for_variable(product, raw_variable).into_iter())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).num_seconds())
+        .filter(|seconds| *seconds > 0)
+        .min()
+        .unwrap_or(3 * 3600);
+    let mut stitched = BTreeMap::<DateTime<Utc>, f32>::new();
+    for product in products.iter().rev() {
+        let native_times = native_times_for_variable(product, raw_variable);
+        let (Some(first), Some(last)) =
+            (native_times.first().copied(), native_times.last().copied())
+        else {
+            continue;
+        };
+        let span = (last - first).num_seconds();
+        if span < 0 || span % regular_seconds != 0 {
+            bail!("GFS probability run is not aligned to its 3-hour database axis");
+        }
+        let mut values = vec![f32::NAN; usize::try_from(span / regular_seconds + 1)?];
+        for native_time in native_times {
+            let elapsed = (native_time - first).num_seconds();
+            if elapsed < 0 || elapsed % regular_seconds != 0 {
+                bail!("GFS probability frame is not aligned to its 3-hour database axis");
+            }
+            values[usize::try_from(elapsed / regular_seconds)?] = read_native_value(
+                product,
+                decoder,
+                raw_variable,
+                native_time,
+                latitude,
+                longitude,
+            )?;
+        }
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 100.0)), false, false);
+        for (index, value) in values.into_iter().enumerate() {
+            if value.is_finite() {
+                stitched.insert(
+                    first + Duration::seconds(regular_seconds * index as i64),
+                    round_to_scalefactor(value, 1.0),
+                );
+            }
+        }
+    }
+    let (Some(first), Some(last)) = (
+        stitched.first_key_value().map(|(time, _)| *time),
+        stitched.last_key_value().map(|(time, _)| *time),
+    ) else {
+        return Ok(f32::NAN);
+    };
+    let span = (last - first).num_seconds();
+    let regular_times = (0..=span / regular_seconds)
+        .map(|index| first + Duration::seconds(regular_seconds * index))
+        .collect::<Vec<_>>();
+    let values = regular_times
+        .iter()
+        .map(|time| stitched.get(time).copied().unwrap_or(f32::NAN))
+        .collect::<Vec<_>>();
+    let Some((index, fraction, _)) = gfs_probability_interpolation_position(&regular_times, time)
+    else {
+        return Ok(f32::NAN);
+    };
+    let b = values[index];
+    if !b.is_finite() || (fraction == 0.0 && index + 1 >= regular_times.len()) {
+        return Ok(maybe_round_to_scalefactor(b, 1.0, round_values));
+    }
+    let a = index
+        .checked_sub(1)
+        .and_then(|previous| values.get(previous))
+        .copied()
+        .filter(|value| value.is_finite())
+        .unwrap_or(b);
+    let c = values
+        .get(index + 1)
+        .copied()
+        .filter(|value| value.is_finite())
+        .unwrap_or(b);
+    let d = values
+        .get(index + 2)
+        .copied()
+        .filter(|value| value.is_finite())
+        .unwrap_or(b);
+    let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+    let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+    let coeff_c = -a / 2.0 + c / 2.0;
+    let value = coeff_a * fraction * fraction * fraction
+        + coeff_b * fraction * fraction
+        + coeff_c * fraction
+        + b;
+    Ok(maybe_round_to_scalefactor(value, 1.0, round_values).clamp(0.0, 100.0))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_history_grid_with_rounding(
+    products: &[Arc<ProductSnapshot>],
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Vec<f32>> {
+    let grid_len = latitudes.len() * longitudes.len();
+    let native_times = gfs_history_native_times(products, raw_variable);
+    let Some((index, fraction, stride_seconds)) =
+        gfs_probability_interpolation_position(&native_times, time)
+    else {
+        return Ok(vec![f32::NAN; grid_len]);
+    };
+    let read = |native_time| -> Result<Option<Vec<f32>>> {
+        newest_gfs_history_product_for_time(products, raw_variable, native_time)
+            .map(|product| {
+                read_native_grid(
+                    product,
+                    decoder,
+                    raw_variable,
+                    native_time,
+                    latitudes,
+                    longitudes,
+                )
+            })
+            .transpose()
+    };
+    let b = read(native_times[index])?.unwrap_or_else(|| vec![f32::NAN; grid_len]);
+    if fraction == 0.0 && index + 1 >= native_times.len() {
+        return Ok(b
+            .into_iter()
+            .map(|value| maybe_round_to_scalefactor(value, 1.0, round_values))
+            .collect());
+    }
+    let a =
+        read(native_times[index] - Duration::seconds(stride_seconds))?.unwrap_or_else(|| b.clone());
+    let c_time = native_times[index] + Duration::seconds(stride_seconds);
+    let c = read(c_time)?.unwrap_or_else(|| b.clone());
+    let d = read(c_time + Duration::seconds(stride_seconds))?;
+    Ok((0..grid_len)
+        .map(|point| {
+            let b = b[point];
+            if !b.is_finite() {
+                return b;
+            }
+            let a = a[point];
+            let a = if a.is_finite() { a } else { b };
+            let c = c[point];
+            let c = if c.is_finite() { c } else { b };
+            let d = d.as_ref().map(|values| values[point]).map_or(b, |value| {
+                if value.is_finite() {
+                    value
+                } else {
+                    b
+                }
+            });
+            let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+            let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+            let coeff_c = -a / 2.0 + c / 2.0;
+            let value = coeff_a * fraction * fraction * fraction
+                + coeff_b * fraction * fraction
+                + coeff_c * fraction
+                + b;
+            maybe_round_to_scalefactor(value, 1.0, round_values).clamp(0.0, 100.0)
+        })
+        .collect())
 }
 
 fn read_cams_mixed_carbon_monoxide(
@@ -9505,6 +9835,15 @@ mod tests {
     }
 
     #[test]
+    fn gfs_probability_terminal_first_stage_repeats_c_like_open_meteo() {
+        let mut values = vec![2.0, f32::NAN, 8.0, f32::NAN, 10.0];
+
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 100.0)), false, false);
+
+        assert!((values[3] - 9.375).abs() < 1e-6);
+    }
+
+    #[test]
     fn dew_point_preserves_open_meteo_float_order_at_vpd_rounding_boundary() {
         // Frozen ECMWF p0146 at 2026-07-28T11:00Z. The model value is
         // elevation-corrected from 336 m to the requested DEM elevation of
@@ -11843,6 +12182,27 @@ mod output_tests {
         let wrongly_hourly = backwards_sunshine_duration(200.0, daily[4], 3_600, 31.25, 121.5);
         assert_ne!(daily_sunshine.to_bits(), wrongly_hourly.to_bits());
         assert!(daily_sunshine <= 10_800.0);
+    }
+
+    #[test]
+    fn only_ecmwf_derives_diffuse_radiation_from_shortwave() {
+        assert!(!derives_diffuse_radiation(WeatherModel::Gfs));
+        assert!(derives_diffuse_radiation(WeatherModel::EcmwfIfs025));
+    }
+
+    #[test]
+    fn daily_probability_aggregates_the_published_integer_series() {
+        let mut values = [53.51, 74.0];
+        round_daily_source_values("precipitation_probability", &mut values);
+        assert_eq!(values, [54.0, 74.0]);
+        assert_eq!(
+            aggregate_daily_weather_values(
+                DailyWeatherAggregation::Min("precipitation_probability"),
+                &values,
+                1,
+            ),
+            54.0
+        );
     }
 
     #[test]

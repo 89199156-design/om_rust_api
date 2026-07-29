@@ -1661,6 +1661,108 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
 }
 
 #[tokio::test]
+async fn gfs_precipitation_probability_interpolates_across_newer_run_overlays() {
+    let root = tempfile::tempdir().unwrap();
+    let deterministic = "gfs013_surface_probability_history_seed";
+    write_product_coverage_timed(
+        root.path(),
+        "gfs013_surface",
+        deterministic,
+        vec![
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [20.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [23.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+        ],
+        false,
+    );
+    let previous = "ncep_gefs025_probability_previous";
+    write_product_coverage_timed(
+        root.path(),
+        "ncep_gefs025",
+        previous,
+        vec![
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-07T21:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    let current = "ncep_gefs025_probability_current";
+    write_product_coverage_timed(
+        root.path(),
+        "ncep_gefs025",
+        current,
+        vec![
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [100.0; 4],
+                valid_time_utc: "2026-07-08T09:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("ncep_gefs025", previous)],
+    );
+    write_group_ready(
+        root.path(),
+        "gfs",
+        &[("gfs013_surface", deterministic), ("ncep_gefs025", current)],
+    );
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation_probability&start_hour=2026-07-08T00:00&end_hour=2026-07-08T03:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["hourly"]["precipitation_probability"],
+        serde_json::json!([0, 30, 70, 100])
+    );
+}
+
+#[tokio::test]
 async fn ecmwf_precipitation_probability_supports_independent_ensemble_run_and_missing_null() {
     let root = tempfile::tempdir().unwrap();
     let deterministic = "ecmwf_ifs025_probability_seed";

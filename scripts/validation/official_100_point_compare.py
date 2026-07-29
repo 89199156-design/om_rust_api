@@ -6,15 +6,18 @@ Validation then requests the local API one point at a time and stops at the
 first difference.  Successful point receipts are immutable and resumable, so
 diagnosis and fixes never consume the official API quota again.
 
-Only the official/local field intersection is compared.  GFS and ECMWF hourly
-and daily fields are compared directly.  Open-Meteo does not expose CAMS daily
-fields or Chinese AQI fields, so local-only derived outputs are intentionally
-outside this official parity run.
+Only the requested official/local surface-field intersection is compared. GFS
+and ECMWF surface hourly and daily fields are compared directly. Pressure-level
+fields are excluded because this validation targets the public point forecast
+contract rather than each server's pressure-level inventory. Open-Meteo does
+not expose CAMS daily fields or Chinese AQI fields, so local-only derived
+outputs are intentionally outside this official parity run.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -44,20 +47,14 @@ except ImportError:
 SCHEMA_VERSION = 1
 POINT_COUNT = 100
 USER_AGENT = "om-weather-server-official-100-point-validation/1.0"
-PRESSURE_LEVELS = (
-    10, 50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550,
-    600, 650, 700, 750, 800, 850, 900, 925, 950, 975, 1000,
-)
-GFS_PRESSURE_TYPES = (
-    "temperature",
-    "relative_humidity",
-    "dew_point",
-    "cloud_cover",
-    "wind_speed",
-    "wind_direction",
-    "geopotential_height",
-    "vertical_velocity",
-)
+DEFAULT_FIELD_CHUNK_SIZE = 12
+DEFAULT_REQUEST_DELAY_SECONDS = 0.5
+DEFAULT_POINT_DELAY_SECONDS = 2.0
+DEFAULT_MIN_AVAILABLE_MEMORY_MIB = 768.0
+DEFAULT_MAX_IO_FULL_PRESSURE_AVG10 = 10.0
+DEFAULT_RESOURCE_WAIT_TIMEOUT_SECONDS = 900.0
+DEFAULT_RESOURCE_POLL_SECONDS = 5.0
+DEFAULT_MAX_LOCAL_OM_API_PROCESSES = 2
 GFS_SURFACE = (
     "temperature_2m",
     "apparent_temperature",
@@ -117,9 +114,8 @@ GFS_SURFACE = (
     "et0_fao_evapotranspiration",
     "vapour_pressure_deficit",
 )
-GFS_HOURLY = GFS_SURFACE + tuple(
-    f"{kind}_{level}hPa" for level in PRESSURE_LEVELS for kind in GFS_PRESSURE_TYPES
-)
+GFS_HOURLY = GFS_SURFACE
+ECMWF_SURFACE_HOURLY = tuple(variable for variable in ECMWF_HOURLY if "hPa" not in variable)
 GFS_DAILY = (
     "temperature_2m_max",
     "temperature_2m_min",
@@ -214,8 +210,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "local_path": "/v1/ecmwf",
         "model_parameter": ("models", ["ecmwf_ifs025"]),
         "forecast_days": 15,
-        "official_hourly": tuple(ECMWF_HOURLY),
-        "local_hourly": tuple(ECMWF_HOURLY),
+        "official_hourly": ECMWF_SURFACE_HOURLY,
+        "local_hourly": ECMWF_SURFACE_HOURLY,
         "daily": tuple(ECMWF_DAILY),
     },
     "cams": {
@@ -283,6 +279,168 @@ CHINESE_DAILY_BREAKPOINTS = {
 
 class ValidationError(RuntimeError):
     pass
+
+
+def chunks(values: tuple[str, ...], size: int) -> list[tuple[str, ...]]:
+    if size <= 0:
+        raise ValidationError("field chunk size must be positive")
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def request_plan(model: str, field_chunk_size: int) -> list[dict[str, Any]]:
+    spec = MODEL_SPECS[model]
+    plan: list[dict[str, Any]] = []
+    for period, variables in (
+        ("hourly", tuple(spec["local_hourly"])),
+        ("daily", tuple(spec["daily"]) if model != "cams" else ()),
+    ):
+        for group in chunks(variables, field_chunk_size):
+            plan.append({"period": period, "variables": group})
+    return plan
+
+
+def attempt_id_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def linux_available_memory_mib() -> float | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return float(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def linux_io_full_pressure_avg10() -> float | None:
+    try:
+        for line in Path("/proc/pressure/io").read_text(encoding="ascii").splitlines():
+            if not line.startswith("full "):
+                continue
+            for item in line.split()[1:]:
+                key, value = item.split("=", 1)
+                if key == "avg10":
+                    return float(value)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def local_om_api_process_count() -> int | None:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+    count = 0
+    try:
+        entries = tuple(proc.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.joinpath("comm").read_text(encoding="ascii").strip() != "om-api":
+                continue
+            status = entry.joinpath("status").read_text(encoding="ascii")
+        except OSError:
+            continue
+        if "\nState:\tZ" not in f"\n{status}":
+            count += 1
+    return count
+
+
+def is_loopback_url(url: str) -> bool:
+    hostname = urllib.parse.urlsplit(url).hostname
+    return hostname in {"127.0.0.1", "::1", "localhost"}
+
+
+def wait_for_safe_local_resources(
+    *,
+    local_base: str,
+    min_available_memory_mib: float,
+    max_io_full_pressure_avg10: float,
+    max_local_om_api_processes: int,
+    wait_timeout_seconds: float,
+    poll_seconds: float,
+) -> dict[str, float | int | None]:
+    deadline = time.monotonic() + wait_timeout_seconds
+    while True:
+        available_memory_mib = linux_available_memory_mib()
+        io_full_pressure_avg10 = linux_io_full_pressure_avg10()
+        om_api_processes = (
+            local_om_api_process_count() if is_loopback_url(local_base) else None
+        )
+        if (
+            om_api_processes is not None
+            and om_api_processes > max_local_om_api_processes
+        ):
+            raise ValidationError(
+                "refusing local validation with "
+                f"{om_api_processes} om-api processes; maximum is "
+                f"{max_local_om_api_processes}"
+            )
+        memory_safe = (
+            available_memory_mib is None
+            or available_memory_mib >= min_available_memory_mib
+        )
+        io_safe = (
+            io_full_pressure_avg10 is None
+            or io_full_pressure_avg10 <= max_io_full_pressure_avg10
+        )
+        snapshot: dict[str, float | int | None] = {
+            "available_memory_mib": (
+                None
+                if available_memory_mib is None
+                else round(available_memory_mib, 3)
+            ),
+            "io_full_pressure_avg10": io_full_pressure_avg10,
+            "local_om_api_processes": om_api_processes,
+        }
+        if memory_safe and io_safe:
+            return snapshot
+        if time.monotonic() >= deadline:
+            raise ValidationError(
+                "local validation resource guard timed out: "
+                f"{json.dumps(snapshot, ensure_ascii=False)}"
+            )
+        print(
+            json.dumps({"event": "resource_wait", **snapshot}, ensure_ascii=False),
+            flush=True,
+        )
+        time.sleep(poll_seconds)
+
+
+@contextlib.contextmanager
+def validation_lock(output: Path):
+    lock_path = output / ".official-100-validation.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    fcntl_module = None
+    try:
+        try:
+            import fcntl as fcntl_module
+
+            fcntl_module.flock(
+                handle.fileno(), fcntl_module.LOCK_EX | fcntl_module.LOCK_NB
+            )
+        except ImportError:
+            pass
+        except BlockingIOError as exc:
+            raise ValidationError(
+                f"another validator holds {lock_path}; concurrent validation is forbidden"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        yield
+    finally:
+        try:
+            if fcntl_module is not None:
+                fcntl_module.flock(handle.fileno(), fcntl_module.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -577,18 +735,30 @@ def capture_official(
     return metadata
 
 
-def local_url(base: str, model: str, point: dict[str, Any]) -> str:
+def local_url(
+    base: str,
+    model: str,
+    point: dict[str, Any],
+    *,
+    hourly: tuple[str, ...] | None = None,
+    daily: tuple[str, ...] | None = None,
+) -> str:
     spec = MODEL_SPECS[model]
+    if hourly is None and daily is None:
+        hourly = tuple(spec["local_hourly"])
+        daily = tuple(spec["daily"]) if model != "cams" else ()
     params: dict[str, Any] = {
         "latitude": f"{point['latitude']:.4f}",
         "longitude": f"{point['longitude']:.4f}",
-        "hourly": ",".join(spec["local_hourly"]),
-        "daily": ",".join(spec["daily"]),
         "forecast_days": str(spec["forecast_days"]),
         "timezone": "GMT",
         "timeformat": "iso8601",
         "cell_selection": "nearest",
     }
+    if hourly:
+        params["hourly"] = ",".join(hourly)
+    if daily:
+        params["daily"] = ",".join(daily)
     if model != "cams":
         params["temperature_unit"] = "celsius"
         params["wind_speed_unit"] = "ms"
@@ -601,6 +771,131 @@ def local_url(base: str, model: str, point: dict[str, Any]) -> str:
     )
 
 
+def first_period_difference(
+    period: str,
+    variables: tuple[str, ...],
+    official: dict[str, Any],
+    local: dict[str, Any],
+) -> tuple[dict[str, Any] | None, int, int]:
+    hourly_count = 0
+    daily_count = 0
+    if not variables:
+        return None, hourly_count, daily_count
+    official_period = official.get(period)
+    local_period = local.get(period)
+    if not isinstance(official_period, dict) or not isinstance(local_period, dict):
+        return (
+            {
+                "period": period,
+                "reason": "missing_period",
+                "official_present": isinstance(official_period, dict),
+                "local_present": isinstance(local_period, dict),
+            },
+            hourly_count,
+            daily_count,
+        )
+    official_times = official_period.get("time")
+    local_times = local_period.get("time")
+    if (
+        not isinstance(official_times, list)
+        or not isinstance(local_times, list)
+        or len(set(official_times)) != len(official_times)
+        or len(set(local_times)) != len(local_times)
+    ):
+        return (
+            {
+                "period": period,
+                "variable": "time",
+                "reason": "invalid_time_axis",
+                "official": official_times,
+                "local": local_times,
+            },
+            hourly_count,
+            daily_count,
+        )
+    local_index_by_time = {
+        time_value: index for index, time_value in enumerate(local_times)
+    }
+    missing_time = next(
+        (
+            (index, time_value)
+            for index, time_value in enumerate(official_times)
+            if time_value not in local_index_by_time
+        ),
+        None,
+    )
+    if missing_time is not None:
+        index, time_value = missing_time
+        return (
+            {
+                "period": period,
+                "variable": "time",
+                "reason": "missing_official_time",
+                "index": index,
+                "time": time_value,
+                "local_start": local_times[0] if local_times else None,
+                "local_end": local_times[-1] if local_times else None,
+            },
+            hourly_count,
+            daily_count,
+        )
+    for variable in variables:
+        official_values = official_period.get(variable)
+        local_values = local_period.get(variable)
+        if (
+            not isinstance(official_values, list)
+            or not isinstance(local_values, list)
+            or len(official_values) != len(official_times)
+            or len(local_values) != len(local_times)
+        ):
+            return (
+                {
+                    "period": period,
+                    "variable": variable,
+                    "reason": "invalid_value_axis",
+                    "official_values": len(official_values)
+                    if isinstance(official_values, list)
+                    else None,
+                    "official_times": len(official_times),
+                    "local_values": len(local_values)
+                    if isinstance(local_values, list)
+                    else None,
+                    "local_times": len(local_times),
+                },
+                hourly_count,
+                daily_count,
+            )
+        index = next(
+            (
+                official_index
+                for official_index, time_value in enumerate(official_times)
+                if official_values[official_index]
+                != local_values[local_index_by_time[time_value]]
+            ),
+            None,
+        )
+        if index is not None:
+            local_index = local_index_by_time[official_times[index]]
+            return (
+                {
+                    "period": period,
+                    "variable": variable,
+                    "reason": "json_value",
+                    "index": index,
+                    "time": official_times[index],
+                    "official": official_values[index],
+                    "local": local_values[local_index],
+                },
+                hourly_count,
+                daily_count,
+            )
+        if period == "hourly":
+            hourly_count += len(official_values)
+        else:
+            daily_count += len(official_values)
+    return None, hourly_count, daily_count
+
+
 def first_direct_difference(
     model: str, official: dict[str, Any], local: dict[str, Any]
 ) -> tuple[dict[str, Any] | None, int, int]:
@@ -608,123 +903,16 @@ def first_direct_difference(
     hourly_count = 0
     daily_count = 0
     for period, variables in (
-        ("hourly", spec["official_hourly"]),
-        ("daily", spec["daily"] if model != "cams" else ()),
+        ("hourly", tuple(spec["official_hourly"])),
+        ("daily", tuple(spec["daily"]) if model != "cams" else ()),
     ):
-        if not variables:
-            continue
-        official_period = official.get(period)
-        local_period = local.get(period)
-        if not isinstance(official_period, dict) or not isinstance(local_period, dict):
-            return (
-                {
-                    "period": period,
-                    "reason": "missing_period",
-                    "official_present": isinstance(official_period, dict),
-                    "local_present": isinstance(local_period, dict),
-                },
-                hourly_count,
-                daily_count,
-            )
-        official_times = official_period.get("time")
-        local_times = local_period.get("time")
-        if (
-            not isinstance(official_times, list)
-            or not isinstance(local_times, list)
-            or len(set(official_times)) != len(official_times)
-            or len(set(local_times)) != len(local_times)
-        ):
-            return (
-                {
-                    "period": period,
-                    "variable": "time",
-                    "reason": "invalid_time_axis",
-                    "official": official_times,
-                    "local": local_times,
-                },
-                hourly_count,
-                daily_count,
-            )
-        local_index_by_time = {
-            time_value: index for index, time_value in enumerate(local_times)
-        }
-        missing_time = next(
-            (
-                (index, time_value)
-                for index, time_value in enumerate(official_times)
-                if time_value not in local_index_by_time
-            ),
-            None,
+        difference, hourly_part, daily_part = first_period_difference(
+            period, variables, official, local
         )
-        if missing_time is not None:
-            index, time_value = missing_time
-            return (
-                {
-                    "period": period,
-                    "variable": "time",
-                    "reason": "missing_official_time",
-                    "index": index,
-                    "time": time_value,
-                    "local_start": local_times[0] if local_times else None,
-                    "local_end": local_times[-1] if local_times else None,
-                },
-                hourly_count,
-                daily_count,
-            )
-        for variable in variables:
-            official_values = official_period.get(variable)
-            local_values = local_period.get(variable)
-            if (
-                not isinstance(official_values, list)
-                or not isinstance(local_values, list)
-                or len(official_values) != len(official_times)
-                or len(local_values) != len(local_times)
-            ):
-                return (
-                    {
-                        "period": period,
-                        "variable": variable,
-                        "reason": "invalid_value_axis",
-                        "official_values": len(official_values)
-                        if isinstance(official_values, list)
-                        else None,
-                        "official_times": len(official_times),
-                        "local_values": len(local_values)
-                        if isinstance(local_values, list)
-                        else None,
-                        "local_times": len(local_times),
-                    },
-                    hourly_count,
-                    daily_count,
-                )
-            index = next(
-                (
-                    official_index
-                    for official_index, time_value in enumerate(official_times)
-                    if official_values[official_index]
-                    != local_values[local_index_by_time[time_value]]
-                ),
-                None,
-            )
-            if index is not None:
-                local_index = local_index_by_time[official_times[index]]
-                return (
-                    {
-                        "period": period,
-                        "variable": variable,
-                        "reason": "json_value",
-                        "index": index,
-                        "time": official_times[index],
-                        "official": official_values[index],
-                        "local": local_values[local_index],
-                    },
-                    hourly_count,
-                    daily_count,
-                )
-            if period == "hourly":
-                hourly_count += len(official_values)
-            else:
-                daily_count += len(official_values)
+        hourly_count += hourly_part
+        daily_count += daily_part
+        if difference is not None:
+            return difference, hourly_count, daily_count
     return None, hourly_count, daily_count
 
 
@@ -952,6 +1140,16 @@ def validate_model(
     local_base: str,
     timeout: float,
     retries: int,
+    point_delay_seconds: float,
+    field_chunk_size: int = DEFAULT_FIELD_CHUNK_SIZE,
+    request_delay_seconds: float = DEFAULT_REQUEST_DELAY_SECONDS,
+    min_available_memory_mib: float = DEFAULT_MIN_AVAILABLE_MEMORY_MIB,
+    max_io_full_pressure_avg10: float = DEFAULT_MAX_IO_FULL_PRESSURE_AVG10,
+    resource_wait_timeout_seconds: float = DEFAULT_RESOURCE_WAIT_TIMEOUT_SECONDS,
+    resource_poll_seconds: float = DEFAULT_RESOURCE_POLL_SECONDS,
+    max_local_om_api_processes: int = DEFAULT_MAX_LOCAL_OM_API_PROCESSES,
+    attempt_id: str | None = None,
+    point_limit: int = POINT_COUNT,
 ) -> dict[str, Any]:
     official_path = output / model / "official" / "response.json"
     metadata_path = output / model / "official" / "metadata.json"
@@ -962,6 +1160,10 @@ def validate_model(
     if sha256_bytes(official_raw) != metadata["response_sha256"]:
         raise ValidationError(f"official {model} snapshot hash mismatch")
     official_rows = normalize_rows(json.loads(official_raw), POINT_COUNT)
+    plan = request_plan(model, field_chunk_size)
+    if not plan:
+        raise ValidationError(f"{model} has no local fields to validate")
+    attempt_id = attempt_id or attempt_id_now()
     report_path = output / model / "report.json"
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -971,57 +1173,190 @@ def validate_model(
         "official_snapshot_sha256": metadata["response_sha256"],
         "official_requests": metadata["official_request_count"],
         "points_total": POINT_COUNT,
+        "points_target": point_limit,
         "points_completed": 0,
+        "local_requests_completed": 0,
+        "local_requests_per_point": len(plan),
         "hourly_values_compared": 0,
         "daily_values_compared": 0,
         "comparison": "strict_official_json_values_for_field_intersection",
+        "local_request_mode": "sequential_field_chunks",
+        "field_chunk_size": field_chunk_size,
         "failure": None,
+        "current_point": None,
+        "current_request": None,
+        "current_point_hourly_values_compared": 0,
+        "current_point_daily_values_compared": 0,
+        "attempt_id": attempt_id,
+        "point_delay_seconds": point_delay_seconds,
+        "request_delay_seconds": request_delay_seconds,
+        "resource_guard": {
+            "min_available_memory_mib": min_available_memory_mib,
+            "max_io_full_pressure_avg10": max_io_full_pressure_avg10,
+            "resource_wait_timeout_seconds": resource_wait_timeout_seconds,
+            "resource_poll_seconds": resource_poll_seconds,
+            "max_local_om_api_processes": max_local_om_api_processes,
+        },
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     points = sample_points()
     receipts = output / model / "receipts"
     receipts.mkdir(parents=True, exist_ok=True)
-    for point, official in zip(points, official_rows):
+    for point, official in zip(points[:point_limit], official_rows[:point_limit]):
         receipt_path = receipts / f"{point['order']:03d}_{point['id']}.json"
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             report["points_completed"] += 1
+            report["local_requests_completed"] += receipt.get(
+                "local_request_count", len(plan)
+            )
             report["hourly_values_compared"] += receipt["hourly_values_compared"]
             report["daily_values_compared"] += receipt["daily_values_compared"]
             continue
-        url = local_url(local_base, model, point)
-        raw, headers, elapsed = request_json(
-            "GET",
-            url,
-            body=None,
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=timeout,
-            retries=retries,
+        report["current_point"] = point
+        report["current_point_hourly_values_compared"] = 0
+        report["current_point_daily_values_compared"] = 0
+        write_json(report_path, report)
+        print(
+            json.dumps(
+                {
+                    "model": model,
+                    "event": "point_started",
+                    "point": point,
+                    "points_completed": report["points_completed"],
+                    "points_total": POINT_COUNT,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
         )
-        local_path = output / model / "local" / f"{point['order']:03d}_{point['id']}.json"
-        write_once(local_path, raw)
-        local = normalize_rows(json.loads(raw), 1)[0]
-        difference, hourly_count, daily_count = first_direct_difference(model, official, local)
-        if difference is not None:
-            failure = {
-                "point": point,
-                "difference": difference,
+        hourly_count = 0
+        daily_count = 0
+        local_elapsed_seconds = 0.0
+        response_parts: list[dict[str, Any]] = []
+        for request_index, request_part in enumerate(plan):
+            period = request_part["period"]
+            variables = request_part["variables"]
+            resource_snapshot = wait_for_safe_local_resources(
+                local_base=local_base,
+                min_available_memory_mib=min_available_memory_mib,
+                max_io_full_pressure_avg10=max_io_full_pressure_avg10,
+                max_local_om_api_processes=max_local_om_api_processes,
+                wait_timeout_seconds=resource_wait_timeout_seconds,
+                poll_seconds=resource_poll_seconds,
+            )
+            report["current_request"] = {
+                "index": request_index,
+                "count": len(plan),
+                "period": period,
+                "variables": list(variables),
+                "resources": resource_snapshot,
+            }
+            write_json(report_path, report)
+            print(
+                json.dumps(
+                    {
+                        "model": model,
+                        "event": "request_started",
+                        "point": point,
+                        **report["current_request"],
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            url = local_url(
+                local_base,
+                model,
+                point,
+                hourly=variables if period == "hourly" else (),
+                daily=variables if period == "daily" else (),
+            )
+            raw, headers, elapsed = request_json(
+                "GET",
+                url,
+                body=None,
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                timeout=timeout,
+                retries=retries,
+            )
+            local_path = (
+                output
+                / model
+                / "local"
+                / "attempts"
+                / attempt_id
+                / f"{point['order']:03d}_{point['id']}"
+                / f"{request_index:03d}_{period}.json"
+            )
+            write_once(local_path, raw)
+            local = normalize_rows(json.loads(raw), 1)[0]
+            difference, hourly_part, daily_part = first_period_difference(
+                period, variables, official, local
+            )
+            hourly_count += hourly_part
+            daily_count += daily_part
+            report["current_point_hourly_values_compared"] = hourly_count
+            report["current_point_daily_values_compared"] = daily_count
+            local_elapsed_seconds += elapsed
+            part_metadata = {
+                "index": request_index,
+                "period": period,
+                "variables": list(variables),
                 "local_response_file": str(local_path),
                 "local_response_sha256": sha256_bytes(raw),
+                "local_elapsed_seconds": round(elapsed, 6),
+                "local_response_headers": headers,
+                "resources_before_request": resource_snapshot,
             }
-            report["status"] = "failed"
-            report["failure"] = failure
+            response_parts.append(part_metadata)
+            report["local_requests_completed"] += 1
+            if difference is not None:
+                failure = {
+                    "point": point,
+                    "request": part_metadata,
+                    "difference": difference,
+                }
+                report["status"] = "failed"
+                report["failure"] = failure
+                write_json(report_path, report)
+                raise ValidationError(
+                    f"{model} stopped at {point['id']}: "
+                    f"{json.dumps(difference, ensure_ascii=False)}"
+                )
+            report["current_request"] = None
             write_json(report_path, report)
-            raise ValidationError(
-                f"{model} stopped at {point['id']}: {json.dumps(difference, ensure_ascii=False)}"
+            print(
+                json.dumps(
+                    {
+                        "model": model,
+                        "event": "request_passed",
+                        "point": point,
+                        "request_index": request_index,
+                        "request_count": len(plan),
+                        "period": period,
+                        "variables": list(variables),
+                        "local_elapsed_seconds": round(elapsed, 6),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
             )
+            if request_delay_seconds > 0 and request_index + 1 < len(plan):
+                time.sleep(request_delay_seconds)
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "model": model,
             "point": point,
             "official_row_sha256": sha256_bytes(canonical_bytes(official)),
-            "local_response_sha256": sha256_bytes(raw),
-            "local_elapsed_seconds": round(elapsed, 6),
-            "local_response_headers": headers,
+            "local_response_sha256": sha256_bytes(
+                canonical_bytes(
+                    [part["local_response_sha256"] for part in response_parts]
+                )
+            ),
+            "local_response_parts": response_parts,
+            "local_request_count": len(response_parts),
+            "local_elapsed_seconds": round(local_elapsed_seconds, 6),
             "hourly_values_compared": hourly_count,
             "daily_values_compared": daily_count,
             "status": "passed",
@@ -1030,8 +1365,29 @@ def validate_model(
         report["points_completed"] += 1
         report["hourly_values_compared"] += hourly_count
         report["daily_values_compared"] += daily_count
+        report["current_point"] = None
+        report["current_request"] = None
+        report["current_point_hourly_values_compared"] = 0
+        report["current_point_daily_values_compared"] = 0
         write_json(report_path, report)
-    report["status"] = "passed"
+        print(
+            json.dumps(
+                {
+                    "model": model,
+                    "event": "point_passed",
+                    "point": point,
+                    "points_completed": report["points_completed"],
+                    "points_total": POINT_COUNT,
+                    "local_request_count": len(response_parts),
+                    "local_elapsed_seconds": round(local_elapsed_seconds, 6),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        if point_delay_seconds > 0 and report["points_completed"] < point_limit:
+            time.sleep(point_delay_seconds)
+    report["status"] = "passed" if point_limit == POINT_COUNT else "partial"
     report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     write_json(report_path, report)
     return report
@@ -1046,6 +1402,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-key-env", default="OPEN_METEO_API_KEY")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument(
+        "--point-delay-seconds",
+        type=float,
+        default=DEFAULT_POINT_DELAY_SECONDS,
+        help=(
+            "pause between successful local points so validation does not "
+            "starve production monitoring or SSH"
+        ),
+    )
+    parser.add_argument(
+        "--field-chunk-size",
+        type=int,
+        default=DEFAULT_FIELD_CHUNK_SIZE,
+        help="maximum hourly or daily fields per local API request",
+    )
+    parser.add_argument(
+        "--request-delay-seconds",
+        type=float,
+        default=DEFAULT_REQUEST_DELAY_SECONDS,
+        help="pause between field-chunk requests for the same point",
+    )
+    parser.add_argument(
+        "--min-available-memory-mib",
+        type=float,
+        default=DEFAULT_MIN_AVAILABLE_MEMORY_MIB,
+        help="wait before the next local request when Linux MemAvailable is lower",
+    )
+    parser.add_argument(
+        "--max-io-full-pressure-avg10",
+        type=float,
+        default=DEFAULT_MAX_IO_FULL_PRESSURE_AVG10,
+        help="wait while Linux full I/O PSI avg10 exceeds this percentage",
+    )
+    parser.add_argument(
+        "--resource-wait-timeout-seconds",
+        type=float,
+        default=DEFAULT_RESOURCE_WAIT_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        "--resource-poll-seconds",
+        type=float,
+        default=DEFAULT_RESOURCE_POLL_SECONDS,
+    )
+    parser.add_argument(
+        "--max-local-om-api-processes",
+        type=int,
+        default=DEFAULT_MAX_LOCAL_OM_API_PROCESSES,
+        help="refuse loopback validation when too many om-api processes exist",
+    )
+    parser.add_argument(
+        "--point-limit",
+        type=int,
+        default=POINT_COUNT,
+        help="validate only the first N points for a partial smoke run (maximum 100)",
+    )
     return parser.parse_args()
 
 
@@ -1055,6 +1466,29 @@ def main() -> int:
     invalid = set(models) - set(MODEL_SPECS)
     if invalid:
         raise ValidationError(f"unknown models: {sorted(invalid)}")
+    non_negative = {
+        "--point-delay-seconds": args.point_delay_seconds,
+        "--request-delay-seconds": args.request_delay_seconds,
+        "--min-available-memory-mib": args.min_available_memory_mib,
+        "--max-io-full-pressure-avg10": args.max_io_full_pressure_avg10,
+        "--resource-wait-timeout-seconds": args.resource_wait_timeout_seconds,
+    }
+    invalid_non_negative = [
+        name for name, value in non_negative.items() if value < 0
+    ]
+    if invalid_non_negative:
+        raise ValidationError(
+            f"{', '.join(invalid_non_negative)} must be non-negative"
+        )
+    positive = {
+        "--field-chunk-size": args.field_chunk_size,
+        "--resource-poll-seconds": args.resource_poll_seconds,
+        "--max-local-om-api-processes": args.max_local_om_api_processes,
+        "--point-limit": args.point_limit,
+    }
+    invalid_positive = [name for name, value in positive.items() if value <= 0]
+    if invalid_positive:
+        raise ValidationError(f"{', '.join(invalid_positive)} must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
     ensure_validation_manifest(manifest_path, models)
@@ -1076,11 +1510,27 @@ def main() -> int:
                 flush=True,
             )
     if args.command in {"validate", "run"}:
-        for model in models:
-            report = validate_model(
-                model, args.output, args.local_base, args.timeout, args.retries
-            )
-            print(json.dumps(report, ensure_ascii=False), flush=True)
+        attempt_id = attempt_id_now()
+        with validation_lock(args.output):
+            for model in models:
+                report = validate_model(
+                    model,
+                    args.output,
+                    args.local_base,
+                    args.timeout,
+                    args.retries,
+                    args.point_delay_seconds,
+                    args.field_chunk_size,
+                    args.request_delay_seconds,
+                    args.min_available_memory_mib,
+                    args.max_io_full_pressure_avg10,
+                    args.resource_wait_timeout_seconds,
+                    args.resource_poll_seconds,
+                    args.max_local_om_api_processes,
+                    attempt_id,
+                    args.point_limit,
+                )
+                print(json.dumps(report, ensure_ascii=False), flush=True)
     return 0
 
 
