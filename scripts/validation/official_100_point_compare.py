@@ -199,7 +199,8 @@ CAMS_DAILY: tuple[str, ...] = ()
 
 MODEL_SPECS: dict[str, dict[str, Any]] = {
     "gfs": {
-        "official_endpoint": "https://customer-api.open-meteo.com/v1/gfs",
+        "public_endpoint": "https://api.open-meteo.com/v1/gfs",
+        "customer_endpoint": "https://customer-api.open-meteo.com/v1/gfs",
         "local_path": "/v1/gfs",
         "model_parameter": ("models", ["gfs_global"]),
         "forecast_days": 16,
@@ -208,7 +209,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "daily": GFS_DAILY,
     },
     "ec": {
-        "official_endpoint": "https://customer-api.open-meteo.com/v1/ecmwf",
+        "public_endpoint": "https://api.open-meteo.com/v1/ecmwf",
+        "customer_endpoint": "https://customer-api.open-meteo.com/v1/ecmwf",
         "local_path": "/v1/ecmwf",
         "model_parameter": ("models", ["ecmwf_ifs025"]),
         "forecast_days": 15,
@@ -217,7 +219,10 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "daily": tuple(ECMWF_DAILY),
     },
     "cams": {
-        "official_endpoint": "https://customer-air-quality-api.open-meteo.com/v1/air-quality",
+        "public_endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
+        "customer_endpoint": (
+            "https://customer-air-quality-api.open-meteo.com/v1/air-quality"
+        ),
         "local_path": "/v1/cams",
         "model_parameter": ("domains", "cams_global"),
         "forecast_days": 5,
@@ -442,7 +447,7 @@ def official_payload(model: str, points: list[dict[str, Any]]) -> dict[str, Any]
 def capture_official(
     model: str,
     output: Path,
-    api_key: str,
+    api_key: str | None,
     timeout: float,
     retries: int,
 ) -> dict[str, Any]:
@@ -460,8 +465,11 @@ def capture_official(
     points = sample_points()
     payload = official_payload(model, points)
     payload_raw = canonical_bytes(payload)
-    wire_payload_raw = canonical_bytes({**payload, "apikey": api_key})
-    endpoint = MODEL_SPECS[model]["official_endpoint"]
+    api_key = (api_key or "").strip()
+    wire_payload = {**payload, **({"apikey": api_key} if api_key else {})}
+    wire_payload_raw = canonical_bytes(wire_payload)
+    endpoint_key = "customer_endpoint" if api_key else "public_endpoint"
+    endpoint = MODEL_SPECS[model][endpoint_key]
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -474,7 +482,7 @@ def capture_official(
         headers=headers,
         timeout=timeout,
         retries=retries,
-        redact=(api_key,),
+        redact=(api_key,) if api_key else (),
     )
     try:
         rows = normalize_rows(json.loads(raw), POINT_COUNT)
@@ -496,7 +504,12 @@ def capture_official(
         "response_bytes": len(raw),
         "elapsed_seconds": round(elapsed, 6),
         "response_headers": response_headers,
-        "api_key_transport": "POST JSON apikey field (excluded from request snapshot)",
+        "api_access_tier": "customer_commercial" if api_key else "public_noncommercial",
+        "api_key_transport": (
+            "POST JSON apikey field (excluded from request snapshot)"
+            if api_key
+            else "none"
+        ),
         "api_key_persisted": False,
     }
     write_once(metadata_path, pretty_bytes(metadata))
@@ -973,12 +986,7 @@ def main() -> int:
     }
     write_once(manifest_path, pretty_bytes(manifest))
     if args.command in {"capture", "run"}:
-        api_key = os.environ.get(args.api_key_env, "").strip()
-        if not api_key:
-            raise ValidationError(
-                f"commercial official capture requires {args.api_key_env}; "
-                "the public non-commercial API is intentionally not used"
-            )
+        api_key = os.environ.get(args.api_key_env, "").strip() or None
         for model in models:
             metadata = capture_official(
                 model, args.output, api_key, args.timeout, args.retries

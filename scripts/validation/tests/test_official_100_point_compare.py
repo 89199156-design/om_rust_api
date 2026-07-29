@@ -91,11 +91,34 @@ class Official100PointCompareTests(unittest.TestCase):
             )
 
         self.assertEqual(captured["method"], "POST")
+        self.assertEqual(
+            captured["url"], "https://customer-api.open-meteo.com/v1/gfs"
+        )
         self.assertEqual(wire_payload["apikey"], "commercial-secret")
         self.assertNotIn("X-Api-Key", captured["headers"])
         self.assertNotIn("apikey", persisted_payload)
         self.assertNotIn("commercial-secret", json.dumps(persisted_metadata))
         self.assertFalse(metadata["api_key_persisted"])
+        self.assertEqual(metadata["api_access_tier"], "customer_commercial")
+
+    def test_capture_without_key_uses_public_noncommercial_endpoint(self) -> None:
+        captured: dict[str, object] = {}
+        response = json.dumps([{} for _ in range(100)]).encode()
+
+        def fake_request(method, url, **kwargs):
+            captured.update(method=method, url=url, **kwargs)
+            return response, {}, 0.01
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.object(compare, "request_json", side_effect=fake_request):
+                metadata = compare.capture_official(
+                    "gfs", Path(temporary_directory), None, 10.0, 0
+                )
+
+        self.assertEqual(captured["url"], "https://api.open-meteo.com/v1/gfs")
+        self.assertNotIn("apikey", json.loads(captured["body"]))
+        self.assertEqual(metadata["api_access_tier"], "public_noncommercial")
+        self.assertEqual(metadata["api_key_transport"], "none")
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
