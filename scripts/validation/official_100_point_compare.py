@@ -611,6 +611,8 @@ def first_direct_difference(
         ("hourly", spec["official_hourly"]),
         ("daily", spec["daily"] if model != "cams" else ()),
     ):
+        if not variables:
+            continue
         official_period = official.get(period)
         local_period = local.get(period)
         if not isinstance(official_period, dict) or not isinstance(local_period, dict):
@@ -624,55 +626,97 @@ def first_direct_difference(
                 hourly_count,
                 daily_count,
             )
-        if official_period.get("time") != local_period.get("time"):
+        official_times = official_period.get("time")
+        local_times = local_period.get("time")
+        if (
+            not isinstance(official_times, list)
+            or not isinstance(local_times, list)
+            or len(set(official_times)) != len(official_times)
+            or len(set(local_times)) != len(local_times)
+        ):
             return (
                 {
                     "period": period,
                     "variable": "time",
-                    "reason": "time_axis",
-                    "official": official_period.get("time"),
-                    "local": local_period.get("time"),
+                    "reason": "invalid_time_axis",
+                    "official": official_times,
+                    "local": local_times,
                 },
                 hourly_count,
                 daily_count,
             )
-        times = official_period["time"]
+        local_index_by_time = {
+            time_value: index for index, time_value in enumerate(local_times)
+        }
+        missing_time = next(
+            (
+                (index, time_value)
+                for index, time_value in enumerate(official_times)
+                if time_value not in local_index_by_time
+            ),
+            None,
+        )
+        if missing_time is not None:
+            index, time_value = missing_time
+            return (
+                {
+                    "period": period,
+                    "variable": "time",
+                    "reason": "missing_official_time",
+                    "index": index,
+                    "time": time_value,
+                    "local_start": local_times[0] if local_times else None,
+                    "local_end": local_times[-1] if local_times else None,
+                },
+                hourly_count,
+                daily_count,
+            )
         for variable in variables:
             official_values = official_period.get(variable)
             local_values = local_period.get(variable)
-            if official_values != local_values:
-                if not isinstance(official_values, list) or not isinstance(local_values, list):
-                    index = None
-                else:
-                    index = next(
-                        (
-                            offset
-                            for offset, pair in enumerate(zip(official_values, local_values))
-                            if pair[0] != pair[1]
-                        ),
-                        min(len(official_values), len(local_values)),
-                    )
+            if (
+                not isinstance(official_values, list)
+                or not isinstance(local_values, list)
+                or len(official_values) != len(official_times)
+                or len(local_values) != len(local_times)
+            ):
+                return (
+                    {
+                        "period": period,
+                        "variable": variable,
+                        "reason": "invalid_value_axis",
+                        "official_values": len(official_values)
+                        if isinstance(official_values, list)
+                        else None,
+                        "official_times": len(official_times),
+                        "local_values": len(local_values)
+                        if isinstance(local_values, list)
+                        else None,
+                        "local_times": len(local_times),
+                    },
+                    hourly_count,
+                    daily_count,
+                )
+            index = next(
+                (
+                    official_index
+                    for official_index, time_value in enumerate(official_times)
+                    if official_values[official_index]
+                    != local_values[local_index_by_time[time_value]]
+                ),
+                None,
+            )
+            if index is not None:
+                local_index = local_index_by_time[official_times[index]]
                 return (
                     {
                         "period": period,
                         "variable": variable,
                         "reason": "json_value",
                         "index": index,
-                        "time": times[index] if isinstance(index, int) and index < len(times) else None,
-                        "official": (
-                            official_values[index]
-                            if isinstance(official_values, list)
-                            and isinstance(index, int)
-                            and index < len(official_values)
-                            else official_values
-                        ),
-                        "local": (
-                            local_values[index]
-                            if isinstance(local_values, list)
-                            and isinstance(index, int)
-                            and index < len(local_values)
-                            else local_values
-                        ),
+                        "time": official_times[index],
+                        "official": official_values[index],
+                        "local": local_values[local_index],
                     },
                     hourly_count,
                     daily_count,

@@ -55,6 +55,24 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(compare.CAMS_DAILY, ())
         self.assertNotIn("chinese_aqi", compare.CAMS_HOURLY_LOCAL)
 
+    def test_cams_direct_comparison_does_not_require_daily_period(self) -> None:
+        original = compare.MODEL_SPECS["cams"]
+        compare.MODEL_SPECS["cams"] = {
+            **original,
+            "official_hourly": ("pm10",),
+            "daily": (),
+        }
+        try:
+            payload = {"hourly": {"time": ["a"], "pm10": [1.0]}}
+            difference, hourly_count, daily_count = compare.first_direct_difference(
+                "cams", payload, payload
+            )
+            self.assertIsNone(difference)
+            self.assertEqual(hourly_count, 1)
+            self.assertEqual(daily_count, 0)
+        finally:
+            compare.MODEL_SPECS["cams"] = original
+
     def test_official_payload_uses_one_multi_location_request(self) -> None:
         payload = compare.official_payload("gfs", compare.sample_points())
         self.assertEqual(len(payload["latitude"]), 100)
@@ -167,6 +185,59 @@ class Official100PointCompareTests(unittest.TestCase):
             self.assertEqual(difference["period"], "hourly")
             self.assertEqual(difference["variable"], "temperature_2m")
             self.assertEqual(difference["index"], 1)
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_direct_comparison_ignores_local_history_outside_official_axis(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        try:
+            official = {
+                "hourly": {"time": ["b", "c"], "temperature_2m": [2, 3]},
+                "daily": {"time": []},
+            }
+            local = {
+                "hourly": {
+                    "time": ["a", "b", "c"],
+                    "temperature_2m": [1, 2, 3],
+                },
+                "daily": {"time": ["older"]},
+            }
+            difference, hourly_count, daily_count = compare.first_direct_difference(
+                "gfs", official, local
+            )
+            self.assertIsNone(difference)
+            self.assertEqual(hourly_count, 2)
+            self.assertEqual(daily_count, 0)
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_direct_comparison_reports_missing_official_tail_time(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        try:
+            official = {
+                "hourly": {"time": ["b", "c"], "temperature_2m": [2, 3]},
+                "daily": {"time": []},
+            }
+            local = {
+                "hourly": {"time": ["a", "b"], "temperature_2m": [1, 2]},
+                "daily": {"time": []},
+            }
+            difference, _, _ = compare.first_direct_difference(
+                "gfs", official, local
+            )
+            self.assertEqual(difference["reason"], "missing_official_time")
+            self.assertEqual(difference["time"], "c")
+            self.assertEqual(difference["local_end"], "b")
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
