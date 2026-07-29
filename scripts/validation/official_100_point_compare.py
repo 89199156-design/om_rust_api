@@ -383,6 +383,7 @@ def request_json(
     headers: dict[str, str],
     timeout: float,
     retries: int,
+    redact: tuple[str, ...] = (),
 ) -> tuple[bytes, dict[str, str], float]:
     attempt = 0
     while True:
@@ -402,9 +403,13 @@ def request_json(
             raw = exc.read()
             transient = exc.code in {408, 425, 429, 500, 502, 503, 504}
             if not transient or attempt >= retries:
+                response_text = raw[:1000].decode("utf-8", errors="replace")
+                for secret in redact:
+                    if secret:
+                        response_text = response_text.replace(secret, "[REDACTED]")
                 raise ValidationError(
                     f"{method} {url} returned HTTP {exc.code}: "
-                    f"{raw[:1000].decode('utf-8', errors='replace')}"
+                    f"{response_text}"
                 ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
             if attempt >= retries:
@@ -455,20 +460,21 @@ def capture_official(
     points = sample_points()
     payload = official_payload(model, points)
     payload_raw = canonical_bytes(payload)
+    wire_payload_raw = canonical_bytes({**payload, "apikey": api_key})
     endpoint = MODEL_SPECS[model]["official_endpoint"]
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
-        "X-Api-Key": api_key,
     }
     raw, response_headers, elapsed = request_json(
         "POST",
         endpoint,
-        body=payload_raw,
+        body=wire_payload_raw,
         headers=headers,
         timeout=timeout,
         retries=retries,
+        redact=(api_key,),
     )
     try:
         rows = normalize_rows(json.loads(raw), POINT_COUNT)
@@ -490,7 +496,7 @@ def capture_official(
         "response_bytes": len(raw),
         "elapsed_seconds": round(elapsed, 6),
         "response_headers": response_headers,
-        "api_key_transport": "X-Api-Key header",
+        "api_key_transport": "POST JSON apikey field (excluded from request snapshot)",
         "api_key_persisted": False,
     }
     write_once(metadata_path, pretty_bytes(metadata))

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,40 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(payload["cell_selection"], "nearest")
         self.assertIn("precipitation_probability", payload["hourly"])
         self.assertIn("precipitation_probability_max", payload["daily"])
+
+    def test_capture_sends_apikey_in_post_body_without_persisting_it(self) -> None:
+        captured: dict[str, object] = {}
+        response = json.dumps([{} for _ in range(100)]).encode()
+
+        def fake_request(method, url, **kwargs):
+            captured.update(method=method, url=url, **kwargs)
+            return response, {}, 0.01
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            with mock.patch.object(compare, "request_json", side_effect=fake_request):
+                metadata = compare.capture_official(
+                    "gfs", output, "commercial-secret", 10.0, 0
+                )
+
+            wire_payload = json.loads(captured["body"])
+            persisted_payload = json.loads(
+                (output / "gfs" / "official" / "request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            persisted_metadata = json.loads(
+                (output / "gfs" / "official" / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(wire_payload["apikey"], "commercial-secret")
+        self.assertNotIn("X-Api-Key", captured["headers"])
+        self.assertNotIn("apikey", persisted_payload)
+        self.assertNotIn("commercial-secret", json.dumps(persisted_metadata))
+        self.assertFalse(metadata["api_key_persisted"])
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
