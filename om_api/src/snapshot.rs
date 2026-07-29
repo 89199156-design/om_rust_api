@@ -7,9 +7,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const GFS_PRODUCTS: &[&str] = &["gfs013_surface", "gfs025", "gfs_pressure_profile"];
+pub const GFS_NATIVE_PRODUCTS: &[&str] = &["gfs013_surface", "gfs025", "gfs_pressure_profile"];
+pub const GFS_SIDECAR_PRODUCTS: &[&str] = &["ncep_gefs025", "ncep_gefs05"];
+pub const GFS_PRODUCTS: &[&str] = &[
+    "gfs013_surface",
+    "gfs025",
+    "gfs_pressure_profile",
+    "ncep_gefs025",
+    "ncep_gefs05",
+];
 pub const CAMS_PRODUCTS: &[&str] = &["cams_global", "cams_global_greenhouse_gases"];
-pub const ECMWF_PRODUCTS: &[&str] = &["ecmwf_ifs025"];
+pub const ECMWF_PRODUCTS: &[&str] = &["ecmwf_ifs025", "ecmwf_ifs025_ensemble"];
 
 #[derive(Debug)]
 pub struct OmDataSnapshot {
@@ -26,7 +34,7 @@ impl OmDataSnapshot {
         let gfs_native = load_native_group_products(
             &data_root,
             "gfs",
-            GFS_PRODUCTS,
+            GFS_NATIVE_PRODUCTS,
             &mut products,
             &mut historical_products,
         )?;
@@ -43,6 +51,24 @@ impl OmDataSnapshot {
                 &data_root,
                 "gfs",
                 GFS_PRODUCTS,
+                &products,
+                &mut historical_products,
+            )?;
+        } else {
+            // The native GFS marker intentionally materializes only the three
+            // deterministic products. Load GEFS probability from the exact
+            // immutable source release named by that marker, never from an
+            // independently advancing "latest" directory.
+            load_selected_source_release_products(
+                &data_root,
+                "gfs",
+                GFS_SIDECAR_PRODUCTS,
+                &mut products,
+            )?;
+            load_group_release_history(
+                &data_root,
+                "gfs",
+                GFS_SIDECAR_PRODUCTS,
                 &products,
                 &mut historical_products,
             )?;
@@ -95,9 +121,14 @@ impl OmDataSnapshot {
 
 #[derive(Debug, Deserialize)]
 struct GroupReady {
+    #[serde(default)]
+    group: String,
     status: String,
     #[serde(default)]
+    release_id: String,
+    #[serde(default)]
     latest_complete_run: String,
+    #[serde(default)]
     product_manifests: HashMap<String, ProductReady>,
 }
 
@@ -124,6 +155,65 @@ fn load_group_products(
     if ready.status != "complete" {
         return Ok(());
     }
+    load_products_from_ready(data_root, group, group_products, &ready, products)?;
+    Ok(())
+}
+
+fn load_selected_source_release_products(
+    data_root: &Path,
+    group: &str,
+    group_products: &[&str],
+    products: &mut HashMap<String, Arc<ProductSnapshot>>,
+) -> Result<()> {
+    let current_path = data_root
+        .join("groups")
+        .join(group)
+        .join("current")
+        .join("ready_for_processing.json");
+    if !current_path.is_file() {
+        return Ok(());
+    }
+    let current: GroupReady = load_manifest_like(&current_path)?;
+    if current.status != "complete" || current.release_id.is_empty() {
+        return Ok(());
+    }
+    if !current
+        .release_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("group current marker contains an unsafe release_id");
+    }
+    let release_path = data_root
+        .join("groups")
+        .join(group)
+        .join("releases")
+        .join(format!("{}.json", current.release_id));
+    if !release_path.is_file() {
+        return Ok(());
+    }
+    let release: GroupReady = load_manifest_like(&release_path)?;
+    if release.status != "complete"
+        || (!release.group.is_empty() && release.group != group)
+        || release.release_id != current.release_id
+        || release.latest_complete_run != current.latest_complete_run
+    {
+        anyhow::bail!(
+            "source release {} does not match current {} marker",
+            current.release_id,
+            group
+        );
+    }
+    load_products_from_ready(data_root, group, group_products, &release, products)
+}
+
+fn load_products_from_ready(
+    data_root: &Path,
+    group: &str,
+    group_products: &[&str],
+    ready: &GroupReady,
+    products: &mut HashMap<String, Arc<ProductSnapshot>>,
+) -> Result<()> {
     for product in group_products {
         if let Some(product_ready) = ready.product_manifests.get(*product) {
             if data_root.join(product).exists() {

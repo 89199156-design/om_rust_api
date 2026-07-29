@@ -22,14 +22,26 @@ from .static_assets import (
 from .storage_guard import enforce_environment_storage_guard
 
 OPENMETEO_GROUP_PRODUCTS = {
-    "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
+    "gfs": (
+        "gfs013_surface",
+        "gfs025",
+        "gfs_pressure_profile",
+        "ncep_gefs025",
+        "ncep_gefs05",
+    ),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
-    "ecmwf": ("ecmwf_ifs025",),
+    "ecmwf": ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
 }
 MINIMUM_GROUP_PRODUCTS = {
-    "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
+    "gfs": (
+        "gfs013_surface",
+        "gfs025",
+        "gfs_pressure_profile",
+        "ncep_gefs025",
+        "ncep_gefs05",
+    ),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
-    "ecmwf": ("ecmwf_ifs025",),
+    "ecmwf": ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
 }
 GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 DEFAULT_COMPLETE_RELEASE_RETENTION = 3

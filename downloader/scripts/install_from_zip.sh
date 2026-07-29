@@ -93,6 +93,7 @@ run_privileged install -d -o "$INSTALL_OWNER" -g "$INSTALL_OWNER" -m 0775 \
   "$DOWNLOAD_ROOT" \
   "$RAW_ROOT" \
   "$RAW_ROOT/ecmwf_ifs025" \
+  "$RAW_ROOT/ecmwf_ifs025_ensemble" \
   "$RAW_ROOT/groups/ecmwf" \
   "$RAW_ROOT/groups/ecmwf/current" \
   "$RAW_ROOT/groups/ecmwf/releases"
@@ -112,9 +113,12 @@ fi
 
 python3 -c "from om_downloader.om_native import load_default_turbopfor_decoder; load_default_turbopfor_decoder(); print('native_decoder_ok')"
 python3 -m om_downloader.cli --inspect-product-catalog gfs025 --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
+python3 -m om_downloader.cli --inspect-product-catalog ncep_gefs025 --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
+python3 -m om_downloader.cli --inspect-product-catalog ncep_gefs05 --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 python3 -m om_downloader.cli --inspect-product-catalog cams_global --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 python3 -m om_downloader.cli --inspect-product-catalog cams_global_greenhouse_gases --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 python3 -m om_downloader.cli --inspect-product-catalog ecmwf_ifs025 --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
+python3 -m om_downloader.cli --inspect-product-catalog ecmwf_ifs025_ensemble --config config/models.json --now "$(date -u +%Y-%m-%dT%H:00:00Z)"
 
 if [ "$(id -u)" -eq 0 ]; then
   chown -R "$INSTALL_OWNER:$INSTALL_OWNER" "$INSTALL_DIR"

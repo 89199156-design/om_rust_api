@@ -18,6 +18,37 @@ from om_downloader.mirror_sync import (
 from om_downloader.static_assets import OPENMETEO_STATIC_ASSETS
 
 
+GFS_GROUP_PRODUCTS = (
+    "gfs013_surface",
+    "gfs025",
+    "gfs_pressure_profile",
+    "ncep_gefs025",
+    "ncep_gefs05",
+)
+ECMWF_GROUP_PRODUCTS = ("ecmwf_ifs025", "ecmwf_ifs025_ensemble")
+
+
+def _external_static_asset_records(products):
+    records = {}
+    for product in products:
+        spec = OPENMETEO_STATIC_ASSETS.get(product)
+        if spec is None:
+            continue
+        records[product] = {
+            "model": product,
+            "path": spec.relative_path.as_posix(),
+            "bytes": spec.bytes,
+            "sha256": spec.sha256,
+            "storage": "external_env",
+            "environment": "OM_MODEL_STATIC_ROOT",
+            "source_url": (
+                "https://example.invalid/"
+                f"{spec.bucket_key.as_posix()}"
+            ),
+        }
+    return records
+
+
 class _SyncHandler(BaseHTTPRequestHandler):
     model = "gfs025"
     coverage_id = "gfs025_2026070718_1h"
@@ -468,6 +499,8 @@ class MirrorSyncTests(unittest.TestCase):
                 "gfs013_surface": b"gfs013",
                 "gfs025": b"gfs025",
                 "gfs_pressure_profile": b"pressure",
+                "ncep_gefs025": b"gefs025",
+                "ncep_gefs05": b"gefs05",
             }
             product_manifests = {}
             for product, payload in product_payloads.items():
@@ -511,7 +544,10 @@ class MirrorSyncTests(unittest.TestCase):
                     }
                     for product, manifest in product_manifests.items()
                 },
-                "files": 3,
+                "static_assets": _external_static_asset_records(
+                    GFS_GROUP_PRODUCTS
+                ),
+                "files": len(product_payloads),
                 "bytes": sum(len(payload) for payload in product_payloads.values()),
                 "downloaded_bytes": sum(len(payload) for payload in product_payloads.values()),
             }
@@ -540,6 +576,8 @@ class MirrorSyncTests(unittest.TestCase):
                 "gfs013_surface": b"gfs013",
                 "gfs025": b"gfs025",
                 "gfs_pressure_profile": b"pressure",
+                "ncep_gefs025": b"gefs025",
+                "ncep_gefs05": b"gefs05",
             }
             product_manifest_summary = {}
             for product, payload in product_payloads.items():
@@ -591,7 +629,10 @@ class MirrorSyncTests(unittest.TestCase):
                 "latest_complete_run": new_run,
                 "products": list(product_payloads),
                 "product_manifests": product_manifest_summary,
-                "files": 3,
+                "static_assets": _external_static_asset_records(
+                    GFS_GROUP_PRODUCTS
+                ),
+                "files": len(product_payloads),
                 "bytes": sum(len(payload) for payload in product_payloads.values()),
                 "downloaded_bytes": sum(len(payload) for payload in product_payloads.values()),
             }
@@ -630,7 +671,7 @@ class MirrorSyncTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "synced")
             self.assertEqual(result["latest_complete_run"], new_run)
-            self.assertEqual(result["products"], 3)
+            self.assertEqual(result["products"], len(GFS_GROUP_PRODUCTS))
             self.assertEqual(group_ready["latest_complete_run"], new_run)
             self.assertEqual(
                 {entry["source_run"] for entry in pressure_manifest.get("entries", [])},
@@ -648,6 +689,8 @@ class MirrorSyncTests(unittest.TestCase):
                 "gfs013_surface": "2026071000",
                 "gfs025": "2026070918",
                 "gfs_pressure_profile": "2026070918",
+                "ncep_gefs025": "2026070918",
+                "ncep_gefs05": "2026070918",
             }
             product_manifest_summary = {}
             for product, run in product_runs.items():
@@ -689,7 +732,10 @@ class MirrorSyncTests(unittest.TestCase):
                 "latest_complete_run": None,
                 "products": list(product_runs),
                 "product_manifests": product_manifest_summary,
-                "files": 3,
+                "static_assets": _external_static_asset_records(
+                    GFS_GROUP_PRODUCTS
+                ),
+                "files": len(product_runs),
                 "bytes": sum(summary["bytes"] for summary in product_manifest_summary.values()),
                 "downloaded_bytes": sum(
                     summary["downloaded_bytes"] for summary in product_manifest_summary.values()
@@ -925,7 +971,7 @@ class MirrorSyncTests(unittest.TestCase):
             self.assertTrue((mirror_root / product / "coverages" / new_coverage).exists())
 
     def test_native_current_and_duplicate_do_not_consume_gfs_retention_slots(self):
-        products = ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+        products = GFS_GROUP_PRODUCTS
         runs = ["2026072018", "2026072012", "2026072006", "2026072000", "2026071918"]
 
         def release(run: str) -> dict:
@@ -933,6 +979,7 @@ class MirrorSyncTests(unittest.TestCase):
                 "group": "gfs",
                 "status": "complete",
                 "latest_complete_run": run,
+                "static_assets": _external_static_asset_records(products),
                 "product_manifests": {
                     product: {
                         "coverage_id": f"{product}_{run}",
@@ -1003,28 +1050,20 @@ class MirrorSyncTests(unittest.TestCase):
         ]
 
         def release(run: str) -> dict:
-            static = OPENMETEO_STATIC_ASSETS["ecmwf_ifs025"]
             payload = {
                 "group": "ecmwf",
                 "status": "complete",
                 "latest_complete_run": run,
-                "static_assets": {
-                    "ecmwf_ifs025": {
-                        "model": "ecmwf_ifs025",
-                        "path": static.relative_path.as_posix(),
-                        "bytes": static.bytes,
-                        "sha256": static.sha256,
-                        "storage": "external_env",
-                        "environment": "OM_MODEL_STATIC_ROOT",
-                        "source_url": "https://example.invalid/data/ecmwf_ifs025/static/HSURF.om",
-                    }
-                },
+                "static_assets": _external_static_asset_records(
+                    ECMWF_GROUP_PRODUCTS
+                ),
                 "product_manifests": {
-                    "ecmwf_ifs025": {
-                        "coverage_id": f"ecmwf_ifs025_{run}",
+                    product: {
+                        "coverage_id": f"{product}_{run}",
                         "status": "complete",
                         "latest_complete_run": run,
                     }
+                    for product in ECMWF_GROUP_PRODUCTS
                 },
             }
             payload["release_id"] = group_release_id(payload)

@@ -2,7 +2,8 @@
 
 This is the single source of truth shared by the API allowlist and the strict
 Open-Meteo parity validator.  It mirrors the supported Open-Meteo ECMWF field
-names; unsupported ensemble, showers, and ocean fields are deliberately absent.
+names; probability is supplied by the paired IFS ensemble product, while
+unsupported showers and ocean fields are deliberately absent.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ SURFACE_HOURLY_VARIABLES: tuple[str, ...] = (
     "cloud_cover_mid",
     "cloud_cover_high",
     "precipitation",
+    "precipitation_probability",
     "rain",
     "snowfall",
     "snowfall_water_equivalent",
@@ -114,6 +116,9 @@ DAILY_VARIABLES: tuple[str, ...] = (
     "et0_fao_evapotranspiration_sum",
     "growing_degree_days_base_0_limit_50",
     "precipitation_hours",
+    "precipitation_probability_max",
+    "precipitation_probability_mean",
+    "precipitation_probability_min",
     "precipitation_sum",
     "pressure_msl_max",
     "pressure_msl_mean",
@@ -181,7 +186,6 @@ ROLLING_HOUR0_INHERITED_VARIABLES: tuple[str, ...] = (
 
 UNAVAILABLE_VARIABLE_MARKERS: tuple[str, ...] = (
     "showers",
-    "precipitation_probability",
 )
 OCEAN_HOURLY_VARIABLES: tuple[str, ...] = (
     "ocean_current_velocity",
@@ -192,20 +196,20 @@ OCEAN_HOURLY_VARIABLES: tuple[str, ...] = (
 
 CATALOG_SCHEMA_VERSION = 1
 OPEN_METEO_UPSTREAM_BASELINE = "acfe608b825da1a8b42a755297eb61121986e9da"
-HOURLY_CATALOG_SHA256 = "a518f8c0ddfb5e11ac5661da7d6c5d588bbb56f33e5267378631947e3a52669c"
-DAILY_CATALOG_SHA256 = "87a46a349a767c1e015bf76ab506546865b483365f7e04c543c730d67cd65f33"
-AVAILABLE_CATALOG_SHA256 = "3789f8994822fc3e5820a71de8dab3e805fa13cd7bad1634e6a12c17d197bbe2"
+HOURLY_CATALOG_SHA256 = "71cfa7319f4026aa85a35ff6a0cc3a323ea094286117646b2ca99b9f16399531"
+DAILY_CATALOG_SHA256 = "44c4398fd2c356663b62e09fe86f2e5b1481b1ae1a19873d025e26732fc1753f"
+AVAILABLE_CATALOG_SHA256 = "ea2916567e3c33a4b3df96f21b9f342fed70cab50ca200fcaac4cac8cf133be3"
 
 
 def _catalog_sha256(values: tuple[str, ...]) -> str:
     payload = json.dumps(list(values), sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
-assert len(SURFACE_HOURLY_VARIABLES) == 57
+assert len(SURFACE_HOURLY_VARIABLES) == 58
 assert len(PRESSURE_HOURLY_VARIABLES) == 140
-assert len(HOURLY_VARIABLES) == 197
-assert len(DAILY_VARIABLES) == 65
-assert len(AVAILABLE_VARIABLES) == 257
+assert len(HOURLY_VARIABLES) == 198
+assert len(DAILY_VARIABLES) == 68
+assert len(AVAILABLE_VARIABLES) == 261
 assert len(set(HOURLY_VARIABLES)) == len(HOURLY_VARIABLES)
 assert len(set(DAILY_VARIABLES)) == len(DAILY_VARIABLES)
 assert _catalog_sha256(HOURLY_VARIABLES) == HOURLY_CATALOG_SHA256

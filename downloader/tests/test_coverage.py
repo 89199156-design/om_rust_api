@@ -1,13 +1,15 @@
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from om_downloader.coverage import (
     build_coverage_plan,
     build_run_forecast_hour_coverage_plan,
+    build_run_native_forecast_hour_coverage_plan,
     required_start_for_anchors,
 )
 from om_downloader.metadata import OmRun
-from om_downloader.model_config import Bounds, ProductConfig
+from om_downloader.model_config import Bounds, ProductConfig, load_models
 
 
 class CoverageTests(unittest.TestCase):
@@ -38,6 +40,40 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(plan.required_end_utc, datetime(2026, 7, 15, 5, tzinfo=timezone.utc))
         self.assertEqual([slot.forecast_hour for slot in plan.slots], list(range(6)))
         self.assertEqual({slot.source_run for slot in plan.slots}, {"2026071500"})
+
+    def test_gfs_probability_short_run_starts_at_native_f003_without_f000(self):
+        config = load_models(Path("config/models.json"))
+        base = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
+
+        for product_name in ("ncep_gefs025", "ncep_gefs05"):
+            with self.subTest(product=product_name):
+                product = config.products[product_name]
+                run = OmRun(
+                    "2026071500",
+                    base,
+                    product.forecast_hour_end,
+                    ("precipitation_probability",),
+                    (),
+                    valid_times_utc=(
+                        base,
+                        datetime(2026, 7, 15, 3, tzinfo=timezone.utc),
+                        datetime(2026, 7, 15, 6, tzinfo=timezone.utc),
+                    ),
+                )
+
+                plan = build_run_native_forecast_hour_coverage_plan(
+                    product,
+                    run,
+                    forecast_hour_end=5,
+                )
+
+                self.assertEqual(plan.required_start_utc, base.replace(hour=3))
+                self.assertEqual(plan.required_end_utc, base.replace(hour=3))
+                self.assertEqual(
+                    [slot.forecast_hour for slot in plan.slots],
+                    [3],
+                )
+                self.assertNotIn(0, [slot.forecast_hour for slot in plan.slots])
 
     def test_required_start_uses_earliest_utc_anchor(self):
         now = datetime(2026, 7, 8, 14, 0, tzinfo=timezone.utc)

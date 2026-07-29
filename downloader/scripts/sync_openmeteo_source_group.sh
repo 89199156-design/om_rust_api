@@ -149,7 +149,13 @@ group = sys.argv[2]
 retention = int(sys.argv[3])
 selected_path = Path(sys.argv[4])
 required_products = {
-    "gfs": {"gfs013_surface", "gfs025", "gfs_pressure_profile"},
+    "gfs": {
+        "gfs013_surface",
+        "gfs025",
+        "gfs_pressure_profile",
+        "ncep_gefs025",
+        "ncep_gefs05",
+    },
     "cams": {"cams_global", "cams_global_greenhouse_gases"},
 }[group]
 releases = []

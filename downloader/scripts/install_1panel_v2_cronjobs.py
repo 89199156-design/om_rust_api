@@ -38,13 +38,21 @@ PRODUCTS = (
     "gfs013_surface",
     "gfs025",
     "gfs_pressure_profile",
+    "ncep_gefs025",
+    "ncep_gefs05",
     "cams_global",
     "cams_global_greenhouse_gases",
 )
 OPENMETEO_GROUP_PRODUCTS = {
-    "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
+    "gfs": (
+        "gfs013_surface",
+        "gfs025",
+        "gfs_pressure_profile",
+        "ncep_gefs025",
+        "ncep_gefs05",
+    ),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
-    "ecmwf": ("ecmwf_ifs025",),
+    "ecmwf": ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
 }
 TASK_BY_GROUP = {
     "gfs": "OM_GFS_DOWNLOAD",

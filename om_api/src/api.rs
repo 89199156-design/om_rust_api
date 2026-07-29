@@ -258,7 +258,7 @@ fn weather_attribution_payload() -> serde_json::Value {
                 "provider_url": "https://www.ecmwf.int/",
                 "distributor": "Open-Meteo",
                 "distributor_url": "https://open-meteo.com/",
-                "dataset": "ECMWF IFS open data",
+                "dataset": "ECMWF IFS deterministic and ensemble open data",
                 "license": "CC-BY-4.0",
                 "license_url": ECMWF_LICENSE_URL,
                 "terms_url": "https://apps.ecmwf.int/datasets/licences/general/",
@@ -276,7 +276,9 @@ fn weather_attribution_payload() -> serde_json::Value {
             "gfs": {
                 "provider": "NOAA National Centers for Environmental Prediction (NCEP)",
                 "provider_url": "https://www.ncep.noaa.gov/",
-                "dataset": "Global Forecast System (GFS)",
+                "dataset": "Global Forecast System (GFS) and Global Ensemble Forecast System (GEFS)",
+                "distributor": "Open-Meteo",
+                "distributor_url": "https://open-meteo.com/",
                 "terms_url": "https://www.weather.gov/disclaimer",
                 "modified": true
             },
@@ -423,6 +425,7 @@ fn attach_model_run(payload: &mut serde_json::Value, model_run: &str) -> Result<
 async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
     let product = snapshot.require_product("ecmwf_ifs025")?;
+    let probability_product = snapshot.require_product("ecmwf_ifs025_ensemble")?;
     let hourly = ecmwf_public_hourly_variables();
     let daily = ECMWF_PUBLIC_DAILY_VARIABLES.to_vec();
     let available_variables = hourly
@@ -435,6 +438,19 @@ async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json:
         "coverage_id": product.manifest.coverage_id,
         "latest_complete_run": product.manifest.latest_complete_run,
         "public_start_utc": product.manifest.public_start_utc,
+        "products": {
+            "ecmwf_ifs025": {
+                "coverage_id": product.manifest.coverage_id,
+                "latest_complete_run": product.manifest.latest_complete_run,
+                "public_start_utc": product.manifest.public_start_utc,
+            },
+            "ecmwf_ifs025_ensemble": {
+                "coverage_id": probability_product.manifest.coverage_id,
+                "latest_complete_run": probability_product.manifest.latest_complete_run,
+                "public_start_utc": probability_product.manifest.public_start_utc,
+                "variables": ["precipitation_probability"],
+            }
+        },
         "available_hourly_variables": hourly,
         "available_daily_variables": daily,
         "available_variables": available_variables,

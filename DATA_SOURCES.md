@@ -23,7 +23,7 @@ with **“Weather data by Open-Meteo.com.”**
 
 ## ECMWF IFS open data
 
-- Local product key: `ecmwf_ifs025`
+- Local product keys: `ecmwf_ifs025`, `ecmwf_ifs025_ensemble`
 - Underlying provider: European Centre for Medium-Range Weather Forecasts
   (ECMWF)
 - Distribution used here: Open-Meteo spatial object storage
@@ -45,13 +45,16 @@ performs requested unit conversions and derived-variable calculations, and
 encodes map layers as lossless WebP. ECMWF is not responsible for these local
 transformations or service output.
 
-The free deterministic product does not consistently provide every GFS field.
-Capabilities absent from the upstream inventory are not synthesized. The
-repository's model notice and manifests list those unavailable fields.
+The deterministic IFS product does not expose precipitation probability.
+`ecmwf_ifs025_ensemble` supplies that field from the 51-member IFS ensemble.
+The pipeline omits the unavailable forecast-hour-zero spatial object, retains
+its first real frame at forecast hour 3, and may use an older retained run only
+when it represents the same valid time. It never manufactures a zero value.
 
 ## NOAA GFS
 
-- Local products: `gfs013_surface`, `gfs025`, `gfs_pressure_profile`
+- Local products: `gfs013_surface`, `gfs025`, `gfs_pressure_profile`,
+  `ncep_gefs025`, `ncep_gefs05`
 - Underlying provider: NOAA National Centers for Environmental Prediction
   (NCEP)
 - Model information: <https://www.ncei.noaa.gov/products/weather-climate-models/global-forecast>
@@ -61,7 +64,14 @@ repository's model notice and manifests list those unavailable fields.
 The pipeline performs regional byte-range extraction, run selection,
 null-value fallback to the immediately preceding complete run where defined,
 point interpolation, requested unit conversions and derived-variable
-calculation, and lossless WebP map encoding.
+calculation, and lossless WebP map encoding. `ncep_gefs025` and
+`ncep_gefs05` supply precipitation probability from the NOAA Global Ensemble
+Forecast System (GEFS). The API prefers the 0.25° product through forecast hour
+240 and uses the 0.5° product at the same valid time when the 0.25° value is
+unavailable, including the longer tail through forecast hour 384. Their
+unavailable forecast-hour-zero spatial objects are omitted; an older retained
+run may fill only the same valid time, and a missing value is never replaced
+with a fabricated zero.
 
 ## Copernicus Atmosphere Monitoring Service
 
@@ -94,9 +104,9 @@ cycles, WebP releases, and official-comparison snapshots remain on `/data`.
 Native cycle markers record the external `OM_DEM_ROOT` contract and do not
 duplicate DEM90 payload bytes inside cycle directories.
 
-The pinned GFS 0.13°, GFS 0.25°, and ECMWF IFS 0.25° `HSURF.om` model
-elevation grids are likewise immutable installation assets. The API installer
-downloads and checksum-verifies them under
+The pinned GFS 0.13°, GFS 0.25°, GEFS 0.25°, ECMWF IFS 0.25°, and ECMWF IFS
+ensemble 0.25° `HSURF.om` model elevation grids are likewise immutable
+installation assets. The API installer downloads and checksum-verifies them under
 `/opt/1panel/apps/weather_om_api/static/<model>/HSURF.om`, and the service
 resolves them through `OM_MODEL_STATIC_ROOT=/opt/1panel/apps/weather_om_api`.
 Downloader and mirror manifests retain their source URL, size, checksum, and

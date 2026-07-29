@@ -113,6 +113,46 @@
       ],
       "requested_pressure_levels_hpa": [1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300, 250, 200, 150, 100, 50]
     },
+    "ncep_gefs025": {
+      "download_product": "om_ncep_gefs025",
+      "openmeteo_model": "ncep_gefs025",
+      "forecast_hour_start": 3,
+      "forecast_hour_end": 240,
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "precipitation_probability"
+      ],
+      "optional_variables": [],
+      "requested_pressure_levels_hpa": []
+    },
+    "ncep_gefs05": {
+      "download_product": "om_ncep_gefs05",
+      "openmeteo_model": "ncep_gefs05",
+      "forecast_hour_start": 3,
+      "forecast_hour_end": 384,
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "precipitation_probability"
+      ],
+      "optional_variables": [],
+      "requested_pressure_levels_hpa": []
+    },
     "ecmwf_ifs025": {
       "download_product": "om_ecmwf_ifs025",
       "openmeteo_model": "ecmwf_ifs025",
@@ -185,6 +225,28 @@
         "vertical_velocity"
       ],
       "requested_pressure_levels_hpa": [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50, 10]
+    },
+    "ecmwf_ifs025_ensemble": {
+      "download_product": "om_ecmwf_ifs025_ensemble",
+      "openmeteo_model": "ecmwf_ifs025_ensemble",
+      "forecast_hour_start": 3,
+      "forecast_hour_end": 360,
+      "history_hours": 6,
+      "coverage_strategy": "latest_with_long_run_tail",
+      "run_cadence_hours": 6,
+      "timezone_anchors": [8, 6],
+      "requested_bounds": {
+        "lon_min": 70.0,
+        "lat_min": 0.0,
+        "lon_max": 140.0,
+        "lat_max": 58.0
+      },
+      "bounds_padding_degrees": 2.0,
+      "required_variables": [
+        "precipitation_probability"
+      ],
+      "optional_variables": [],
+      "requested_pressure_levels_hpa": []
     },
     "cams_global": {
       "download_product": "om_cams_global",

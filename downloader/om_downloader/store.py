@@ -275,6 +275,10 @@ def _progress_log(context: dict | None, payload: dict, *, force: bool = False) -
         "gfs013_surface": "GFS 0.13°地面层",
         "gfs025": "GFS 0.25°地面层",
         "gfs_pressure_profile": "GFS 气压层",
+        "ncep_gefs025": "GEFS 0.25°降水概率",
+        "ncep_gefs05": "GEFS 0.5°降水概率",
+        "ecmwf_ifs025": "ECMWF IFS 0.25°",
+        "ecmwf_ifs025_ensemble": "ECMWF IFS 0.25°集合降水概率",
         "cams_global": "CAMS 全球空气质量",
         "cams_global_greenhouse_gases": "CAMS 温室气体",
     }.get(str(context.get("product") or ""), str(context.get("product") or "未知产品"))

@@ -398,11 +398,11 @@ def load_config(path: Path) -> dict[str, Any]:
     daily = _require_string_list(variables.get("daily"), "variables.daily")
     if hourly != list(HOURLY_VARIABLES):
         raise ValidationError(
-            "variables.hourly must exactly match the canonical 197-field ECMWF catalog"
+            "variables.hourly must exactly match the canonical 198-field ECMWF catalog"
         )
     if daily != list(DAILY_VARIABLES):
         raise ValidationError(
-            "variables.daily must exactly match the canonical 65-field ECMWF catalog"
+            "variables.daily must exactly match the canonical 68-field ECMWF catalog"
         )
     if config.get("variable_catalog") != {
         "schema_version": CATALOG_SCHEMA_VERSION,
@@ -416,10 +416,6 @@ def load_config(path: Path) -> dict[str, Any]:
         )
     if "showers" in hourly or "showers_sum" in daily:
         raise ValidationError("source-unavailable IFS showers fields must be omitted, not exempted")
-    if any("precipitation_probability" in variable for variable in [*hourly, *daily]):
-        raise ValidationError(
-            "source-unavailable IFS precipitation-probability fields must be omitted"
-        )
     if config.get("rolling_hour0_inherited_variables") != list(ROLLING_HOUR0_VARIABLES):
         raise ValidationError(
             "rolling_hour0_inherited_variables must record the exact six live-series fields"

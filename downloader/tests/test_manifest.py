@@ -1,11 +1,16 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from om_downloader.coverage import CoveragePlan, CoverageSlot
-from om_downloader.manifest import atomic_write_json, build_latest_manifest
+from om_downloader.manifest import (
+    atomic_write_json,
+    build_latest_manifest,
+    product_config_fingerprint,
+)
 from om_downloader.metadata import OmRun
 from om_downloader.model_config import Bounds, ProductConfig
 
@@ -20,6 +25,27 @@ def _region_plan():
 
 
 class ManifestTests(unittest.TestCase):
+    def test_config_fingerprint_includes_first_available_forecast_hour(self):
+        product = ProductConfig(
+            name="ncep_gefs025",
+            download_product="om_ncep_gefs025",
+            openmeteo_model="ncep_gefs025",
+            forecast_hour_end=240,
+            run_cadence_hours=6,
+            timezone_anchors=(8, 6),
+            requested_bounds=Bounds(70.0, 0.0, 140.0, 58.0),
+            bounds_padding_degrees=2.0,
+            required_variables=("precipitation_probability",),
+            optional_variables=(),
+            requested_pressure_levels_hpa=(),
+            forecast_hour_start=3,
+        )
+
+        self.assertNotEqual(
+            product_config_fingerprint(product),
+            product_config_fingerprint(replace(product, forecast_hour_start=0)),
+        )
+
     def test_manifest_records_missing_pressure_levels(self):
         product = ProductConfig(
             name="gfs_pressure_profile",

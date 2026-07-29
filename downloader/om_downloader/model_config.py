@@ -35,6 +35,7 @@ class ProductConfig:
     missing_variable_fallback_lookback_hours: int = 0
     missing_variable_fallback_context_hours: int = 0
     missing_variable_fallback_predecessor_runs: int = 0
+    forecast_hour_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -166,11 +167,19 @@ def load_models(path: Path) -> ModelsConfig:
             raise ValueError(
                 f"product {name} has unsupported coverage_strategy: {coverage_strategy}"
             )
+        forecast_hour_start = int(raw.get("forecast_hour_start", 0))
+        forecast_hour_end = int(raw["forecast_hour_end"])
+        if forecast_hour_start < 0:
+            raise ValueError(f"product {name} forecast_hour_start must not be negative")
+        if forecast_hour_start > forecast_hour_end:
+            raise ValueError(
+                f"product {name} forecast_hour_start must not exceed forecast_hour_end"
+            )
         products[name] = ProductConfig(
             name=name,
             download_product=str(raw["download_product"]),
             openmeteo_model=str(raw.get("openmeteo_model", name)),
-            forecast_hour_end=int(raw["forecast_hour_end"]),
+            forecast_hour_end=forecast_hour_end,
             run_cadence_hours=int(raw["run_cadence_hours"]),
             timezone_anchors=_as_int_tuple(raw["timezone_anchors"], "timezone_anchors"),
             requested_bounds=_as_bounds(raw["requested_bounds"], "requested_bounds"),
@@ -192,5 +201,6 @@ def load_models(path: Path) -> ModelsConfig:
             missing_variable_fallback_predecessor_runs=(
                 missing_variable_fallback_predecessor_runs
             ),
+            forecast_hour_start=forecast_hour_start,
         )
     return ModelsConfig(version=int(data.get("version", 1)), products=products)

@@ -33,6 +33,26 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(config.products["gfs025"].openmeteo_model, "ncep_gfs025")
         self.assertEqual(config.products["cams_global"].openmeteo_model, "cams_global")
 
+    def test_loads_probability_ensemble_products_from_forecast_hour_three(self):
+        config = load_models(Path("config/models.json"))
+        expected = {
+            "ncep_gefs025": ("ncep_gefs025", 240),
+            "ncep_gefs05": ("ncep_gefs05", 384),
+            "ecmwf_ifs025_ensemble": ("ecmwf_ifs025_ensemble", 360),
+        }
+
+        for product_name, (openmeteo_model, forecast_hour_end) in expected.items():
+            with self.subTest(product=product_name):
+                product = config.products[product_name]
+                self.assertEqual(product.openmeteo_model, openmeteo_model)
+                self.assertEqual(product.forecast_hour_start, 3)
+                self.assertEqual(product.forecast_hour_end, forecast_hour_end)
+                self.assertEqual(
+                    product.required_variables,
+                    ("precipitation_probability",),
+                )
+                self.assertEqual(product.optional_variables, ())
+
     def test_includes_singapore_production_surface_and_cams_variables(self):
         config = load_models(Path("config/models.json"))
 

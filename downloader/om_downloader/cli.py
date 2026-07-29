@@ -20,7 +20,6 @@ from .checksum import sha256_file
 from .coverage import (
     build_complete_run_coverage_plan,
     build_product_coverage_plan,
-    build_run_forecast_hour_coverage_plan,
     build_run_native_forecast_hour_coverage_plan,
     required_start_for_anchors,
 )
@@ -68,9 +67,15 @@ from .static_assets import (
 from .storage_guard import enforce_environment_storage_guard
 
 OPENMETEO_GROUP_PRODUCTS = {
-    "gfs": ("gfs013_surface", "gfs025", "gfs_pressure_profile"),
+    "gfs": (
+        "gfs013_surface",
+        "gfs025",
+        "gfs_pressure_profile",
+        "ncep_gefs025",
+        "ncep_gefs05",
+    ),
     "cams": ("cams_global", "cams_global_greenhouse_gases"),
-    "ecmwf": ("ecmwf_ifs025",),
+    "ecmwf": ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
 }
 GROUPS_REQUIRING_MATCHING_RUNS = frozenset({"gfs"})
 GFS_COMPLETE_RUN_RETENTION = 2
@@ -942,6 +947,10 @@ def _log_download_stage(
         "gfs013_surface": "GFS 0.13°地面层",
         "gfs025": "GFS 0.25°地面层",
         "gfs_pressure_profile": "GFS 气压层",
+        "ncep_gefs025": "GEFS 0.25°降水概率",
+        "ncep_gefs05": "GEFS 0.5°降水概率",
+        "ecmwf_ifs025": "ECMWF IFS 0.25°",
+        "ecmwf_ifs025_ensemble": "ECMWF IFS 0.25°集合降水概率",
         "cams_global": "CAMS 全球空气质量",
         "cams_global_greenhouse_gases": "CAMS 温室气体",
     }.get(product.name, product.name)
@@ -2160,7 +2169,7 @@ def _discover_recent_gfs_retention_plans(
             partial_plans[product_name] = (
                 catalog,
                 runs,
-                build_run_forecast_hour_coverage_plan(
+                build_run_native_forecast_hour_coverage_plan(
                     product_by_name[product_name],
                     runs[0],
                     forecast_hour_end=GFS_PARTIAL_FORECAST_HOUR_END,
@@ -2213,12 +2222,20 @@ def _build_exact_gfs_short_run_plans(
                 f"expected {run_id}, got {catalog.reference_time_utc:%Y%m%d%H}"
             )
         run = om_run_from_spatial_catalog(product.name, catalog)
-        plan = build_run_forecast_hour_coverage_plan(
+        plan = build_run_native_forecast_hour_coverage_plan(
             product,
             run,
             forecast_hour_end=GFS_PARTIAL_FORECAST_HOUR_END,
         )
-        expected_hours = tuple(range(GFS_PARTIAL_FORECAST_HOUR_END + 1))
+        expected_hours = tuple(
+            sorted(
+                int((valid_time - reference_time).total_seconds() // 3600)
+                for valid_time in catalog.valid_times_utc
+                if getattr(product, "forecast_hour_start", 0)
+                <= int((valid_time - reference_time).total_seconds() // 3600)
+                <= GFS_PARTIAL_FORECAST_HOUR_END
+            )
+        )
         actual_hours = tuple(slot.forecast_hour for slot in plan.slots)
         source_runs = {slot.source_run for slot in plan.slots}
         if (
@@ -2350,13 +2367,13 @@ def _discover_recent_complete_cams_ranked_plans(
     return ranked
 
 
-def _discover_recent_ecmwf_retention_plans(
+def _discover_recent_ecmwf_product_retention_plans(
     product: ProductConfig,
     *,
     now_utc: datetime,
     bucket_url: str,
     count: int = ECMWF_TOTAL_RELEASE_RETENTION,
-) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
+) -> list[tuple[str, tuple[Any, list[Any], Any]]]:
     """Discover the latest two 00Z/12Z long runs and their three predecessors."""
     if count != ECMWF_TOTAL_RELEASE_RETENTION:
         raise ValueError(
@@ -2367,7 +2384,7 @@ def _discover_recent_ecmwf_retention_plans(
         bucket_url=bucket_url,
     )
     candidate = latest.reference_time_utc
-    discovered: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
+    discovered: list[tuple[str, tuple[Any, list[Any], Any]]] = []
     complete_runs: list[datetime] = []
     required_partial_runs: set[datetime] = set()
     max_probes = max(24, count * 8)
@@ -2394,8 +2411,9 @@ def _discover_recent_ecmwf_retention_plans(
             if (
                 len(complete_runs) < ECMWF_COMPLETE_RUN_RETENTION
                 and candidate.hour in (0, 12)
+                and catalog.max_forecast_hour >= product.forecast_hour_end
             ):
-                plan_data = _build_product_plan(
+                plan = _build_product_plan(
                     product,
                     now_utc=now_utc,
                     bucket_url=bucket_url,
@@ -2403,7 +2421,7 @@ def _discover_recent_ecmwf_retention_plans(
                 )
                 complete_runs.append(candidate)
                 run_id = candidate.strftime("%Y%m%d%H")
-                discovered.append((run_id, {product.name: plan_data}))
+                discovered.append((run_id, plan))
                 if len(complete_runs) == ECMWF_COMPLETE_RUN_RETENTION:
                     previous_complete = complete_runs[-1]
                     required_partial_runs = {
@@ -2412,7 +2430,7 @@ def _discover_recent_ecmwf_retention_plans(
                     }
             elif candidate in required_partial_runs:
                 run = om_run_from_spatial_catalog(product.name, catalog)
-                plan_data = (
+                plan = (
                     catalog,
                     [run],
                     build_run_native_forecast_hour_coverage_plan(
@@ -2422,13 +2440,43 @@ def _discover_recent_ecmwf_retention_plans(
                     ),
                 )
                 run_id = candidate.strftime("%Y%m%d%H")
-                discovered.append((run_id, {product.name: plan_data}))
+                discovered.append((run_id, plan))
             if len(discovered) == count:
                 return discovered
         candidate -= timedelta(hours=product.run_cadence_hours)
     raise ValueError(
         f"could not discover {count} recent complete ECMWF releases for {product.name}"
     )
+
+
+def _discover_recent_ecmwf_retention_plans(
+    products: list[ProductConfig],
+    *,
+    now_utc: datetime,
+    bucket_url: str,
+    count: int = ECMWF_TOTAL_RELEASE_RETENTION,
+) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
+    """Rank independently published deterministic and ensemble ECMWF cycles."""
+    if not products:
+        raise ValueError("ECMWF retention requires at least one product")
+    product_plans = {
+        product.name: _discover_recent_ecmwf_product_retention_plans(
+            product,
+            now_utc=now_utc,
+            bucket_url=bucket_url,
+            count=count,
+        )
+        for product in products
+    }
+    ranked: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
+    for rank in range(count):
+        plans = {
+            product.name: product_plans[product.name][rank][1]
+            for product in products
+        }
+        group_run = max(product_plans[product.name][rank][0] for product in products)
+        ranked.append((group_run, plans))
+    return ranked
 
 
 def _reconcile_ecmwf_retention_window(
@@ -2444,10 +2492,12 @@ def _reconcile_ecmwf_retention_window(
         )
 
     config = load_models(Path(args.config))
-    product = config.products[OPENMETEO_GROUP_PRODUCTS["ecmwf"][0]]
+    products = [
+        config.products[name] for name in OPENMETEO_GROUP_PRODUCTS["ecmwf"]
+    ]
     now_utc = _parse_utc(args.now)
     target_plans = _discover_recent_ecmwf_retention_plans(
-        product,
+        products,
         now_utc=now_utc,
         bucket_url=args.openmeteo_bucket_url,
     )
@@ -2476,7 +2526,6 @@ def _reconcile_ecmwf_retention_window(
             retain_runs=target_runs,
         )
 
-    products = [product]
     available = _matching_group_releases(
         api_root,
         "ecmwf",
@@ -2511,7 +2560,7 @@ def _reconcile_ecmwf_retention_window(
         if source_root.resolve(strict=False) != api_root.resolve(strict=False):
             _clear_group_download_payloads(
                 Path(args.output),
-                product_names=[product.name],
+                product_names=[product.name for product in products],
             )
 
     available = _matching_group_releases(

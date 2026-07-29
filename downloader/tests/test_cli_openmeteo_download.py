@@ -18,15 +18,28 @@ from om_downloader.metadata import OmRun
 from tests.test_om_format import OM_HEADER, OM_TRAILER_MAGIC, _pack_array, _pack_root
 
 
+GFS_GROUP_PRODUCTS = (
+    "gfs013_surface",
+    "gfs025",
+    "gfs_pressure_profile",
+    "ncep_gefs025",
+    "ncep_gefs05",
+)
+GFS_DETERMINISTIC_PRODUCTS = GFS_GROUP_PRODUCTS[:3]
+GFS_PROBABILITY_PRODUCTS = GFS_GROUP_PRODUCTS[3:]
+
+
 def _product_config(
     openmeteo_model="ncep_gfs025",
     required_variables=None,
+    forecast_hour_start=0,
     forecast_hour_end=4,
 ):
     required_variables = required_variables or ["temperature_2m"]
     return {
         "download_product": "om_gfs025",
         "openmeteo_model": openmeteo_model,
+        "forecast_hour_start": forecast_hour_start,
         "forecast_hour_end": forecast_hour_end,
         "run_cadence_hours": 6,
         "timezone_anchors": [8, 6],
@@ -70,6 +83,13 @@ def _read_run_summary(output_root):
 
 def _write_gfs_group_config(path, *, forecast_hour_end=4):
     _OpenMeteoDownloadHandler.complete_run_catalogs = True
+    probability_forecast_hour_end = max(
+        3,
+        ((forecast_hour_end + 2) // 3) * 3,
+    )
+    _OpenMeteoDownloadHandler.complete_probability_forecast_hour_end = (
+        probability_forecast_hour_end
+    )
     products = {
         "gfs013_surface": _product_config(
             "ncep_gfs013", forecast_hour_end=forecast_hour_end
@@ -79,6 +99,16 @@ def _write_gfs_group_config(path, *, forecast_hour_end=4):
         ),
         "gfs_pressure_profile": _product_config(
             "ncep_gfs025", forecast_hour_end=forecast_hour_end
+        ),
+        "ncep_gefs025": _product_config(
+            "ncep_gefs025",
+            forecast_hour_start=3,
+            forecast_hour_end=probability_forecast_hour_end,
+        ),
+        "ncep_gefs05": _product_config(
+            "ncep_gefs05",
+            forecast_hour_start=3,
+            forecast_hour_end=probability_forecast_hour_end,
         ),
     }
     path.write_text(json.dumps({"version": 1, "products": products}), encoding="utf-8")
@@ -154,6 +184,8 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
     object_content_by_model = {
         "ncep_gfs013": _sample_object_with_plain_lut([1536, 3072]),
         "ncep_gfs025": _sample_object_with_plain_lut([721, 1440]),
+        "ncep_gefs025": _sample_object_with_plain_lut([721, 1440]),
+        "ncep_gefs05": _sample_object_with_plain_lut([361, 720]),
     }
     object_content_by_path = {}
     catalog_variables = ["temperature_2m"]
@@ -167,6 +199,7 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
     fail_ranges = set()
     complete_run_catalogs = False
     complete_run_forecast_hour_end = 4
+    complete_probability_forecast_hour_end = 6
 
     def log_message(self, _format, *_args):
         return
@@ -202,9 +235,14 @@ class _OpenMeteoDownloadHandler(BaseHTTPRequestHandler):
             valid_times = self.catalog_valid_times
             if self.complete_run_catalogs:
                 base = datetime.fromisoformat(reference_time.replace("Z", "+00:00"))
+                forecast_hours = (
+                    range(3, self.complete_probability_forecast_hour_end + 1, 3)
+                    if model in {"ncep_gefs025", "ncep_gefs05"}
+                    else range(self.complete_run_forecast_hour_end + 1)
+                )
                 valid_times = [
                     (base + timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%MZ")
-                    for hour in range(self.complete_run_forecast_hour_end + 1)
+                    for hour in forecast_hours
                 ]
             payload = json.dumps(
                 [
@@ -307,14 +345,19 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         _OpenMeteoDownloadHandler.fail_ranges = set()
         _OpenMeteoDownloadHandler.complete_run_catalogs = False
         _OpenMeteoDownloadHandler.complete_run_forecast_hour_end = 4
+        _OpenMeteoDownloadHandler.complete_probability_forecast_hour_end = 6
         _OpenMeteoDownloadHandler.catalog_variables = ["temperature_2m"]
         _OpenMeteoDownloadHandler.catalog_reference_times = {
             "ncep_gfs013": "2026-07-07T12:00:00Z",
             "ncep_gfs025": "2026-07-07T12:00:00Z",
+            "ncep_gefs025": "2026-07-07T12:00:00Z",
+            "ncep_gefs05": "2026-07-07T12:00:00Z",
         }
         _OpenMeteoDownloadHandler.object_content_by_model = {
             "ncep_gfs013": _sample_object_with_plain_lut([1536, 3072]),
             "ncep_gfs025": _sample_object_with_plain_lut([721, 1440]),
+            "ncep_gefs025": _sample_object_with_plain_lut([721, 1440]),
+            "ncep_gefs05": _sample_object_with_plain_lut([361, 720]),
         }
         _OpenMeteoDownloadHandler.object_content_by_path = {}
         _OpenMeteoDownloadHandler.catalog_valid_times = ["2026-07-07T16:00Z"]
@@ -409,10 +452,14 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             ],
         )
 
-    def test_gfs_retention_targets_two_full_and_three_zero_through_five_hour_runs(self):
+    def test_gfs_retention_uses_native_probability_frames_in_three_short_runs(self):
         products = [
-            SimpleNamespace(name=name, forecast_hour_end=12)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            SimpleNamespace(
+                name=name,
+                forecast_hour_start=3 if name in GFS_PROBABILITY_PRODUCTS else 0,
+                forecast_hour_end=12,
+            )
+            for name in GFS_GROUP_PRODUCTS
         ]
         base = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
         discovered = []
@@ -421,13 +468,28 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             run_id = run_time.strftime("%Y%m%d%H")
             plans = {}
             for product in products:
-                run = OmRun(run_id, run_time, 12, ("temperature_2m",), ())
+                forecast_hours = (
+                    range(3, 13, 3)
+                    if product.name in GFS_PROBABILITY_PRODUCTS
+                    else range(13)
+                )
+                run = OmRun(
+                    run_id,
+                    run_time,
+                    12,
+                    ("temperature_2m",),
+                    (),
+                    valid_times_utc=tuple(
+                        run_time + timedelta(hours=hour)
+                        for hour in forecast_hours
+                    ),
+                )
                 plans[product.name] = (
                     SimpleNamespace(reference_time_utc=run_time),
                     [run],
                     SimpleNamespace(
                         latest_complete_run=run_id,
-                        slots=tuple(range(13)),
+                        slots=tuple(forecast_hours),
                     ),
                 )
             discovered.append((run_id, plans))
@@ -444,33 +506,62 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
 
         for _run, plans in ranked[:2]:
             self.assertEqual(
-                {len(plan_data[2].slots) for plan_data in plans.values()},
-                {13},
+                {
+                    product_name: len(plan_data[2].slots)
+                    for product_name, plan_data in plans.items()
+                },
+                {
+                    **{name: 13 for name in GFS_DETERMINISTIC_PRODUCTS},
+                    **{name: 4 for name in GFS_PROBABILITY_PRODUCTS},
+                },
             )
         for _run, plans in ranked[2:]:
             self.assertEqual(
                 {
-                    tuple(slot.forecast_hour for slot in plan_data[2].slots)
-                    for plan_data in plans.values()
+                    product_name: tuple(
+                        slot.forecast_hour for slot in plan_data[2].slots
+                    )
+                    for product_name, plan_data in plans.items()
                 },
-                {tuple(range(6))},
+                {
+                    **{
+                        name: tuple(range(6))
+                        for name in GFS_DETERMINISTIC_PRODUCTS
+                    },
+                    **{name: (3,) for name in GFS_PROBABILITY_PRODUCTS},
+                },
             )
 
-    def test_exact_gfs_short_run_plan_loads_each_model_once_and_requires_f000_through_f005(self):
+    def test_exact_gfs_short_run_keeps_probability_f003_without_requiring_f000(self):
         products = [
             SimpleNamespace(
                 name="gfs013_surface",
                 openmeteo_model="ncep_gfs013",
+                forecast_hour_start=0,
                 forecast_hour_end=384,
             ),
             SimpleNamespace(
                 name="gfs025",
                 openmeteo_model="ncep_gfs025",
+                forecast_hour_start=0,
                 forecast_hour_end=384,
             ),
             SimpleNamespace(
                 name="gfs_pressure_profile",
                 openmeteo_model="ncep_gfs025",
+                forecast_hour_start=0,
+                forecast_hour_end=384,
+            ),
+            SimpleNamespace(
+                name="ncep_gefs025",
+                openmeteo_model="ncep_gefs025",
+                forecast_hour_start=3,
+                forecast_hour_end=240,
+            ),
+            SimpleNamespace(
+                name="ncep_gefs05",
+                openmeteo_model="ncep_gefs05",
+                forecast_hour_start=3,
                 forecast_hour_end=384,
             ),
         ]
@@ -479,11 +570,17 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
 
         def load_run(model, requested_time, *, bucket_url):
             calls.append((model, requested_time, bucket_url))
+            forecast_hours = (
+                range(3, 13, 3)
+                if model in {"ncep_gefs025", "ncep_gefs05"}
+                else range(13)
+            )
             return SimpleNamespace(
                 completed=True,
                 reference_time_utc=reference_time,
                 valid_times_utc=tuple(
-                    reference_time + timedelta(hours=hour) for hour in range(13)
+                    reference_time + timedelta(hours=hour)
+                    for hour in forecast_hours
                 ),
                 variables=("temperature_2m",),
                 max_forecast_hour=12,
@@ -498,21 +595,25 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0] for call in calls],
-            ["ncep_gfs013", "ncep_gfs025"],
+            ["ncep_gfs013", "ncep_gfs025", "ncep_gefs025", "ncep_gefs05"],
         )
-        for _catalog, runs, plan in plans.values():
+        for product_name, (_catalog, runs, plan) in plans.items():
             self.assertEqual(len(runs), 1)
             self.assertEqual(plan.latest_complete_run, "2026071918")
             self.assertEqual(
                 tuple(slot.forecast_hour for slot in plan.slots),
-                tuple(range(6)),
+                (
+                    (3,)
+                    if product_name in GFS_PROBABILITY_PRODUCTS
+                    else tuple(range(6))
+                ),
             )
             self.assertEqual({slot.source_run for slot in plan.slots}, {"2026071918"})
 
     def test_gfs_short_run_recovery_retains_without_changing_current_markers(self):
         products = [
             SimpleNamespace(name=name)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            for name in GFS_GROUP_PRODUCTS
         ]
         run_id = "2026071918"
         plans = {
@@ -615,7 +716,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
     def test_gfs_short_run_recovery_rejects_target_inside_recovery_staging(self):
         products = [
             SimpleNamespace(name=name)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            for name in GFS_GROUP_PRODUCTS
         ]
         run_id = "2026071918"
         plans = {
@@ -668,7 +769,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 / "current"
                 / "ready_for_processing.json",
             ]
-            for product in ("gfs013_surface", "gfs025", "gfs_pressure_profile"):
+            for product in GFS_GROUP_PRODUCTS:
                 marker_paths.extend(
                     [
                         api_root / product / "current" / "latest.json",
@@ -721,7 +822,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                 )
-                for product in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+                for product in GFS_GROUP_PRODUCTS
             }
 
             self.assertEqual(payload["status"], "complete")
@@ -738,12 +839,20 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             )
             self.assertEqual(len(release_paths), 1)
             self.assertEqual(release["latest_complete_run"], "2026070712")
-            for manifest in retained_manifests.values():
+            for product_name, manifest in retained_manifests.items():
                 self.assertEqual(manifest["latest_complete_run"], "2026070712")
-                self.assertEqual(manifest["valid_time_count"], 6)
+                expected_hours = (
+                    [3]
+                    if product_name in GFS_PROBABILITY_PRODUCTS
+                    else list(range(6))
+                )
+                self.assertEqual(
+                    manifest["valid_time_count"],
+                    len(expected_hours),
+                )
                 self.assertEqual(
                     [entry["forecast_hour"] for entry in manifest["files"][0]["entries"]],
-                    list(range(6)),
+                    expected_hours,
                 )
                 self.assertEqual(
                     {entry["source_run"] for entry in manifest["files"][0]["entries"]},
@@ -784,7 +893,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
     def test_gfs_reconcile_downloads_only_missing_target_coverages(self):
         products = [
             SimpleNamespace(name=name)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            for name in GFS_GROUP_PRODUCTS
         ]
         runs = ["2026071500", "2026071418", "2026071412", "2026071406"]
         target_plans = [
@@ -857,7 +966,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
     def test_gfs_reconcile_reports_busy_group_without_false_incomplete_error(self):
         products = [
             SimpleNamespace(name=name)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            for name in GFS_GROUP_PRODUCTS
         ]
         run = "2026071500"
         target_plans = [
@@ -926,7 +1035,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
     def test_gfs_reconcile_defers_legacy_activation_for_native_publisher(self):
         products = [
             SimpleNamespace(name=name)
-            for name in ("gfs013_surface", "gfs025", "gfs_pressure_profile")
+            for name in GFS_GROUP_PRODUCTS
         ]
         runs = ["2026072018", "2026072012", "2026072006", "2026072000", "2026071918"]
         target_plans = [
@@ -1673,16 +1782,36 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(group_manifest["status"], "complete")
         self.assertEqual(group_manifest["latest_complete_run"], "2026070712")
-        self.assertEqual(group_manifest["files"], 3)
-        self.assertEqual(group_manifest["bytes"], 840)
+        self.assertEqual(group_manifest["files"], len(GFS_GROUP_PRODUCTS))
         self.assertEqual(
-            sorted(group_manifest["products"]),
-            ["gfs013_surface", "gfs025", "gfs_pressure_profile"],
+            group_manifest["bytes"],
+            sum(
+                summary["bytes"]
+                for summary in group_manifest["product_manifests"].values()
+            ),
+        )
+        self.assertEqual(
+            tuple(group_manifest["products"]),
+            GFS_GROUP_PRODUCTS,
         )
         for product_name in group_manifest["products"]:
             self.assertTrue(product_latest_exists[product_name])
             self.assertEqual(group_manifest["product_manifests"][product_name]["files"], 1)
-            self.assertEqual(group_manifest["product_manifests"][product_name]["bytes"], 280)
+            expected_valid_time_count = (
+                2
+                if product_name in GFS_PROBABILITY_PRODUCTS
+                else 5
+            )
+            self.assertEqual(
+                group_manifest["product_manifests"][product_name][
+                    "valid_time_count"
+                ],
+                expected_valid_time_count,
+            )
+            self.assertEqual(
+                group_manifest["product_manifests"][product_name]["bytes"],
+                56 * expected_valid_time_count,
+            )
         group_runs = [
             record
             for record in run_summary
@@ -1692,31 +1821,19 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         group_run = group_runs[-1]
         self.assertEqual(group_run["status"], "complete")
         self.assertEqual(group_run["latest_complete_run"], "2026070712")
-        self.assertEqual(group_run["files"], 3)
-        self.assertEqual(group_run["bytes"], 840)
+        self.assertEqual(group_run["files"], len(GFS_GROUP_PRODUCTS))
+        self.assertEqual(group_run["bytes"], group_manifest["bytes"])
         self.assertEqual(
             sorted(
                 record["product"]
                 for record in run_summary
                 if record["kind"] == "product"
             ),
-            [
-                "gfs013_surface",
-                "gfs013_surface",
-                "gfs013_surface",
-                "gfs013_surface",
-                "gfs013_surface",
-                "gfs025",
-                "gfs025",
-                "gfs025",
-                "gfs025",
-                "gfs025",
-                "gfs_pressure_profile",
-                "gfs_pressure_profile",
-                "gfs_pressure_profile",
-                "gfs_pressure_profile",
-                "gfs_pressure_profile",
-            ],
+            sorted(
+                product_name
+                for product_name in GFS_GROUP_PRODUCTS
+                for _release in range(cli_module.GFS_TOTAL_RELEASE_RETENTION)
+            ),
         )
 
     def test_cli_group_publish_to_api_root_clears_download_payloads_and_skips_next_probe(self):
@@ -1773,9 +1890,15 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
             self.assertEqual(api_ready["status"], "complete")
             self.assertEqual(api_ready["latest_complete_run"], group_manifest["latest_complete_run"])
             self.assertTrue((output / "published" / "gfs025" / "latest.json").exists())
-            self.assertFalse((output / "published" / "gfs025" / "coverages").exists())
-            self.assertFalse((output / "published" / "gfs013_surface" / "coverages").exists())
-            self.assertFalse((output / "published" / "gfs_pressure_profile" / "coverages").exists())
+            for product_name in GFS_GROUP_PRODUCTS:
+                self.assertFalse(
+                    (
+                        output
+                        / "published"
+                        / product_name
+                        / "coverages"
+                    ).exists()
+                )
             self.assertTrue((api_root / "gfs025" / "coverages").exists())
             self.assertEqual(second_payload["status"], "skipped")
             self.assertEqual(second_payload["reason"], "target retention window already complete")
@@ -1851,9 +1974,8 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 for product, summary in api_ready["product_manifests"].items()
             },
             {
-                "gfs013_surface": "2026070712",
-                "gfs025": "2026070712",
-                "gfs_pressure_profile": "2026070712",
+                product_name: "2026070712"
+                for product_name in GFS_GROUP_PRODUCTS
             },
         )
 
@@ -2021,9 +2143,8 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 for product, summary in group_manifest["product_manifests"].items()
             },
             {
-                "gfs013_surface": "2026070712",
-                "gfs025": "2026070712",
-                "gfs_pressure_profile": "2026070712",
+                product_name: "2026070712"
+                for product_name in GFS_GROUP_PRODUCTS
             },
         )
 

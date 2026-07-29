@@ -26,8 +26,35 @@ ECMWF_IFS025_HSURF = StaticAssetSpec(
     sha256="935d56ba000b438b61504fbc271bfaa8f70db2acb541d58d5b466a24d294a9fb",
 )
 
+NCEP_GEFS025_HSURF = StaticAssetSpec(
+    model="ncep_gefs025",
+    relative_path=PurePosixPath("static/ncep_gefs025/HSURF.om"),
+    bucket_key=PurePosixPath("data/ncep_gefs025/static/HSURF.om"),
+    bytes=408_440,
+    sha256="09f589bd34aad27f538a5c0cb01c5dbd4114acc27d6b6f24524fd9451ce56f62",
+)
+
+NCEP_GEFS05_HSURF = StaticAssetSpec(
+    model="ncep_gefs05",
+    relative_path=PurePosixPath("static/ncep_gefs05/HSURF.om"),
+    bucket_key=PurePosixPath("data/ncep_gefs05/static/HSURF.om"),
+    bytes=118_088,
+    sha256="aeb5313b8f402b9098a268b476b480ed065593eb718c358ad01fada0f0f6ddcb",
+)
+
+ECMWF_IFS025_ENSEMBLE_HSURF = StaticAssetSpec(
+    model="ecmwf_ifs025_ensemble",
+    relative_path=PurePosixPath("static/ecmwf_ifs025_ensemble/HSURF.om"),
+    bucket_key=PurePosixPath("data/ecmwf_ifs025_ensemble/static/HSURF.om"),
+    bytes=433_744,
+    sha256="c137997ccae161da2f79bd4ae3e00e03aa0a94cf351d5fd69b88a03191c1e2be",
+)
+
 OPENMETEO_STATIC_ASSETS = {
     ECMWF_IFS025_HSURF.model: ECMWF_IFS025_HSURF,
+    NCEP_GEFS025_HSURF.model: NCEP_GEFS025_HSURF,
+    NCEP_GEFS05_HSURF.model: NCEP_GEFS05_HSURF,
+    ECMWF_IFS025_ENSEMBLE_HSURF.model: ECMWF_IFS025_ENSEMBLE_HSURF,
 }
 
 

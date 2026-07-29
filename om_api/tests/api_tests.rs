@@ -141,6 +141,41 @@ fn write_group_ready(root: &Path, group: &str, products: &[(&str, &str)]) {
     .unwrap();
 }
 
+fn write_group_ready_with_product_runs(
+    root: &Path,
+    group: &str,
+    latest_complete_run: &str,
+    products: &[(&str, &str, &str)],
+) {
+    let product_manifests = products
+        .iter()
+        .map(|(product, coverage_id, product_run)| {
+            (
+                (*product).to_string(),
+                serde_json::json!({
+                    "coverage_id": coverage_id,
+                    "status": "complete",
+                    "latest_complete_run": product_run,
+                    "path": format!("../{product}/latest.json")
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let ready = serde_json::json!({
+        "group": group,
+        "status": "complete",
+        "latest_complete_run": latest_complete_run,
+        "product_manifests": product_manifests
+    });
+    let current = root.join("groups").join(group).join("current");
+    fs::create_dir_all(&current).unwrap();
+    fs::write(
+        current.join("ready_for_processing.json"),
+        serde_json::to_vec_pretty(&ready).unwrap(),
+    )
+    .unwrap();
+}
+
 fn write_group_release(root: &Path, group: &str, run: &str, products: &[(&str, &str)]) {
     let product_manifests = products
         .iter()
@@ -193,6 +228,22 @@ fn set_coverage_forecast_hour(root: &Path, product: &str, coverage_id: &str, for
             entry["forecast_hour"] = Value::from(forecast_hour);
         }
     }
+    fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn set_coverage_latest_complete_run(
+    root: &Path,
+    product: &str,
+    coverage_id: &str,
+    latest_complete_run: &str,
+) {
+    let path = root
+        .join(product)
+        .join("coverages")
+        .join(coverage_id)
+        .join("latest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["latest_complete_run"] = Value::String(latest_complete_run.to_string());
     fs::write(path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
@@ -1452,6 +1503,264 @@ async fn forecast_endpoint_uses_official_json_precision_time_and_units() {
     assert_eq!(body["hourly_units"]["dew_point_2m"], "°C");
     assert_eq!(body["hourly_units"]["wind_direction_10m"], "°");
     assert_eq!(body["hourly_units"]["pressure_msl"], "hPa");
+}
+
+#[tokio::test]
+async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_keeps_missing_null() {
+    let root = tempfile::tempdir().unwrap();
+    let deterministic = "gfs013_surface_probability_seed";
+    write_product_coverage_timed(
+        root.path(),
+        "gfs013_surface",
+        deterministic,
+        vec![
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [20.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [23.0; 4],
+                valid_time_utc: "2026-07-08T07:00:00Z",
+            },
+        ],
+        false,
+    );
+    let gefs025 = "ncep_gefs025_probability";
+    write_product_coverage_timed(
+        root.path(),
+        "ncep_gefs025",
+        gefs025,
+        vec![
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [27.0; 4],
+                valid_time_utc: "2026-07-08T01:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [31.0; 4],
+                valid_time_utc: "2026-07-08T02:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [35.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [39.0; 4],
+                valid_time_utc: "2026-07-08T04:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [43.0; 4],
+                valid_time_utc: "2026-07-08T05:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [f32::NAN; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    let gefs05 = "ncep_gefs05_probability";
+    write_product_coverage_timed(
+        root.path(),
+        "ncep_gefs05",
+        gefs05,
+        vec![
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [91.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [83.0; 4],
+                valid_time_utc: "2026-07-08T01:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [75.0; 4],
+                valid_time_utc: "2026-07-08T02:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [67.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [59.0; 4],
+                valid_time_utc: "2026-07-08T04:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [51.0; 4],
+                valid_time_utc: "2026-07-08T05:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [64.0; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    write_group_ready(
+        root.path(),
+        "gfs",
+        &[
+            ("gfs013_surface", deterministic),
+            ("ncep_gefs025", gefs025),
+            ("ncep_gefs05", gefs05),
+        ],
+    );
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app,
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation_probability&forecast_hours=8",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["hourly"]["precipitation_probability"],
+        serde_json::json!([0, 27, 31, 43, 49, 49, 64, null])
+    );
+    assert_eq!(body["hourly_units"]["precipitation_probability"], "%");
+    assert_eq!(
+        body["hourly"]["precipitation_probability"][0].as_i64(),
+        Some(0),
+        "a downloaded 0% must remain a numeric zero rather than becoming null"
+    );
+    assert_eq!(
+        body["hourly"]["precipitation_probability"][1].as_i64(),
+        Some(27),
+        "GEFS 0.25° must take precedence when both products cover the hour"
+    );
+    assert_eq!(
+        body["hourly"]["precipitation_probability"][6].as_i64(),
+        Some(64),
+        "GEFS 0.5° must fill the same-hour gap left by GEFS 0.25°"
+    );
+    assert!(
+        body["hourly"]["precipitation_probability"][7].is_null(),
+        "an hour missing from both ensemble products must not be synthesized as 0%"
+    );
+}
+
+#[tokio::test]
+async fn ecmwf_precipitation_probability_supports_independent_ensemble_run_and_missing_null() {
+    let root = tempfile::tempdir().unwrap();
+    let deterministic = "ecmwf_ifs025_probability_seed";
+    write_product_coverage_timed(
+        root.path(),
+        "ecmwf_ifs025",
+        deterministic,
+        vec![
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [20.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [24.0; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    let ensemble = "ecmwf_ifs025_ensemble_probability";
+    write_product_coverage_timed(
+        root.path(),
+        "ecmwf_ifs025_ensemble",
+        ensemble,
+        vec![
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [0.0; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [42.0; 4],
+                valid_time_utc: "2026-07-08T03:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "precipitation_probability",
+                values: [f32::NAN; 4],
+                valid_time_utc: "2026-07-08T06:00:00Z",
+            },
+        ],
+        false,
+    );
+    let deterministic_run = "2026070718";
+    let ensemble_run = "2026070712";
+    set_coverage_latest_complete_run(
+        root.path(),
+        "ecmwf_ifs025",
+        deterministic,
+        deterministic_run,
+    );
+    set_coverage_latest_complete_run(root.path(), "ecmwf_ifs025_ensemble", ensemble, ensemble_run);
+    write_group_ready_with_product_runs(
+        root.path(),
+        "ecmwf",
+        deterministic_run,
+        &[
+            ("ecmwf_ifs025", deterministic, deterministic_run),
+            ("ecmwf_ifs025_ensemble", ensemble, ensemble_run),
+        ],
+    );
+
+    let state = AppState::new(root.path().to_path_buf(), None).unwrap();
+    let app = router(state);
+    let (status, body) = request_json(
+        app.clone(),
+        "/v1/ecmwf?latitude=-90&longitude=-180&hourly=precipitation_probability&forecast_hours=7",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["model_run"], deterministic_run);
+    assert_eq!(body["hourly_units"]["precipitation_probability"], "%");
+    assert_eq!(
+        body["hourly"]["precipitation_probability"][0].as_i64(),
+        Some(0),
+        "a downloaded 0% must remain a numeric zero"
+    );
+    assert_eq!(
+        body["hourly"]["precipitation_probability"][3].as_i64(),
+        Some(42),
+        "native ensemble probability must be serialized as an integer percentage"
+    );
+    assert!(
+        body["hourly"]["precipitation_probability"][6].is_null(),
+        "a missing ensemble value must remain null rather than becoming 0%"
+    );
+
+    let (catalog_status, catalog) = request_json(app, "/v1/ecmwf/catalog").await;
+    assert_eq!(catalog_status, StatusCode::OK, "{catalog}");
+    assert_eq!(
+        catalog["products"]["ecmwf_ifs025"]["latest_complete_run"],
+        deterministic_run
+    );
+    assert_eq!(
+        catalog["products"]["ecmwf_ifs025_ensemble"]["latest_complete_run"],
+        ensemble_run
+    );
 }
 
 #[tokio::test]

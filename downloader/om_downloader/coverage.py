@@ -59,6 +59,17 @@ def _forecast_hour_for(run: OmRun, valid_time: datetime) -> int | None:
     return hour
 
 
+def _forecast_hour_for_product(
+    product: ProductConfig,
+    run: OmRun,
+    valid_time: datetime,
+) -> int | None:
+    hour = _forecast_hour_for(run, valid_time)
+    if hour is None or hour < getattr(product, "forecast_hour_start", 0):
+        return None
+    return hour
+
+
 def _target_valid_times(
     runs: list[OmRun],
     *,
@@ -103,7 +114,7 @@ def build_coverage_plan(product: ProductConfig, runs: list[OmRun], now_utc: date
     ):
         candidates: list[tuple[datetime, str, int]] = []
         for run in sorted_runs:
-            forecast_hour = _forecast_hour_for(run, cursor)
+            forecast_hour = _forecast_hour_for_product(product, run, cursor)
             if forecast_hour is not None:
                 candidates.append((_as_utc(run.base_time_utc), run.run_id, forecast_hour))
         if not candidates:
@@ -156,7 +167,7 @@ def build_stitched_coverage_plan(
     ):
         candidates: list[tuple[datetime, str, int]] = []
         for run in sorted_runs:
-            forecast_hour = _forecast_hour_for(run, cursor)
+            forecast_hour = _forecast_hour_for_product(product, run, cursor)
             if forecast_hour is not None:
                 candidates.append((_as_utc(run.base_time_utc), run.run_id, forecast_hour))
         if not candidates:
@@ -199,18 +210,27 @@ def build_product_coverage_plan(
 def build_complete_run_coverage_plan(product: ProductConfig, run: OmRun) -> CoveragePlan:
     """Build a coverage containing only one complete model run."""
     base_time = _as_utc(run.base_time_utc)
+    forecast_hour_start = getattr(product, "forecast_hour_start", 0)
     forecast_hour_end = min(product.forecast_hour_end, run.max_forecast_hour)
+    required_start = base_time + timedelta(hours=forecast_hour_start)
     required_end = base_time + timedelta(hours=forecast_hour_end)
     valid_times = (
         sorted(
             _as_utc(valid_time)
             for valid_time in run.valid_times_utc
-            if base_time <= _as_utc(valid_time) <= required_end
+            if required_start <= _as_utc(valid_time) <= required_end
         )
         if run.valid_times_utc
-        else [base_time + timedelta(hours=hour) for hour in range(forecast_hour_end + 1)]
+        else [
+            base_time + timedelta(hours=hour)
+            for hour in range(forecast_hour_start, forecast_hour_end + 1)
+        ]
     )
-    if not valid_times or valid_times[0] != base_time or valid_times[-1] != required_end:
+    if (
+        not valid_times
+        or valid_times[0] != required_start
+        or valid_times[-1] != required_end
+    ):
         raise ValueError(f"run {run.run_id} does not contain the requested complete window")
 
     slots = tuple(
@@ -223,11 +243,11 @@ def build_complete_run_coverage_plan(product: ProductConfig, run: OmRun) -> Cove
     )
     return CoveragePlan(
         product=product.name,
-        required_start_utc=base_time,
+        required_start_utc=required_start,
         required_end_utc=required_end,
         latest_complete_run=run.run_id,
         slots=slots,
-        public_start_utc=base_time,
+        public_start_utc=required_start,
     )
 
 
@@ -241,18 +261,31 @@ def build_run_forecast_hour_coverage_plan(
     if forecast_hour_end < 0:
         raise ValueError("forecast_hour_end must not be negative")
     base_time = _as_utc(run.base_time_utc)
+    forecast_hour_start = getattr(product, "forecast_hour_start", 0)
     effective_end = min(product.forecast_hour_end, run.max_forecast_hour, forecast_hour_end)
+    if effective_end < forecast_hour_start:
+        raise ValueError(
+            f"forecast hour {forecast_hour_end} precedes the first available "
+            f"hour {forecast_hour_start} for {product.name}"
+        )
+    required_start = base_time + timedelta(hours=forecast_hour_start)
     required_end = base_time + timedelta(hours=effective_end)
     valid_times = (
         sorted(
             _as_utc(valid_time)
             for valid_time in run.valid_times_utc
-            if base_time <= _as_utc(valid_time) <= required_end
+            if required_start <= _as_utc(valid_time) <= required_end
         )
         if run.valid_times_utc
-        else [base_time + timedelta(hours=hour) for hour in range(effective_end + 1)]
+        else [
+            base_time + timedelta(hours=hour)
+            for hour in range(forecast_hour_start, effective_end + 1)
+        ]
     )
-    expected_times = [base_time + timedelta(hours=hour) for hour in range(effective_end + 1)]
+    expected_times = [
+        base_time + timedelta(hours=hour)
+        for hour in range(forecast_hour_start, effective_end + 1)
+    ]
     if valid_times != expected_times:
         raise ValueError(
             f"run {run.run_id} does not contain every hour through forecast hour {effective_end}"
@@ -267,11 +300,11 @@ def build_run_forecast_hour_coverage_plan(
     )
     return CoveragePlan(
         product=product.name,
-        required_start_utc=base_time,
+        required_start_utc=required_start,
         required_end_utc=required_end,
         latest_complete_run=run.run_id,
         slots=slots,
-        public_start_utc=base_time,
+        public_start_utc=required_start,
     )
 
 
@@ -285,18 +318,27 @@ def build_run_native_forecast_hour_coverage_plan(
     if forecast_hour_end < 0:
         raise ValueError("forecast_hour_end must not be negative")
     base_time = _as_utc(run.base_time_utc)
+    forecast_hour_start = getattr(product, "forecast_hour_start", 0)
     effective_end = min(product.forecast_hour_end, run.max_forecast_hour, forecast_hour_end)
-    required_end = base_time + timedelta(hours=effective_end)
+    if effective_end < forecast_hour_start:
+        raise ValueError(
+            f"forecast hour {forecast_hour_end} precedes the first available "
+            f"hour {forecast_hour_start} for {product.name}"
+        )
+    required_start = base_time + timedelta(hours=forecast_hour_start)
     valid_times = sorted(
         _as_utc(valid_time)
         for valid_time in run.valid_times_utc
-        if base_time <= _as_utc(valid_time) <= required_end
+        if required_start
+        <= _as_utc(valid_time)
+        <= base_time + timedelta(hours=effective_end)
     )
-    if not valid_times or valid_times[0] != base_time or valid_times[-1] != required_end:
+    if not valid_times or valid_times[0] != required_start:
         raise ValueError(
-            f"run {run.run_id} does not contain its native boundary frames through "
-            f"forecast hour {effective_end}"
+            f"run {run.run_id} does not contain its first native frame at "
+            f"forecast hour {forecast_hour_start}"
         )
+    required_end = valid_times[-1]
     slots = tuple(
         CoverageSlot(
             valid_time_utc=valid_time,
@@ -307,9 +349,9 @@ def build_run_native_forecast_hour_coverage_plan(
     )
     return CoveragePlan(
         product=product.name,
-        required_start_utc=base_time,
+        required_start_utc=required_start,
         required_end_utc=required_end,
         latest_complete_run=run.run_id,
         slots=slots,
-        public_start_utc=base_time,
+        public_start_utc=required_start,
     )

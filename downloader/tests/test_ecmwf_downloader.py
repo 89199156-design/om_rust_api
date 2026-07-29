@@ -64,6 +64,24 @@ def _product() -> ProductConfig:
     )
 
 
+def _ensemble_product() -> ProductConfig:
+    return ProductConfig(
+        name="ecmwf_ifs025_ensemble",
+        download_product="om_ecmwf_ifs025_ensemble",
+        openmeteo_model="ecmwf_ifs025_ensemble",
+        forecast_hour_start=3,
+        forecast_hour_end=360,
+        run_cadence_hours=6,
+        timezone_anchors=(8, 6),
+        requested_bounds=Bounds(70.0, 0.0, 140.0, 58.0),
+        bounds_padding_degrees=2.0,
+        required_variables=("precipitation_probability",),
+        optional_variables=(),
+        requested_pressure_levels_hpa=(),
+        coverage_strategy="latest_with_long_run_tail",
+    )
+
+
 class EcmwfDownloaderTests(unittest.TestCase):
     def test_initial_fallback_gate_applies_only_when_plan_contains_latest_f000(self):
         base = datetime(2026, 7, 27, tzinfo=UTC)
@@ -381,8 +399,19 @@ class EcmwfDownloaderTests(unittest.TestCase):
             "2026072700",
             "2026072618",
         )
+        products = (_product(), _ensemble_product())
         plans = [
-            (run, {"ecmwf_ifs025": (None, [], SimpleNamespace(latest_complete_run=run))})
+            (
+                run,
+                {
+                    product.name: (
+                        None,
+                        [],
+                        SimpleNamespace(latest_complete_run=run),
+                    )
+                    for product in products
+                },
+            )
             for run in runs
         ]
         retained = {
@@ -391,7 +420,9 @@ class EcmwfDownloaderTests(unittest.TestCase):
         }
 
         def download_release(*_args, **kwargs):
-            plan = kwargs["plan_by_product_override"]["ecmwf_ifs025"][2]
+            override = kwargs["plan_by_product_override"]
+            self.assertEqual(set(override), {product.name for product in products})
+            plan = override["ecmwf_ifs025"][2]
             print(json.dumps({"status": "complete", "latest_complete_run": plan.latest_complete_run}))
             return 0
 
@@ -410,7 +441,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
                     cli_module,
                     "load_models",
                     return_value=SimpleNamespace(
-                        products={"ecmwf_ifs025": _product()}
+                        products={product.name: product for product in products}
                     ),
                 ),
                 patch.object(
@@ -549,7 +580,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
             patch.object(cli_module, "_build_product_plan", side_effect=build_full),
         ):
             plans = cli_module._discover_recent_ecmwf_retention_plans(
-                _product(),
+                [_product()],
                 now_utc=datetime(2026, 7, 28, 4, tzinfo=UTC),
                 bucket_url="https://example.test",
             )
@@ -699,7 +730,10 @@ class EcmwfDownloaderTests(unittest.TestCase):
             bucket_url="https://openmeteo.s3.amazonaws.com",
         )
         self.assertEqual(json.loads(stdout.getvalue())["reference_time"], "2026-07-18T18:00:00Z")
-        self.assertEqual(cli_module.OPENMETEO_GROUP_PRODUCTS["ecmwf"], ("ecmwf_ifs025",))
+        self.assertEqual(
+            cli_module.OPENMETEO_GROUP_PRODUCTS["ecmwf"],
+            ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
+        )
 
 
 if __name__ == "__main__":

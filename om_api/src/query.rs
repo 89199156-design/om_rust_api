@@ -1,7 +1,5 @@
 use crate::dem::read_dem90;
-use crate::manifest::{
-    ArrayMetadata, BundleEntry, CoveragePlanEntry, EntryKey, ProductSnapshot,
-};
+use crate::manifest::{ArrayMetadata, BundleEntry, CoveragePlanEntry, EntryKey, ProductSnapshot};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
@@ -34,12 +32,30 @@ const GFS025_STATIC_CHUNKS: &[u64] = &[20, 20];
 const GFS025_STATIC_LUT_OFFSET: u64 = 404_885;
 const GFS025_STATIC_LUT_SIZE: u64 = 3_444;
 const GFS025_STATIC_FILE_SIZE: u64 = 408_440;
+const GEFS025_STATIC_ELEVATION_PATH: &str = "static/ncep_gefs025/HSURF.om";
+const GEFS025_STATIC_DIMENSIONS: &[u64] = &[721, 1440];
+const GEFS025_STATIC_CHUNKS: &[u64] = &[20, 20];
+const GEFS025_STATIC_LUT_OFFSET: u64 = 404_885;
+const GEFS025_STATIC_LUT_SIZE: u64 = 3_444;
+const GEFS025_STATIC_FILE_SIZE: u64 = 408_440;
+const GEFS05_STATIC_ELEVATION_PATH: &str = "static/ncep_gefs05/HSURF.om";
+const GEFS05_STATIC_DIMENSIONS: &[u64] = &[361, 720];
+const GEFS05_STATIC_CHUNKS: &[u64] = &[20, 20];
+const GEFS05_STATIC_LUT_OFFSET: u64 = 117_112;
+const GEFS05_STATIC_LUT_SIZE: u64 = 869;
+const GEFS05_STATIC_FILE_SIZE: u64 = 118_088;
 const ECMWF025_STATIC_ELEVATION_PATH: &str = "static/ecmwf_ifs025/HSURF.om";
 const ECMWF025_STATIC_DIMENSIONS: &[u64] = &[721, 1440];
 const ECMWF025_STATIC_CHUNKS: &[u64] = &[20, 20];
 const ECMWF025_STATIC_LUT_OFFSET: u64 = 430_052;
 const ECMWF025_STATIC_LUT_SIZE: u64 = 3_486;
 const ECMWF025_STATIC_FILE_SIZE: u64 = 433_648;
+const ECMWF025_ENSEMBLE_STATIC_ELEVATION_PATH: &str = "static/ecmwf_ifs025_ensemble/HSURF.om";
+const ECMWF025_ENSEMBLE_STATIC_DIMENSIONS: &[u64] = &[721, 1440];
+const ECMWF025_ENSEMBLE_STATIC_CHUNKS: &[u64] = &[20, 20];
+const ECMWF025_ENSEMBLE_STATIC_LUT_OFFSET: u64 = 430_151;
+const ECMWF025_ENSEMBLE_STATIC_LUT_SIZE: u64 = 3_486;
+const ECMWF025_ENSEMBLE_STATIC_FILE_SIZE: u64 = 433_744;
 type ElevationCache = HashMap<(PathBuf, u64, u64), f32>;
 static ELEVATION_CACHE: OnceLock<Mutex<ElevationCache>> = OnceLock::new();
 
@@ -154,7 +170,10 @@ struct ModelSampling {
 struct RequestSampling {
     gfs013: Option<ModelSampling>,
     gfs025: Option<ModelSampling>,
+    gefs025: Option<ModelSampling>,
+    gefs05: Option<ModelSampling>,
     ecmwf025: Option<ModelSampling>,
+    ecmwf025_ensemble: Option<ModelSampling>,
     response_elevation: f32,
 }
 
@@ -180,7 +199,10 @@ fn current_product_sampling(product: &str) -> Option<ModelSampling> {
             .and_then(|sampling| match product {
                 "gfs013_surface" => sampling.gfs013,
                 "gfs025" | "gfs_pressure_profile" => sampling.gfs025,
+                "ncep_gefs025" => sampling.gefs025,
+                "ncep_gefs05" => sampling.gefs05,
                 "ecmwf_ifs025" => sampling.ecmwf025,
+                "ecmwf_ifs025_ensemble" => sampling.ecmwf025_ensemble,
                 _ => None,
             })
     })
@@ -353,7 +375,9 @@ pub fn validate_explicit_variables(query: &PointQuery) -> Result<()> {
 pub fn validate_gfs_query(query: &PointQuery) -> Result<()> {
     validate_explicit_variables(query)?;
     let (hourly, daily) = requested_variables(query);
-    if hourly.iter().any(|variable| is_air_quality_variable(variable))
+    if hourly
+        .iter()
+        .any(|variable| is_air_quality_variable(variable))
         || daily
             .iter()
             .any(|variable| is_chinese_air_quality_daily_variable(variable))
@@ -400,6 +424,7 @@ pub const ECMWF_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
     "cloud_cover_mid",
     "cloud_cover_high",
     "precipitation",
+    "precipitation_probability",
     "rain",
     "snowfall",
     "snowfall_water_equivalent",
@@ -472,6 +497,9 @@ pub const ECMWF_PUBLIC_DAILY_VARIABLES: &[&str] = &[
     "et0_fao_evapotranspiration_sum",
     "growing_degree_days_base_0_limit_50",
     "precipitation_hours",
+    "precipitation_probability_max",
+    "precipitation_probability_mean",
+    "precipitation_probability_min",
     "precipitation_sum",
     "pressure_msl_max",
     "pressure_msl_mean",
@@ -600,6 +628,7 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "weathercode"
             | "is_day"
             | "precipitation"
+            | "precipitation_probability"
             | "rain"
             | "showers"
             | "snowfall"
@@ -692,6 +721,9 @@ fn is_gfs_public_daily_variable(variable: &str) -> bool {
             | "apparent_temperature_min"
             | "apparent_temperature_mean"
             | "precipitation_sum"
+            | "precipitation_probability_max"
+            | "precipitation_probability_min"
+            | "precipitation_probability_mean"
             | "rain_sum"
             | "showers_sum"
             | "snowfall_sum"
@@ -1189,7 +1221,13 @@ pub fn point_forecast(
         );
 
         for variable in variables {
-            let fast_values = if let Some(decoder) = decoder {
+            let fast_values = if variable == "precipitation_probability"
+                && current_weather_model() == WeatherModel::Gfs
+            {
+                Some(read_gfs_precipitation_probability_point_series(
+                    snapshot, decoder, &times, latitude, longitude,
+                )?)
+            } else if let Some(decoder) = decoder {
                 match read_variable_point_series(
                     snapshot, decoder, variable, &times, latitude, longitude,
                 ) {
@@ -1299,6 +1337,15 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "apparent_temperature_min" => DailyWeatherAggregation::Min("apparent_temperature"),
         "apparent_temperature_mean" => DailyWeatherAggregation::Mean("apparent_temperature"),
         "precipitation_sum" => DailyWeatherAggregation::Sum("precipitation"),
+        "precipitation_probability_max" => {
+            DailyWeatherAggregation::Max("precipitation_probability")
+        }
+        "precipitation_probability_min" => {
+            DailyWeatherAggregation::Min("precipitation_probability")
+        }
+        "precipitation_probability_mean" => {
+            DailyWeatherAggregation::Mean("precipitation_probability")
+        }
         "rain_sum" => DailyWeatherAggregation::Sum("rain"),
         "showers_sum" => DailyWeatherAggregation::Sum("showers"),
         "snowfall_sum" => DailyWeatherAggregation::Sum("snowfall"),
@@ -1563,7 +1610,9 @@ fn select_weather_dates(
         bail!("past_days and forecast_days cannot be combined with start_date and end_date");
     }
 
-    let raw_seed = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+    let raw_seed = if current_weather_model() == WeatherModel::EcmwfIfs025
+        || seed_variable == "precipitation_probability"
+    {
         // The free IFS025 product always requires temperature_2m. Use that
         // stable axis so an unavailable first daily field cannot change the
         // response window or make variable order affect request success.
@@ -1697,10 +1746,7 @@ fn daily_weather_value(
         {
             return Ok(f32::NAN);
         }
-        return Ok(dominant_wind_direction(
-            &speed_values,
-            &direction_values,
-        ));
+        return Ok(dominant_wind_direction(&speed_values, &direction_values));
     }
 
     let source = aggregation.seed_variable();
@@ -1983,13 +2029,17 @@ fn select_times(
         || variables
             .iter()
             .any(|variable| !is_air_quality_variable(variable));
-    let seed_var = if current_weather_model() == WeatherModel::EcmwfIfs025 && contains_weather {
+    let requested_seed = variables
+        .first()
+        .map(|value| seed_variable_for_times(value))
+        .unwrap_or_else(|| "temperature_2m".to_string());
+    let seed_var = if contains_weather
+        && (current_weather_model() == WeatherModel::EcmwfIfs025
+            || requested_seed == "precipitation_probability")
+    {
         "temperature_2m".to_string()
     } else {
-        variables
-            .first()
-            .map(|value| seed_variable_for_times(value))
-            .unwrap_or_else(|| "temperature_2m".to_string())
+        requested_seed
     };
     let (product_name, raw_var) = product_for_variable(snapshot, &seed_var)?;
     let product = snapshot.require_product(product_name)?;
@@ -2976,16 +3026,24 @@ pub fn read_variable_grid_series(
     if times.is_empty() || latitudes.is_empty() || longitudes.is_empty() {
         bail!("regional grid series dimensions must not be empty");
     }
-    let ecmwf_latitudes;
-    let ecmwf_longitudes;
+    if variable == "precipitation_probability" && current_weather_model() == WeatherModel::Gfs {
+        return read_gfs_precipitation_probability_grid_series(
+            snapshot, decoder, times, latitudes, longitudes,
+        );
+    }
+    let sampled_latitudes;
+    let sampled_longitudes;
     let (latitudes, longitudes) = if current_weather_model() == WeatherModel::EcmwfIfs025
         && latitudes.len() == 1
         && longitudes.len() == 1
     {
-        if let Some(sampling) = current_product_sampling("ecmwf_ifs025") {
-            ecmwf_latitudes = [sampling.latitude];
-            ecmwf_longitudes = [sampling.longitude];
-            (&ecmwf_latitudes[..], &ecmwf_longitudes[..])
+        let sampling_product = product_for_variable(snapshot, &seed_variable_for_times(variable))
+            .ok()
+            .map(|(product, _)| product);
+        if let Some(sampling) = sampling_product.and_then(current_product_sampling) {
+            sampled_latitudes = [sampling.latitude];
+            sampled_longitudes = [sampling.longitude];
+            (&sampled_latitudes[..], &sampled_longitudes[..])
         } else {
             (latitudes, longitudes)
         }
@@ -3868,6 +3926,138 @@ pub fn read_variable_grid_series(
     }
 }
 
+fn read_gfs_precipitation_probability_grid_series(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<Vec<f32>>> {
+    let grid_len = latitudes.len() * longitudes.len();
+    let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
+        if snapshot.product(product_name).is_none() {
+            return Ok(None);
+        }
+        times
+            .iter()
+            .map(|time| {
+                read_gfs_product_history_grid_with_rounding(
+                    snapshot,
+                    decoder,
+                    product_name,
+                    "precipitation_probability",
+                    "precipitation_probability",
+                    *time,
+                    latitudes,
+                    longitudes,
+                    true,
+                )
+                .map(|values| values.unwrap_or_else(|| vec![f32::NAN; grid_len]))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    };
+
+    let high_resolution = read_product("ncep_gefs025")?;
+    let low_resolution = read_product("ncep_gefs05")?;
+    let mut output = match high_resolution {
+        Some(values) => values,
+        None => vec![vec![f32::NAN; grid_len]; times.len()],
+    };
+    let Some(low_resolution) = low_resolution else {
+        if output
+            .iter()
+            .all(|frame| frame.iter().all(|value| value.is_nan()))
+            && snapshot.product("ncep_gefs025").is_none()
+        {
+            bail!("GFS precipitation probability products are not available");
+        }
+        return Ok(output);
+    };
+
+    integrate_probability_if_nan_smooth(&mut output, &low_resolution, grid_len);
+    Ok(output)
+}
+
+fn read_gfs_precipitation_probability_point_series(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+) -> Result<Vec<f32>> {
+    let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
+        if snapshot.product(product_name).is_none() {
+            return Ok(None);
+        }
+        times
+            .iter()
+            .map(|time| {
+                read_product_history_value_with_rounding(
+                    snapshot,
+                    decoder,
+                    product_name,
+                    "precipitation_probability",
+                    "precipitation_probability",
+                    *time,
+                    latitude,
+                    longitude,
+                    true,
+                )
+                .map(|value| vec![value])
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    };
+    let high_resolution = read_product("ncep_gefs025")?;
+    let low_resolution = read_product("ncep_gefs05")?;
+    let mut output = high_resolution.unwrap_or_else(|| vec![vec![f32::NAN]; times.len()]);
+    if let Some(low_resolution) = low_resolution {
+        integrate_probability_if_nan_smooth(&mut output, &low_resolution, 1);
+    } else if snapshot.product("ncep_gefs025").is_none() {
+        bail!("GFS precipitation probability products are not available");
+    }
+    output
+        .into_iter()
+        .map(|mut frame| {
+            frame
+                .pop()
+                .context("GFS precipitation probability point frame is empty")
+        })
+        .collect()
+}
+
+fn integrate_probability_if_nan_smooth(
+    high_resolution: &mut [Vec<f32>],
+    low_resolution: &[Vec<f32>],
+    grid_len: usize,
+) {
+    debug_assert_eq!(high_resolution.len(), low_resolution.len());
+    // Open-Meteo's GenericReaderMixerSameDomain reads GEFS025 first, fills
+    // gaps from GEFS05, and blends the three output steps immediately before
+    // a transition. Preserve that contract so the f240 resolution boundary
+    // does not create an artificial jump.
+    for point in 0..grid_len {
+        let mut steps_since_gap = 3_i32;
+        for index in (0..high_resolution.len()).rev() {
+            steps_since_gap += 1;
+            let low = low_resolution[index][point];
+            if low.is_nan() {
+                continue;
+            }
+            let high = &mut high_resolution[index][point];
+            if high.is_nan() {
+                steps_since_gap = 0;
+                *high = low;
+                continue;
+            }
+            if steps_since_gap <= 3 {
+                *high = (low * (4 - steps_since_gap) as f32 + *high * steps_since_gap as f32) / 4.0;
+            }
+        }
+    }
+}
+
 fn read_variable_point_series(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
@@ -3878,7 +4068,7 @@ fn read_variable_point_series(
 ) -> Result<Option<Vec<f32>>> {
     let seed = seed_variable_for_times(variable);
     let (product, _) = product_for_variable(snapshot, &seed)?;
-    if product == "ecmwf_ifs025" {
+    if is_ecmwf_product(product) {
         let values = read_variable_grid_series(
             snapshot,
             decoder,
@@ -4854,6 +5044,16 @@ fn read_direct_with_rounding(
             round_values,
         );
     }
+    if variable == "precipitation_probability" && current_weather_model() == WeatherModel::Gfs {
+        return read_gfs_precipitation_probability_with_rounding(
+            snapshot,
+            decoder,
+            time,
+            latitude,
+            longitude,
+            round_values,
+        );
+    }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     read_product_history_value_with_rounding(
         snapshot,
@@ -4866,6 +5066,44 @@ fn read_direct_with_rounding(
         longitude,
         round_values,
     )
+}
+
+fn read_gfs_precipitation_probability_with_rounding(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+    round_values: bool,
+) -> Result<f32> {
+    let mut found_product = false;
+    let mut fallback = f32::NAN;
+    for product_name in ["ncep_gefs025", "ncep_gefs05"] {
+        if snapshot.product(product_name).is_none() {
+            continue;
+        }
+        found_product = true;
+        let value = read_product_history_value_with_rounding(
+            snapshot,
+            decoder,
+            product_name,
+            "precipitation_probability",
+            "precipitation_probability",
+            time,
+            latitude,
+            longitude,
+            round_values,
+        )?;
+        if value.is_finite() {
+            return Ok(value);
+        }
+        fallback = value;
+    }
+    if found_product {
+        Ok(fallback)
+    } else {
+        bail!("GFS precipitation probability products are not available")
+    }
 }
 
 fn read_direct_grid(
@@ -4892,50 +5130,52 @@ fn read_direct_grid(
         )?;
         return Ok(frames.remove(0));
     }
-    let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
-    let products = snapshot.product_snapshots(product_name);
-    if is_gfs_product(product_name) {
-        if let Some(primary) = products
-            .iter()
-            .find(|product| product_covers_time(product, &raw_variable, time))
-        {
-            let mut values = read_product_grid_with_rounding(
-                primary,
+    if variable == "precipitation_probability" {
+        let mut found_product = false;
+        let mut output = vec![f32::NAN; latitudes.len() * longitudes.len()];
+        for product_name in ["ncep_gefs025", "ncep_gefs05"] {
+            let Some(values) = read_gfs_product_history_grid_with_rounding(
+                snapshot,
                 decoder,
+                product_name,
                 variable,
-                &raw_variable,
+                variable,
                 time,
                 latitudes,
                 longitudes,
                 round_values,
-            )?;
-            if values.iter().any(|value| value.is_nan()) {
-                let fallback = products.iter().find(|product| {
-                    !Arc::ptr_eq(primary, product)
-                        && gfs_snapshot_is_full(product)
-                        && product_covers_time(product, &raw_variable, time)
-                });
-                if let Some(product) = fallback {
-                    let fallback = read_product_grid_with_rounding(
-                        product,
-                        decoder,
-                        variable,
-                        &raw_variable,
-                        time,
-                        latitudes,
-                        longitudes,
-                        round_values,
-                    )?;
-                    for (value, fallback_value) in values.iter_mut().zip(fallback) {
-                        if value.is_nan() && !fallback_value.is_nan() {
-                            *value = fallback_value;
-                        }
-                    }
-                }
+            )?
+            else {
+                continue;
+            };
+            found_product = true;
+            fill_nan_from_fallback(&mut output, &values);
+            if output.iter().all(|value| value.is_finite()) {
+                break;
             }
+        }
+        if found_product {
+            return Ok(output);
+        }
+        bail!("GFS precipitation probability products are not available");
+    }
+    let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
+    if is_gfs_product(product_name) {
+        if let Some(values) = read_gfs_product_history_grid_with_rounding(
+            snapshot,
+            decoder,
+            product_name,
+            variable,
+            &raw_variable,
+            time,
+            latitudes,
+            longitudes,
+            round_values,
+        )? {
             return Ok(values);
         }
     }
+    let products = snapshot.product_snapshots(product_name);
     if is_cams_product(product_name) {
         let covering_products = newest_and_previous_products(&products)
             // CAMS fallback is deliberately limited to the newest and the
@@ -5004,6 +5244,82 @@ fn read_direct_grid(
     bail!("variable/time is not available: {} {}", raw_variable, time)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_product_history_grid_with_rounding(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    product_name: &str,
+    variable: &str,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Option<Vec<f32>>> {
+    let products = snapshot.product_snapshots(product_name);
+    if products.is_empty() {
+        return Ok(None);
+    }
+    let sampled_latitudes;
+    let sampled_longitudes;
+    let (latitudes, longitudes) = if latitudes.len() == 1 && longitudes.len() == 1 {
+        if let Some(sampling) = current_product_sampling(product_name) {
+            sampled_latitudes = [sampling.latitude];
+            sampled_longitudes = [sampling.longitude];
+            (&sampled_latitudes[..], &sampled_longitudes[..])
+        } else {
+            (latitudes, longitudes)
+        }
+    } else {
+        (latitudes, longitudes)
+    };
+    if let Some(primary) = products
+        .iter()
+        .find(|product| product_covers_time(product, raw_variable, time))
+    {
+        let mut values = read_product_grid_with_rounding(
+            primary,
+            decoder,
+            variable,
+            raw_variable,
+            time,
+            latitudes,
+            longitudes,
+            round_values,
+        )?;
+        if values.iter().any(|value| value.is_nan()) {
+            let fallback = products.iter().find(|product| {
+                !Arc::ptr_eq(primary, product)
+                    && gfs_snapshot_is_full(product)
+                    && product_covers_time(product, raw_variable, time)
+            });
+            if let Some(product) = fallback {
+                let fallback = read_product_grid_with_rounding(
+                    product,
+                    decoder,
+                    variable,
+                    raw_variable,
+                    time,
+                    latitudes,
+                    longitudes,
+                    round_values,
+                )?;
+                fill_nan_from_fallback(&mut values, &fallback);
+            }
+        }
+        return Ok(Some(values));
+    }
+    if products.iter().any(|product| {
+        product
+            .entries
+            .keys()
+            .any(|entry_key| entry_key.variable == raw_variable)
+    }) {
+        return Ok(Some(vec![f32::NAN; latitudes.len() * longitudes.len()]));
+    }
+    Ok(None)
+}
+
 fn read_direct_grid_series(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
@@ -5033,7 +5349,7 @@ fn read_direct_grid_series(
         (latitudes, longitudes)
     };
     let products = snapshot.product_snapshots(product_name);
-    if product_name == "ecmwf_ifs025" {
+    if is_ecmwf_product(product_name) {
         let mut values = read_ecmwf_window_grid_series(
             &products,
             decoder,
@@ -5160,8 +5476,12 @@ fn read_direct_grid_series(
 fn is_gfs_product(product_name: &str) -> bool {
     matches!(
         product_name,
-        "gfs013_surface" | "gfs025" | "gfs_pressure_profile"
+        "gfs013_surface" | "gfs025" | "gfs_pressure_profile" | "ncep_gefs025" | "ncep_gefs05"
     )
+}
+
+fn is_ecmwf_product(product_name: &str) -> bool {
+    matches!(product_name, "ecmwf_ifs025" | "ecmwf_ifs025_ensemble")
 }
 
 fn is_cams_product(product_name: &str) -> bool {
@@ -5734,14 +6054,12 @@ fn ecmwf_first_stage_point(
         }
         InterpolationKind::Backwards { .. } => interpolate_ecmwf_backwards_in_place(values, false),
         InterpolationKind::Linear { .. } => interpolate_ecmwf_linear_in_place(values),
-        InterpolationKind::Hermite { bounds, .. } => {
-            interpolate_ecmwf_hermite_in_place(
-                values,
-                bounds,
-                require_full_hermite_support,
-                allow_missing_terminal_hermite_d,
-            )
-        }
+        InterpolationKind::Hermite { bounds, .. } => interpolate_ecmwf_hermite_in_place(
+            values,
+            bounds,
+            require_full_hermite_support,
+            allow_missing_terminal_hermite_d,
+        ),
         InterpolationKind::SolarBackwardsAveraged { .. } => {
             interpolate_solar_backwards_with_dt_in_place(
                 values,
@@ -5991,7 +6309,7 @@ fn build_ecmwf_regular_series(
     latitudes: &[f64],
     longitudes: &[f64],
 ) -> Result<Option<EcmwfRegularSeries>> {
-    if product.product != "ecmwf_ifs025" {
+    if !is_ecmwf_product(&product.product) {
         return Ok(None);
     }
     #[cfg(test)]
@@ -6107,7 +6425,7 @@ fn read_ecmwf_product_grid_series(
     latitudes: &[f64],
     longitudes: &[f64],
 ) -> Result<Option<Vec<Vec<f32>>>> {
-    if product.product != "ecmwf_ifs025" {
+    if !is_ecmwf_product(&product.product) {
         return Ok(None);
     }
     let key = EcmwfRegularCacheKey {
@@ -6152,14 +6470,8 @@ fn read_ecmwf_product_grid_series(
 fn ecmwf_coverage_bounds(
     coverage_plan: &[CoveragePlanEntry],
 ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let first = coverage_plan
-        .iter()
-        .map(|entry| entry.valid_time_utc)
-        .min();
-    let last = coverage_plan
-        .iter()
-        .map(|entry| entry.valid_time_utc)
-        .max();
+    let first = coverage_plan.iter().map(|entry| entry.valid_time_utc).min();
+    let last = coverage_plan.iter().map(|entry| entry.valid_time_utc).max();
     first.zip(last)
 }
 
@@ -6209,7 +6521,7 @@ fn read_ecmwf_window_grid_series(
         .collect::<Vec<_>>();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
 
-    for product_index in 0..products.len() {
+    for (product_index, product) in products.iter().enumerate() {
         let requested = primary
             .iter()
             .enumerate()
@@ -6223,7 +6535,7 @@ fn read_ecmwf_window_grid_series(
             .map(|index| times[*index])
             .collect::<Vec<_>>();
         let frames = read_ecmwf_product_grid_series(
-            &products[product_index],
+            product,
             decoder,
             variable,
             raw_variable,
@@ -7640,6 +7952,10 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
                 bounds: Some((0.0, 100.0)),
             }
         }
+        "precipitation_probability" => InterpolationKind::Hermite {
+            scalefactor: 1.0,
+            bounds: Some((0.0, 100.0)),
+        },
         "relative_humidity_2m" => InterpolationKind::Hermite {
             scalefactor: 1.0,
             bounds: Some((0.0, 100.0)),
@@ -7765,7 +8081,8 @@ fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
         | "cloud_cover_low"
         | "cloud_cover_mid"
         | "cloud_cover_high"
-        | "relative_humidity_2m" => InterpolationKind::Hermite {
+        | "relative_humidity_2m"
+        | "precipitation_probability" => InterpolationKind::Hermite {
             scalefactor,
             bounds: Some((0.0, 100.0)),
         },
@@ -7866,6 +8183,11 @@ fn product_for_variable(
         &["cams_global_greenhouse_gases", "cams_global"]
     } else if is_cams_variable(variable) {
         &["cams_global"]
+    } else if variable == "precipitation_probability" {
+        match current_weather_model() {
+            WeatherModel::Gfs => &["ncep_gefs025", "ncep_gefs05"],
+            WeatherModel::EcmwfIfs025 => &["ecmwf_ifs025_ensemble"],
+        }
     } else if current_weather_model() == WeatherModel::EcmwfIfs025 {
         &["ecmwf_ifs025"]
     } else if is_gfs025_variable(variable) {
@@ -8484,6 +8806,24 @@ const GFS025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
     file_size: GFS025_STATIC_FILE_SIZE,
 };
 
+const GEFS025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
+    relative_path: GEFS025_STATIC_ELEVATION_PATH,
+    dimensions: GEFS025_STATIC_DIMENSIONS,
+    chunks: GEFS025_STATIC_CHUNKS,
+    lut_offset: GEFS025_STATIC_LUT_OFFSET,
+    lut_size: GEFS025_STATIC_LUT_SIZE,
+    file_size: GEFS025_STATIC_FILE_SIZE,
+};
+
+const GEFS05_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
+    relative_path: GEFS05_STATIC_ELEVATION_PATH,
+    dimensions: GEFS05_STATIC_DIMENSIONS,
+    chunks: GEFS05_STATIC_CHUNKS,
+    lut_offset: GEFS05_STATIC_LUT_OFFSET,
+    lut_size: GEFS05_STATIC_LUT_SIZE,
+    file_size: GEFS05_STATIC_FILE_SIZE,
+};
+
 const ECMWF025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
     relative_path: ECMWF025_STATIC_ELEVATION_PATH,
     dimensions: ECMWF025_STATIC_DIMENSIONS,
@@ -8491,6 +8831,15 @@ const ECMWF025_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
     lut_offset: ECMWF025_STATIC_LUT_OFFSET,
     lut_size: ECMWF025_STATIC_LUT_SIZE,
     file_size: ECMWF025_STATIC_FILE_SIZE,
+};
+
+const ECMWF025_ENSEMBLE_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
+    relative_path: ECMWF025_ENSEMBLE_STATIC_ELEVATION_PATH,
+    dimensions: ECMWF025_ENSEMBLE_STATIC_DIMENSIONS,
+    chunks: ECMWF025_ENSEMBLE_STATIC_CHUNKS,
+    lut_offset: ECMWF025_ENSEMBLE_STATIC_LUT_OFFSET,
+    lut_size: ECMWF025_ENSEMBLE_STATIC_LUT_SIZE,
+    file_size: ECMWF025_ENSEMBLE_STATIC_FILE_SIZE,
 };
 
 fn resolve_request_sampling(
@@ -8553,6 +8902,38 @@ fn resolve_request_sampling(
     } else {
         None
     };
+    let gefs025 = if current_weather_model() == WeatherModel::Gfs
+        && snapshot.product("ncep_gefs025").is_some()
+    {
+        Some(resolve_model_sampling(
+            snapshot,
+            decoder,
+            "ncep_gefs025",
+            GEFS025_STATIC_SPEC,
+            latitude,
+            longitude,
+            target,
+            mode,
+        )?)
+    } else {
+        None
+    };
+    let gefs05 = if current_weather_model() == WeatherModel::Gfs
+        && snapshot.product("ncep_gefs05").is_some()
+    {
+        Some(resolve_model_sampling(
+            snapshot,
+            decoder,
+            "ncep_gefs05",
+            GEFS05_STATIC_SPEC,
+            latitude,
+            longitude,
+            target,
+            mode,
+        )?)
+    } else {
+        None
+    };
     let ecmwf025 = if current_weather_model() == WeatherModel::EcmwfIfs025
         && snapshot.product("ecmwf_ifs025").is_some()
     {
@@ -8569,10 +8950,29 @@ fn resolve_request_sampling(
     } else {
         None
     };
+    let ecmwf025_ensemble = if current_weather_model() == WeatherModel::EcmwfIfs025
+        && snapshot.product("ecmwf_ifs025_ensemble").is_some()
+    {
+        Some(resolve_model_sampling(
+            snapshot,
+            decoder,
+            "ecmwf_ifs025_ensemble",
+            ECMWF025_ENSEMBLE_STATIC_SPEC,
+            latitude,
+            longitude,
+            target,
+            mode,
+        )?)
+    } else {
+        None
+    };
     let response_elevation = if target.is_nan() {
         gfs013
             .or(gfs025)
+            .or(gefs025)
+            .or(gefs05)
             .or(ecmwf025)
+            .or(ecmwf025_ensemble)
             .map(|sampling| sampling.model_elevation)
             .unwrap_or(f32::NAN)
     } else {
@@ -8581,7 +8981,10 @@ fn resolve_request_sampling(
     Ok(RequestSampling {
         gfs013,
         gfs025,
+        gefs025,
+        gefs05,
         ecmwf025,
+        ecmwf025_ensemble,
         response_elevation,
     })
 }
@@ -9062,6 +9465,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gfs_probability_mixer_matches_official_three_step_transition() {
+        let mut high = vec![
+            vec![0.0],
+            vec![27.0],
+            vec![31.0],
+            vec![35.0],
+            vec![39.0],
+            vec![43.0],
+            vec![f32::NAN],
+            vec![f32::NAN],
+        ];
+        let low = vec![
+            vec![91.0],
+            vec![83.0],
+            vec![75.0],
+            vec![67.0],
+            vec![59.0],
+            vec![51.0],
+            vec![64.0],
+            vec![f32::NAN],
+        ];
+
+        integrate_probability_if_nan_smooth(&mut high, &low, 1);
+
+        assert_eq!(
+            &high[..7],
+            &[
+                vec![0.0],
+                vec![27.0],
+                vec![31.0],
+                vec![43.0],
+                vec![49.0],
+                vec![49.0],
+                vec![64.0],
+            ]
+        );
+        assert!(high[7][0].is_nan());
+    }
+
+    #[test]
     fn dew_point_preserves_open_meteo_float_order_at_vpd_rounding_boundary() {
         // Frozen ECMWF p0146 at 2026-07-28T11:00Z. The model value is
         // elevation-corrected from 336 m to the requested DEM elevation of
@@ -9086,16 +9529,7 @@ mod tests {
 
     #[test]
     fn et0_propagates_a_missing_shortwave_tail_frame() {
-        assert!(et0_evapotranspiration(
-            -0.4,
-            0.71,
-            -0.8,
-            f32::NAN,
-            4_884.0,
-            0.0,
-            3600,
-        )
-        .is_nan());
+        assert!(et0_evapotranspiration(-0.4, 0.71, -0.8, f32::NAN, 4_884.0, 0.0, 3600,).is_nan());
     }
 
     #[test]
@@ -9159,8 +9593,7 @@ mod tests {
             4.909175, 5.5443664, 5.323533, 4.785394, 4.8270073, 5.830952, 6.207254, 6.1,
         ];
         let direction = [
-            183.50346, 187.2531, 174.61078, 190.84026, 193.17256, 185.90605, 182.77016,
-            180.0,
+            183.50346, 187.2531, 174.61078, 190.84026, 193.17256, 185.90605, 182.77016, 180.0,
         ];
         assert_eq!(
             json_value_for_variable(
@@ -9432,7 +9865,10 @@ mod tests {
                 model_elevation: 0.0,
                 target_elevation: 0.0,
             }),
+            gefs025: None,
+            gefs05: None,
             ecmwf025: None,
+            ecmwf025_ensemble: None,
             response_elevation: 0.0,
         };
         let selected_latitude = with_request_sampling(sampling, || {
@@ -9553,12 +9989,7 @@ mod tests {
     #[test]
     fn ecmwf_gust_first_stage_leaves_boundary_gaps_for_older_complete_run() {
         let mut values = vec![6.3, f32::NAN, 6.6, f32::NAN, 6.9, f32::NAN, 9.6];
-        interpolate_ecmwf_hermite_in_place(
-            &mut values,
-            Some((0.0, 10e9)),
-            true,
-            false,
-        );
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 10e9)), true, false);
 
         assert!(values[1].is_nan());
         assert!((values[3] - 6.6).abs() < 1e-6);
@@ -9567,21 +9998,8 @@ mod tests {
 
     #[test]
     fn ecmwf_gust_first_stage_does_not_bridge_an_unsupported_internal_window() {
-        let mut values = vec![
-            6.3,
-            f32::NAN,
-            f32::NAN,
-            f32::NAN,
-            7.1,
-            f32::NAN,
-            6.8,
-        ];
-        interpolate_ecmwf_hermite_in_place(
-            &mut values,
-            Some((0.0, 10e9)),
-            true,
-            false,
-        );
+        let mut values = vec![6.3, f32::NAN, f32::NAN, f32::NAN, 7.1, f32::NAN, 6.8];
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 10e9)), true, false);
 
         assert!(values[1..4].iter().all(|value| value.is_nan()));
         assert!(values[5].is_nan());
@@ -9595,15 +10013,7 @@ mod tests {
             bounds: Some((0.0, 10e9)),
         };
         let mut values = vec![3.1, f32::NAN, 3.5, f32::NAN, 2.1];
-        ecmwf_first_stage_point(
-            &mut values,
-            kind,
-            start,
-            0.0,
-            70.0,
-            true,
-            true,
-        );
+        ecmwf_first_stage_point(&mut values, kind, start, 0.0, 70.0, true, true);
 
         assert!(values[1].is_nan());
         assert_eq!(values[3], 2.8);
@@ -10727,16 +11137,12 @@ fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
     let u = speed
         .iter()
         .zip(direction)
-        .map(|(&speed, &direction)| {
-            -1.0 * speed * (direction * SWIFT_FLOAT_PI / 180.0).sin()
-        })
+        .map(|(&speed, &direction)| -speed * (direction * SWIFT_FLOAT_PI / 180.0).sin())
         .sum::<f32>();
     let v = speed
         .iter()
         .zip(direction)
-        .map(|(&speed, &direction)| {
-            -1.0 * speed * (direction * SWIFT_FLOAT_PI / 180.0).cos()
-        })
+        .map(|(&speed, &direction)| -speed * (direction * SWIFT_FLOAT_PI / 180.0).cos())
         .sum::<f32>();
     // The temporal API and spatial OM archive can differ by a final component
     // quantization ULP. Canonicalize only a numerically indistinguishable
@@ -10962,7 +11368,11 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "cloud_cover_mid"
         | "cloudcover_mid"
         | "cloud_cover_high"
-        | "cloudcover_high" => "%",
+        | "cloudcover_high"
+        | "precipitation_probability"
+        | "precipitation_probability_max"
+        | "precipitation_probability_mean"
+        | "precipitation_probability_min" => "%",
         "precipitation"
         | "showers"
         | "rain"
@@ -11181,18 +11591,13 @@ mod output_tests {
     #[test]
     fn growing_degree_days_use_official_two_decimal_precision() {
         assert_eq!(
-            json_array_for_variable(
-                "growing_degree_days_base_0_limit_50",
-                vec![1.1375],
-            ),
+            json_array_for_variable("growing_degree_days_base_0_limit_50", vec![1.1375],),
             serde_json::json!([1.14]),
         );
         assert_eq!(
             json_array_for_daily_variable(
                 "growing_degree_days_base_0_limit_50",
-                DailyWeatherAggregation::Sum(
-                    "growing_degree_days_base_0_limit_50",
-                ),
+                DailyWeatherAggregation::Sum("growing_degree_days_base_0_limit_50",),
                 vec![17.006],
             ),
             serde_json::json!([17.01]),
@@ -11320,15 +11725,7 @@ mod output_tests {
         };
         let raw = vec![0.93, 0.22, 2.17, f32::NAN, -1.64, f32::NAN, -1.01];
         let mut staged = raw.clone();
-        ecmwf_first_stage_point(
-            &mut staged,
-            kind,
-            start,
-            31.25,
-            121.5,
-            false,
-            false,
-        );
+        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5, false, false);
         assert_eq!(staged, vec![0.95, 0.2, 2.15, 0.3, -1.65, -1.55, -1.0]);
 
         let regular_times = (0..staged.len())
@@ -11483,22 +11880,17 @@ mod output_tests {
     #[test]
     fn ecmwf_daily_sum_requires_front_hours_to_be_filled_before_aggregation() {
         let mut day = vec![f32::NAN, f32::NAN, 0.3, 0.6, 0.0, 0.9, 0.0, 1.2];
-        assert!(
-            aggregate_daily_weather_values(
-                DailyWeatherAggregation::Sum("precipitation"),
-                &day,
-                3,
-            )
-            .is_nan()
-        );
-
-        fill_nan_from_fallback(&mut day[..2], &[0.0, 0.3]);
-
-        let total = aggregate_daily_weather_values(
+        assert!(aggregate_daily_weather_values(
             DailyWeatherAggregation::Sum("precipitation"),
             &day,
             3,
-        );
+        )
+        .is_nan());
+
+        fill_nan_from_fallback(&mut day[..2], &[0.0, 0.3]);
+
+        let total =
+            aggregate_daily_weather_values(DailyWeatherAggregation::Sum("precipitation"), &day, 3);
         assert!((total - 3.3).abs() < 1e-6);
     }
 
@@ -11609,6 +12001,10 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "cloudcover_mid"
         | "cloud_cover_high"
         | "cloudcover_high"
+        | "precipitation_probability"
+        | "precipitation_probability_max"
+        | "precipitation_probability_mean"
+        | "precipitation_probability_min"
         | "wind_direction_10m"
         | "winddirection_10m"
         | "wind_direction_80m"

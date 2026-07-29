@@ -9,6 +9,10 @@ from om_downloader import cli as cli_module
 from om_downloader import mirror_sync
 from om_downloader.static_assets import (
     ECMWF_IFS025_HSURF,
+    ECMWF_IFS025_ENSEMBLE_HSURF,
+    NCEP_GEFS025_HSURF,
+    NCEP_GEFS05_HSURF,
+    OPENMETEO_STATIC_ASSETS,
     StaticAssetSpec,
     ensure_static_asset,
     static_asset_manifest_record,
@@ -28,9 +32,65 @@ def _fixture_spec(payload: bytes) -> StaticAssetSpec:
 
 
 class StaticAssetTests(unittest.TestCase):
+    def test_probability_product_group_membership_is_consistent(self):
+        expected = {
+            "gfs": (
+                "gfs013_surface",
+                "gfs025",
+                "gfs_pressure_profile",
+                "ncep_gefs025",
+                "ncep_gefs05",
+            ),
+            "ecmwf": ("ecmwf_ifs025", "ecmwf_ifs025_ensemble"),
+        }
+
+        for group, products in expected.items():
+            with self.subTest(group=group):
+                self.assertEqual(cli_module.OPENMETEO_GROUP_PRODUCTS[group], products)
+                self.assertEqual(mirror_sync.OPENMETEO_GROUP_PRODUCTS[group], products)
+                self.assertEqual(mirror_sync.MINIMUM_GROUP_PRODUCTS[group], products)
+
+    def test_probability_static_asset_specs_are_pinned(self):
+        expected = {
+            "ncep_gefs025": (
+                NCEP_GEFS025_HSURF,
+                408_440,
+                "09f589bd34aad27f538a5c0cb01c5dbd4114acc27d6b6f24524fd9451ce56f62",
+            ),
+            "ncep_gefs05": (
+                NCEP_GEFS05_HSURF,
+                118_088,
+                "aeb5313b8f402b9098a268b476b480ed065593eb718c358ad01fada0f0f6ddcb",
+            ),
+            "ecmwf_ifs025_ensemble": (
+                ECMWF_IFS025_ENSEMBLE_HSURF,
+                433_744,
+                "c137997ccae161da2f79bd4ae3e00e03aa0a94cf351d5fd69b88a03191c1e2be",
+            ),
+        }
+
+        for model, (spec, expected_bytes, expected_sha256) in expected.items():
+            with self.subTest(model=model):
+                self.assertIs(OPENMETEO_STATIC_ASSETS[model], spec)
+                self.assertEqual(spec.model, model)
+                self.assertEqual(
+                    spec.relative_path,
+                    PurePosixPath(f"static/{model}/HSURF.om"),
+                )
+                self.assertEqual(
+                    spec.bucket_key,
+                    PurePosixPath(f"data/{model}/static/HSURF.om"),
+                )
+                self.assertEqual(spec.bytes, expected_bytes)
+                self.assertEqual(spec.sha256, expected_sha256)
+
     def test_ecmwf_group_manifest_records_static_asset_identity(self):
-        record = static_asset_manifest_record(
+        deterministic_record = static_asset_manifest_record(
             ECMWF_IFS025_HSURF,
+            bucket_url="https://openmeteo.s3.amazonaws.com",
+        )
+        ensemble_record = static_asset_manifest_record(
+            ECMWF_IFS025_ENSEMBLE_HSURF,
             bucket_url="https://openmeteo.s3.amazonaws.com",
         )
         product_manifest = {
@@ -51,15 +111,39 @@ class StaticAssetTests(unittest.TestCase):
             group = cli_module._write_group_manifest(
                 root,
                 "ecmwf",
-                {"ecmwf_ifs025": product_manifest},
-                {"ecmwf_ifs025": record},
+                {
+                    "ecmwf_ifs025": product_manifest,
+                    "ecmwf_ifs025_ensemble": {
+                        **product_manifest,
+                        "coverage_id": "ecmwf_ifs025_ensemble_2026071818_85h",
+                        "valid_time_count": 85,
+                        "files": [
+                            {
+                                "path": (
+                                    "coverages/example/"
+                                    "ecmwf_ifs025_ensemble.omranges"
+                                )
+                            }
+                        ],
+                    },
+                },
+                {
+                    "ecmwf_ifs025": deterministic_record,
+                    "ecmwf_ifs025_ensemble": ensemble_record,
+                },
             )
             release_id = mirror_sync.group_release_id(group)
 
             self.assertEqual(group["status"], "complete")
-            self.assertEqual(group["static_assets"], {"ecmwf_ifs025": record})
-            self.assertEqual(group["static_asset_files"], 1)
-            self.assertEqual(group["static_asset_bytes"], 433_648)
+            self.assertEqual(
+                group["static_assets"],
+                {
+                    "ecmwf_ifs025": deterministic_record,
+                    "ecmwf_ifs025_ensemble": ensemble_record,
+                },
+            )
+            self.assertEqual(group["static_asset_files"], 2)
+            self.assertEqual(group["static_asset_bytes"], 433_648 + 433_744)
             self.assertTrue(
                 (
                     root
@@ -153,7 +237,11 @@ class StaticAssetTests(unittest.TestCase):
                 "ecmwf_ifs025": {
                     "status": "complete",
                     "latest_complete_run": "2026071818",
-                }
+                },
+                "ecmwf_ifs025_ensemble": {
+                    "status": "complete",
+                    "latest_complete_run": "2026071812",
+                },
             },
             "static_assets": {"ecmwf_ifs025": record},
         }
@@ -164,6 +252,7 @@ class StaticAssetTests(unittest.TestCase):
             with patch.dict(
                 mirror_sync.OPENMETEO_STATIC_ASSETS,
                 {"ecmwf_ifs025": spec},
+                clear=True,
             ):
                 self.assertTrue(mirror_sync._group_manifest_is_complete(group_manifest, "ecmwf"))
                 stages = mirror_sync._prepare_static_asset_stages(
@@ -197,6 +286,7 @@ class StaticAssetTests(unittest.TestCase):
             with patch.dict(
                 cli_module.OPENMETEO_STATIC_ASSETS,
                 {"ecmwf_ifs025": spec},
+                clear=True,
             ):
                 records, results = cli_module._prepare_group_static_assets(
                     "ecmwf",

@@ -158,7 +158,7 @@ python scripts/validation/ecmwf_official_compare.py `
   --output D:\ecmwf-evidence\2026072300\freeze.json
 ~~~
 
-Linux 服务器使用相同参数与数据盘绝对路径。catalog 的 available_hourly_variables 必须逐项等于 197 项，available_daily_variables 必须逐项等于 65 项，available_variables 必须等于二者去重后的 257 项并集；raw inventory 应另放 available_raw_variables。freeze 会记录两个 manifest 的 SHA-256、run identity 和三组精确 API inventory。在每个本地点请求之前和之后都会重新校验；任何变化都是硬失败。
+Linux 服务器使用相同参数与数据盘绝对路径。catalog 的 available_hourly_variables 必须逐项等于 198 项，available_daily_variables 必须逐项等于 68 项，available_variables 必须等于二者去重后的 261 项并集；其中降水概率来自配套的 `ecmwf_ifs025_ensemble` 产品。raw inventory 应另放 available_raw_variables。freeze 会记录两个 manifest 的 SHA-256、run identity 和三组精确 API inventory。在每个本地点请求之前和之后都会重新校验；任何变化都是硬失败。
 
 ## 官方快照取证
 
@@ -166,6 +166,9 @@ Linux 服务器使用相同参数与数据盘绝对路径。catalog 的 availabl
 
 - 时序：https://openmeteo.s3.amazonaws.com/data/ecmwf_ifs025/static/meta.json
 - 空间：https://openmeteo.s3.amazonaws.com/data_spatial/ecmwf_ifs025/latest.json
+
+本地 catalog 还会冻结 `ecmwf_ifs025_ensemble` 的独立 coverage 与 run，
+用于证明降水概率查询绑定到哪一个集合批次。
 
 时序探针必须满足 last_run_initialisation_time == TARGET_00Z 且覆盖 +360h。空间探针必须满足 completed=true、reference_time == TARGET_00Z 且 valid_times 包含 +360h。前后 identity 必须完全相同。
 

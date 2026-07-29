@@ -472,11 +472,11 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
     def test_canonical_production_contract_and_land_dem_sampling(self) -> None:
         config_path = VALIDATION_ROOT / "ecmwf_validation_config.json"
         config = compare.load_config(config_path)
-        self.assertEqual(len(catalog.SURFACE_HOURLY_VARIABLES), 57)
+        self.assertEqual(len(catalog.SURFACE_HOURLY_VARIABLES), 58)
         self.assertEqual(len(catalog.PRESSURE_HOURLY_VARIABLES), 140)
-        self.assertEqual(len(catalog.HOURLY_VARIABLES), 197)
-        self.assertEqual(len(catalog.DAILY_VARIABLES), 65)
-        self.assertEqual(len(catalog.AVAILABLE_VARIABLES), 257)
+        self.assertEqual(len(catalog.HOURLY_VARIABLES), 198)
+        self.assertEqual(len(catalog.DAILY_VARIABLES), 68)
+        self.assertEqual(len(catalog.AVAILABLE_VARIABLES), 261)
         self.assertEqual(
             catalog.OPEN_METEO_UPSTREAM_BASELINE,
             "acfe608b825da1a8b42a755297eb61121986e9da",
@@ -487,23 +487,22 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
         )
         self.assertEqual(
             catalog.HOURLY_CATALOG_SHA256,
-            "a518f8c0ddfb5e11ac5661da7d6c5d588bbb56f33e5267378631947e3a52669c",
+            "71cfa7319f4026aa85a35ff6a0cc3a323ea094286117646b2ca99b9f16399531",
         )
         self.assertEqual(
             catalog.DAILY_CATALOG_SHA256,
-            "87a46a349a767c1e015bf76ab506546865b483365f7e04c543c730d67cd65f33",
+            "44c4398fd2c356663b62e09fe86f2e5b1481b1ae1a19873d025e26732fc1753f",
         )
         self.assertEqual(
             catalog.AVAILABLE_CATALOG_SHA256,
-            "3789f8994822fc3e5820a71de8dab3e805fa13cd7bad1634e6a12c17d197bbe2",
+            "ea2916567e3c33a4b3df96f21b9f342fed70cab50ca200fcaac4cac8cf133be3",
         )
         self.assertEqual(config["variables"]["hourly"], list(catalog.HOURLY_VARIABLES))
         self.assertEqual(config["variables"]["daily"], list(catalog.DAILY_VARIABLES))
         all_variables = (*catalog.HOURLY_VARIABLES, *catalog.DAILY_VARIABLES)
         self.assertFalse(any("showers" in variable for variable in all_variables))
-        self.assertFalse(
-            any("precipitation_probability" in variable for variable in all_variables)
-        )
+        self.assertIn("precipitation_probability", catalog.HOURLY_VARIABLES)
+        self.assertIn("precipitation_probability_max", catalog.DAILY_VARIABLES)
         self.assertFalse(
             set(catalog.OCEAN_HOURLY_VARIABLES).intersection(
                 catalog.HOURLY_VARIABLES

@@ -32,8 +32,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime};
 
-pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v6-external-static";
-pub const GFS_PRODUCTS: [&str; 3] = ["gfs013_surface", "gfs025", "gfs_pressure_profile"];
+pub const GFS_MATERIALIZATION_REVISION: &str = "official-hourly-quantized-v7-probability-sidecar";
+pub const GFS_MATERIALIZED_PRODUCTS: [&str; 3] =
+    ["gfs013_surface", "gfs025", "gfs_pressure_profile"];
+pub const GFS_SOURCE_RELEASE_PRODUCTS: [&str; 5] = [
+    "gfs013_surface",
+    "gfs025",
+    "gfs_pressure_profile",
+    "ncep_gefs025",
+    "ncep_gefs05",
+];
 const GFS013_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs013/HSURF.om";
 const GFS013_HSURF_BYTES: u64 = 1_455_544;
 const GFS013_HSURF_SHA256: &str =
@@ -768,7 +776,7 @@ fn load_group_release_candidates(data_root: &Path) -> Result<Vec<(Value, LegacyG
 }
 
 fn release_coverage_ids(release: &LegacyGroupRelease) -> Result<BTreeMap<String, String>> {
-    GFS_PRODUCTS
+    GFS_SOURCE_RELEASE_PRODUCTS
         .iter()
         .map(|product| {
             let ready = release.product_manifests.get(*product).with_context(|| {
@@ -851,7 +859,7 @@ fn load_legacy_sources(
         }
         let mut products = HashMap::new();
         let coverage_ids = release_coverage_ids(release)?;
-        for product in GFS_PRODUCTS {
+        for product in GFS_MATERIALIZED_PRODUCTS {
             let ready = release
                 .product_manifests
                 .get(product)
@@ -2119,7 +2127,9 @@ fn validate_build_identity(coverage_root: &Path, marker: &GfsCoverageMarker) -> 
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
-            != GFS_PRODUCTS.into_iter().collect::<BTreeSet<_>>()
+            != GFS_SOURCE_RELEASE_PRODUCTS
+                .into_iter()
+                .collect::<BTreeSet<_>>()
         {
             bail!("native source coverage inventory is invalid for {run}");
         }
@@ -3079,7 +3089,7 @@ mod tests {
     #[test]
     fn retained_release_supersedes_same_run_current_identity_during_deferred_activation() {
         fn marker(run: &str, release_id: &str, suffix: &str) -> Value {
-            let products = GFS_PRODUCTS
+            let products = GFS_SOURCE_RELEASE_PRODUCTS
                 .iter()
                 .map(|product| {
                     (
@@ -3155,6 +3165,20 @@ mod tests {
 
     #[test]
     fn required_inventory_matches_production_contract() {
+        assert_eq!(
+            GFS_MATERIALIZED_PRODUCTS,
+            ["gfs013_surface", "gfs025", "gfs_pressure_profile"]
+        );
+        assert_eq!(
+            GFS_SOURCE_RELEASE_PRODUCTS,
+            [
+                "gfs013_surface",
+                "gfs025",
+                "gfs_pressure_profile",
+                "ncep_gefs025",
+                "ncep_gefs05",
+            ]
+        );
         assert_eq!(required_variables("ncep_gfs013").unwrap().len(), 29);
         assert_eq!(required_variables("ncep_gfs025").unwrap().len(), 168);
         assert!(required_variables("ncep_gfs025")
@@ -3216,7 +3240,7 @@ mod tests {
         let revision = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             default_gfs_coverage_id("2026072018", revision).unwrap(),
-            "gfs_native_2026072018_official-hourly-quantized-v6-external-static_0123456789ab"
+            "gfs_native_2026072018_official-hourly-quantized-v7-probability-sidecar_0123456789ab"
         );
         assert!(default_gfs_coverage_id("2026072021", revision).is_err());
         assert!(default_gfs_coverage_id("2026072018", "not-a-sha").is_err());

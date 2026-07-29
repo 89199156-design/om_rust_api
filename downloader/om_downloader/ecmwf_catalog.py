@@ -5,7 +5,8 @@ SURFACE_HOURLY_VARIABLES = (
     "relative_humidity_2m", "dew_point_2m", "apparent_temperature",
     "wet_bulb_temperature_2m", "pressure_msl", "surface_pressure",
     "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high",
-    "precipitation", "rain", "snowfall", "snowfall_water_equivalent",
+    "precipitation", "precipitation_probability", "rain", "snowfall",
+    "snowfall_water_equivalent",
     "precipitation_type", "runoff", "snow_depth", "snow_depth_water_equivalent",
     "cape", "shortwave_radiation", "shortwave_radiation_instant",
     "direct_radiation", "direct_radiation_instant", "diffuse_radiation",
@@ -43,7 +44,9 @@ DAILY_VARIABLES = (
     "cloud_cover_max", "cloud_cover_mean", "cloud_cover_min",
     "dew_point_2m_max", "dew_point_2m_mean", "dew_point_2m_min",
     "et0_fao_evapotranspiration_sum", "growing_degree_days_base_0_limit_50",
-    "precipitation_hours", "precipitation_sum", "pressure_msl_max",
+    "precipitation_hours", "precipitation_probability_max",
+    "precipitation_probability_mean", "precipitation_probability_min",
+    "precipitation_sum", "pressure_msl_max",
     "pressure_msl_mean", "pressure_msl_min", "rain_sum",
     "relative_humidity_2m_max", "relative_humidity_2m_mean",
     "relative_humidity_2m_min", "shortwave_radiation_sum", "snowfall_sum",
@@ -65,7 +68,7 @@ DAILY_VARIABLES = (
     "wind_speed_100m_max", "wind_speed_100m_mean", "wind_speed_100m_min",
 )
 
-assert len(SURFACE_HOURLY_VARIABLES) == 57
+assert len(SURFACE_HOURLY_VARIABLES) == 58
 assert len(PRESSURE_HOURLY_VARIABLES) == 140
-assert len(HOURLY_VARIABLES) == 197
-assert len(DAILY_VARIABLES) == 65
+assert len(HOURLY_VARIABLES) == 198
+assert len(DAILY_VARIABLES) == 68
