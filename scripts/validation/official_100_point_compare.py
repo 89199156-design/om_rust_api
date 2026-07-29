@@ -324,6 +324,67 @@ def write_json(path: Path, value: Any, *, immutable: bool = False) -> None:
         temporary.replace(path)
 
 
+def validation_manifest(models: list[str]) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "type": "official_100_point_validation_manifest",
+        "models": models,
+        "point_count_per_model": POINT_COUNT,
+        "random_seed": 20260729,
+        "sampling_cohorts": {
+            "random_exact_common_native_grid": 35,
+            "random_offgrid_near_native_grid": 35,
+            "random_offgrid_uniform_crop": 30,
+        },
+        "cell_selection": "nearest",
+        "points": sample_points(),
+        "official_capture_policy": "one_multi_location_post_per_model_then_immutable_reuse",
+        "first_difference_stops": True,
+        "gfs_precipitation_probability_daily": [
+            "precipitation_probability_max",
+            "precipitation_probability_min",
+            "precipitation_probability_mean",
+        ],
+        "ec_precipitation_probability_daily": [
+            "precipitation_probability_max",
+            "precipitation_probability_min",
+            "precipitation_probability_mean",
+        ],
+        "comparison_scope": "official/local field intersection only",
+        "excluded_local_only_outputs": [
+            "Chinese AQI / aqi_cn",
+            "CAMS daily aggregations",
+            "model pressure levels or derived outputs absent from the official response",
+        ],
+    }
+
+
+def ensure_validation_manifest(path: Path, requested_models: list[str]) -> None:
+    if not path.exists():
+        write_once(path, pretty_bytes(validation_manifest(requested_models)))
+        return
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValidationError(f"invalid immutable manifest: {path}") from exc
+    existing_models = existing.get("models")
+    if (
+        not isinstance(existing_models, list)
+        or not existing_models
+        or any(
+            not isinstance(model, str) or model not in MODEL_SPECS
+            for model in existing_models
+        )
+    ):
+        raise ValidationError(f"invalid model list in immutable manifest: {path}")
+    missing = set(requested_models) - set(existing_models)
+    if missing:
+        raise ValidationError(
+            f"requested models absent from immutable manifest: {sorted(missing)}"
+        )
+    write_once(path, pretty_bytes(validation_manifest(existing_models)))
+
+
 def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
     randomizer = random.Random(seed)
     common_grid = [
@@ -952,39 +1013,7 @@ def main() -> int:
         raise ValidationError(f"unknown models: {sorted(invalid)}")
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
-    manifest = {
-        "schema_version": SCHEMA_VERSION,
-        "type": "official_100_point_validation_manifest",
-        "models": models,
-        "point_count_per_model": POINT_COUNT,
-        "random_seed": 20260729,
-        "sampling_cohorts": {
-            "random_exact_common_native_grid": 35,
-            "random_offgrid_near_native_grid": 35,
-            "random_offgrid_uniform_crop": 30,
-        },
-        "cell_selection": "nearest",
-        "points": sample_points(),
-        "official_capture_policy": "one_multi_location_post_per_model_then_immutable_reuse",
-        "first_difference_stops": True,
-        "gfs_precipitation_probability_daily": [
-            "precipitation_probability_max",
-            "precipitation_probability_min",
-            "precipitation_probability_mean",
-        ],
-        "ec_precipitation_probability_daily": [
-            "precipitation_probability_max",
-            "precipitation_probability_min",
-            "precipitation_probability_mean",
-        ],
-        "comparison_scope": "official/local field intersection only",
-        "excluded_local_only_outputs": [
-            "Chinese AQI / aqi_cn",
-            "CAMS daily aggregations",
-            "model pressure levels or derived outputs absent from the official response",
-        ],
-    }
-    write_once(manifest_path, pretty_bytes(manifest))
+    ensure_validation_manifest(manifest_path, models)
     if args.command in {"capture", "run"}:
         api_key = os.environ.get(args.api_key_env, "").strip() or None
         for model in models:

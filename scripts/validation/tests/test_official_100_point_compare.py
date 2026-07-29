@@ -63,6 +63,33 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertIn("precipitation_probability", payload["hourly"])
         self.assertIn("precipitation_probability_max", payload["daily"])
 
+    def test_existing_full_manifest_allows_model_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "manifest.json"
+            compare.ensure_validation_manifest(path, ["gfs", "ec", "cams"])
+            original = path.read_bytes()
+            compare.ensure_validation_manifest(path, ["gfs"])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_existing_manifest_rejects_unplanned_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "manifest.json"
+            compare.ensure_validation_manifest(path, ["gfs"])
+            with self.assertRaisesRegex(
+                compare.ValidationError, "requested models absent"
+            ):
+                compare.ensure_validation_manifest(path, ["ec"])
+
+    def test_existing_manifest_still_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "manifest.json"
+            compare.ensure_validation_manifest(path, ["gfs", "ec", "cams"])
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest["points"][0]["latitude"] += 0.25
+            path.write_bytes(compare.pretty_bytes(manifest))
+            with self.assertRaisesRegex(compare.ValidationError, "immutable artifact"):
+                compare.ensure_validation_manifest(path, ["gfs"])
+
     def test_capture_sends_apikey_in_post_body_without_persisting_it(self) -> None:
         captured: dict[str, object] = {}
         response = json.dumps([{} for _ in range(100)]).encode()
