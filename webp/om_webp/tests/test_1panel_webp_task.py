@@ -28,6 +28,11 @@ class WebpTaskGateTests(unittest.TestCase):
         self.assertIn('export OM_MODEL_STATIC_ROOT="$model_static_root"', content)
         self.assertIn("default_workers=1", content)
         self.assertIn('workers="${OM_WEBP_WORKERS:-$default_workers}"', content)
+        self.assertIn(
+            'minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"',
+            content,
+        )
+        self.assertIn('ulimit -Sn "$minimum_open_files"', content)
 
     def test_standalone_tasks_are_disabled_and_do_not_render(self):
         for name, scope in (
