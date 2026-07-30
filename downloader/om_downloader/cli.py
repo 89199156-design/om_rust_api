@@ -491,13 +491,16 @@ def _with_interpolation_support_records(
     *,
     bucket_url: str,
 ) -> list[dict[str, Any]]:
-    """Retain old-run right lookahead needed across a stitched ECMWF boundary.
+    """Retain per-run context needed across a stitched ECMWF boundary.
 
     Open-Meteo first expands each individual IFS run from its native mixed
     3/6-hour cadence onto a regular 3-hour axis, and only then overlays newer
-    runs.  The public coverage therefore needs a small hidden window from the
-    older run; interpolating directly across the selected-run boundary changes
-    Hermite and solar values.
+    runs. The public coverage therefore needs a small hidden window on both
+    sides of every selected source-run span. In particular, an older long run
+    that supplies the far tail needs left lookbehind before its first public
+    frame; without it, the regularized boundary contains NaNs and changes
+    Hermite values. Right lookahead remains necessary when a newer run takes
+    over before an older source run ends.
     """
     records = []
     for record in object_records:
@@ -510,23 +513,34 @@ def _with_interpolation_support_records(
         return records
 
     runs_by_id = {run.run_id: run for run in runs}
-    last_selected: dict[str, datetime] = {}
+    selected_bounds: dict[str, tuple[datetime, datetime]] = {}
     for slot in plan.slots:
         valid_time = _as_utc(slot.valid_time_utc)
-        last_selected[slot.source_run] = max(
-            valid_time,
-            last_selected.get(slot.source_run, valid_time),
+        first_selected, last_selected = selected_bounds.get(
+            slot.source_run,
+            (valid_time, valid_time),
+        )
+        selected_bounds[slot.source_run] = (
+            min(valid_time, first_selected),
+            max(valid_time, last_selected),
         )
     existing = {
         (str(record["source_run"]), _parse_utc(str(record["valid_time_utc"])))
         for record in records
     }
     support: list[dict[str, Any]] = []
-    for run_id, last_valid_time in last_selected.items():
+    for run_id, (first_valid_time, last_valid_time) in selected_bounds.items():
         run = runs_by_id[run_id]
-        support_end = last_valid_time + timedelta(hours=product.interpolation_support_hours)
+        support_start = first_valid_time - timedelta(
+            hours=product.interpolation_support_hours
+        )
+        support_end = last_valid_time + timedelta(
+            hours=product.interpolation_support_hours
+        )
         for valid_time in sorted(_as_utc(value) for value in run.valid_times_utc):
-            if not (last_valid_time < valid_time <= support_end):
+            in_left_context = support_start <= valid_time < first_valid_time
+            in_right_context = last_valid_time < valid_time <= support_end
+            if not (in_left_context or in_right_context):
                 continue
             if (run_id, valid_time) in existing:
                 continue

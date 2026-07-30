@@ -77,6 +77,7 @@ def _ensemble_product() -> ProductConfig:
         bounds_padding_degrees=2.0,
         required_variables=("precipitation_probability",),
         optional_variables=(),
+        interpolation_support_hours=12,
         requested_pressure_levels_hpa=(),
         coverage_strategy="latest_with_long_run_tail",
     )
@@ -247,7 +248,10 @@ class EcmwfDownloaderTests(unittest.TestCase):
             self.assertNotIn(unavailable, product.required_variables)
             self.assertNotIn(unavailable, product.optional_variables)
 
-    def test_interpolation_support_extends_old_run_to_the_right_of_each_boundary(self):
+        ensemble = config.products["ecmwf_ifs025_ensemble"]
+        self.assertEqual(ensemble.interpolation_support_hours, 12)
+
+    def test_interpolation_support_extends_each_run_on_both_sides(self):
         prior12_base = datetime(2026, 7, 22, 12, tzinfo=UTC)
         prior18_base = datetime(2026, 7, 22, 18, tzinfo=UTC)
         target00_base = datetime(2026, 7, 23, 0, tzinfo=UTC)
@@ -322,6 +326,74 @@ class EcmwfDownloaderTests(unittest.TestCase):
         self.assertIn(("2026072218", "2026-07-23T00:00:00Z"), support)
         self.assertIn(("2026072218", "2026-07-23T03:00:00Z"), support)
         self.assertNotIn(("2026072212", "2026-07-22T09:00:00Z"), support)
+
+    def test_ensemble_tail_keeps_old_long_run_left_context(self):
+        long_base = datetime(2026, 7, 28, 12, tzinfo=UTC)
+        short_base = datetime(2026, 7, 28, 18, tzinfo=UTC)
+        runs = [
+            OmRun(
+                "2026072812",
+                long_base,
+                360,
+                ("precipitation_probability",),
+                (),
+                valid_times_utc=_valid_times(long_base, short=False),
+            ),
+            OmRun(
+                "2026072818",
+                short_base,
+                144,
+                ("precipitation_probability",),
+                (),
+                valid_times_utc=_valid_times(short_base, short=True),
+            ),
+        ]
+        short_end = short_base + timedelta(hours=144)
+        long_tail_start = long_base + timedelta(hours=156)
+        selected = [
+            ("2026072818", short_end - timedelta(hours=3)),
+            ("2026072818", short_end),
+            ("2026072812", long_tail_start),
+            ("2026072812", long_tail_start + timedelta(hours=6)),
+        ]
+        plan = SimpleNamespace(
+            slots=[
+                SimpleNamespace(source_run=run_id, valid_time_utc=valid_time)
+                for run_id, valid_time in selected
+            ]
+        )
+        records = [
+            {
+                "valid_time_utc": valid_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source_run": run_id,
+                "forecast_hour": int(
+                    (
+                        valid_time
+                        - next(run.base_time_utc for run in runs if run.run_id == run_id)
+                    ).total_seconds()
+                    // 3600
+                ),
+                "url": f"https://example.test/{run_id}/{valid_time:%H}",
+            }
+            for run_id, valid_time in selected
+        ]
+
+        enriched = cli_module._with_interpolation_support_records(
+            _ensemble_product(),
+            plan,
+            runs,
+            records,
+            bucket_url="https://openmeteo.s3.amazonaws.com",
+        )
+        support = {
+            (entry["source_run"], entry["valid_time_utc"])
+            for entry in enriched
+            if entry["interpolation_support"]
+        }
+
+        self.assertIn(("2026072812", "2026-08-03T12:00:00Z"), support)
+        self.assertIn(("2026072812", "2026-08-03T18:00:00Z"), support)
+        self.assertNotIn(("2026072812", "2026-08-03T06:00:00Z"), support)
 
     def test_ecmwf_group_command_dispatches_frozen_reference_to_regular_release(self):
         with patch.object(

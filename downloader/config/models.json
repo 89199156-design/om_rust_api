@@ -245,6 +245,7 @@
       "required_variables": [
         "precipitation_probability"
       ],
+      "interpolation_support_hours": 12,
       "optional_variables": [],
       "requested_pressure_levels_hpa": []
     },
