@@ -145,6 +145,62 @@ def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _parse_product_reference_time(value: str) -> tuple[str, datetime]:
+    try:
+        product_name, timestamp = value.split("=", 1)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "product reference time must use PRODUCT=ISO-8601"
+        ) from exc
+    product_name = product_name.strip()
+    timestamp = timestamp.strip()
+    if not product_name or not timestamp:
+        raise argparse.ArgumentTypeError(
+            "product reference time must use PRODUCT=ISO-8601"
+        )
+    try:
+        reference_time = _as_utc(_parse_utc(timestamp))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid product reference time for {product_name}: {timestamp}"
+        ) from exc
+    return product_name, reference_time
+
+
+def _frozen_group_product_reference_times(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    group_name: str,
+    product_names: tuple[str, ...],
+) -> dict[str, datetime]:
+    entries = list(args.product_reference_time or [])
+    if not entries:
+        return {}
+    if group_name != "ecmwf":
+        parser.error("--product-reference-time is supported only for the ecmwf group")
+    if args.reference_time:
+        parser.error(
+            "--reference-time and --product-reference-time cannot be used together"
+        )
+    references: dict[str, datetime] = {}
+    for product_name, reference_time in entries:
+        if product_name not in product_names:
+            parser.error(
+                f"product reference is not part of {group_name}: {product_name}"
+            )
+        if product_name in references:
+            parser.error(f"duplicate product reference time: {product_name}")
+        references[product_name] = reference_time
+    missing = set(product_names) - set(references)
+    if missing:
+        parser.error(
+            "frozen ECMWF group requires a reference time for every product: "
+            + ", ".join(sorted(missing))
+        )
+    return references
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -1697,6 +1753,12 @@ def _download_openmeteo_group_release(
     group_name = args.download_openmeteo_group
     config = load_models(Path(args.config))
     product_names = OPENMETEO_GROUP_PRODUCTS[group_name]
+    product_reference_times = _frozen_group_product_reference_times(
+        args,
+        parser,
+        group_name=group_name,
+        product_names=product_names,
+    )
     missing_products = [name for name in product_names if name not in config.products]
     if missing_products:
         parser.error(f"group {group_name} missing products in config: {', '.join(missing_products)}")
@@ -1731,7 +1793,12 @@ def _download_openmeteo_group_release(
                     now_utc=now_utc,
                     bucket_url=args.openmeteo_bucket_url,
                     reference_time_utc=(
-                        _parse_utc(args.reference_time) if args.reference_time else None
+                        product_reference_times.get(product.name)
+                        or (
+                            _parse_utc(args.reference_time)
+                            if args.reference_time
+                            else None
+                        )
                     ),
                 )
                 for product in products
@@ -3067,7 +3134,11 @@ def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.Argumen
         )
     if args.download_openmeteo_group == "gfs":
         return _reconcile_gfs_retention_window(args, parser)
-    if args.download_openmeteo_group == "ecmwf" and not args.reference_time:
+    if (
+        args.download_openmeteo_group == "ecmwf"
+        and not args.reference_time
+        and not args.product_reference_time
+    ):
         effective_args = copy(args)
         effective_args.retain_complete_releases = _effective_group_retention(
             "ecmwf",
@@ -3176,9 +3247,24 @@ def main(argv: list[str] | None = None) -> int:
             "(ISO-8601, for example 2026-07-18T18:00:00Z)"
         ),
     )
+    parser.add_argument(
+        "--product-reference-time",
+        action="append",
+        type=_parse_product_reference_time,
+        default=[],
+        metavar="PRODUCT=ISO-8601",
+        help=(
+            "freeze each independently published ECMWF product to an exact "
+            "completed run; repeat once for every product in the group"
+        ),
+    )
     parser.add_argument("--source-url")
     parser.add_argument("--byte-range", action="append", type=_parse_byte_range, default=[])
     args = parser.parse_args(argv)
+    if args.product_reference_time and not args.download_openmeteo_group:
+        parser.error(
+            "--product-reference-time requires --download-openmeteo-group ecmwf"
+        )
 
     mutating_command = any(
         (

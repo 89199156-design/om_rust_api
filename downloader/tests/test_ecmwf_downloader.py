@@ -425,6 +425,61 @@ class EcmwfDownloaderTests(unittest.TestCase):
         self.assertEqual(forwarded.download_openmeteo_group, "ecmwf")
         self.assertEqual(forwarded.reference_time, "2026-07-23T00:00:00Z")
 
+    def test_ecmwf_group_accepts_independent_frozen_product_references(self):
+        deterministic = datetime(2026, 7, 29, 0, tzinfo=UTC)
+        ensemble = datetime(2026, 7, 28, 18, tzinfo=UTC)
+        with patch.object(
+            cli_module,
+            "_download_openmeteo_group_release",
+            return_value=0,
+        ) as release:
+            result = cli_module.main(
+                [
+                    "--download-openmeteo-group",
+                    "ecmwf",
+                    "--config",
+                    "config/models.json",
+                    "--now",
+                    "2026-07-29T09:00:00Z",
+                    "--product-reference-time",
+                    "ecmwf_ifs025=2026-07-29T00:00:00Z",
+                    "--product-reference-time",
+                    "ecmwf_ifs025_ensemble=2026-07-28T18:00:00Z",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        release.assert_called_once()
+        forwarded = release.call_args.args[0]
+        references = cli_module._frozen_group_product_reference_times(
+            forwarded,
+            cli_module.argparse.ArgumentParser(),
+            group_name="ecmwf",
+            product_names=cli_module.OPENMETEO_GROUP_PRODUCTS["ecmwf"],
+        )
+        self.assertEqual(
+            references,
+            {
+                "ecmwf_ifs025": deterministic,
+                "ecmwf_ifs025_ensemble": ensemble,
+            },
+        )
+
+    def test_ecmwf_group_requires_every_frozen_product_reference(self):
+        with self.assertRaises(SystemExit):
+            cli_module.main(
+                [
+                    "--download-openmeteo-group",
+                    "ecmwf",
+                    "--config",
+                    "config/models.json",
+                    "--now",
+                    "2026-07-29T09:00:00Z",
+                    "--product-reference-time",
+                    "ecmwf_ifs025=2026-07-29T00:00:00Z",
+                ]
+            )
+
     def test_ecmwf_production_group_dispatches_gfs_batch_window_reconciliation(self):
         with (
             patch.object(
