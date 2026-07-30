@@ -487,6 +487,104 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iter_json_array_file(
+    path: Path,
+    expected: int,
+    chunk_size: int = 1024 * 1024,
+):
+    """Yield a top-level JSON array one item at a time with bounded memory."""
+    decoder = json.JSONDecoder()
+    buffer = ""
+    position = 0
+    count = 0
+    state = "start"
+
+    with path.open("r", encoding="utf-8") as handle:
+        eof = False
+        while not eof:
+            chunk = handle.read(chunk_size)
+            eof = chunk == ""
+            buffer = buffer[position:] + chunk
+            position = 0
+
+            while True:
+                while position < len(buffer) and buffer[position].isspace():
+                    position += 1
+                if state == "start":
+                    if position >= len(buffer):
+                        break
+                    if buffer[position] != "[":
+                        raise ValidationError(
+                            f"official snapshot must be a top-level array: {path}"
+                        )
+                    state = "first_or_end"
+                    position += 1
+                    continue
+
+                if position >= len(buffer):
+                    break
+                if state == "first_or_end" and buffer[position] == "]":
+                    state = "done"
+                    position += 1
+                    break
+                if state == "separator_or_end":
+                    if buffer[position] == "]":
+                        state = "done"
+                        position += 1
+                        break
+                    if buffer[position] != ",":
+                        raise ValidationError(
+                            f"invalid official snapshot array separator: {path}"
+                        )
+                    state = "value"
+                    position += 1
+                    continue
+                if state not in {"first_or_end", "value"}:
+                    raise ValidationError(f"invalid official snapshot state: {path}")
+                try:
+                    value, end = decoder.raw_decode(buffer, position)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise ValidationError(
+                            f"invalid or truncated official snapshot: {path}"
+                        )
+                    break
+                if not isinstance(value, dict):
+                    raise ValidationError(
+                        f"official snapshot row {count} is not an object: {path}"
+                    )
+                count += 1
+                position = end
+                state = "separator_or_end"
+                yield value
+
+            if state == "done":
+                if buffer[position:].strip():
+                    raise ValidationError(
+                        f"unexpected content after official snapshot array: {path}"
+                    )
+                if not eof and handle.read().strip():
+                    raise ValidationError(
+                        f"unexpected content after official snapshot array: {path}"
+                    )
+                break
+
+    if state != "done":
+        raise ValidationError(f"invalid or truncated official snapshot: {path}")
+    if count != expected:
+        raise ValidationError(
+            f"response row count/type mismatch: expected={expected}, actual={count}"
+        )
+
+
 def write_once(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -1190,11 +1288,9 @@ def validate_model(
     metadata_path = output / model / "official" / "metadata.json"
     if not official_path.exists() or not metadata_path.exists():
         raise ValidationError(f"official {model} snapshot is missing; run capture first")
-    official_raw = official_path.read_bytes()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if sha256_bytes(official_raw) != metadata["response_sha256"]:
+    if sha256_file(official_path) != metadata["response_sha256"]:
         raise ValidationError(f"official {model} snapshot hash mismatch")
-    official_rows = normalize_rows(json.loads(official_raw), POINT_COUNT)
     plan = request_plan(model, field_chunk_size)
     if not plan:
         raise ValidationError(f"{model} has no local fields to validate")
@@ -1248,7 +1344,14 @@ def validate_model(
     points = sample_points()
     receipts = output / model / "receipts"
     receipts.mkdir(parents=True, exist_ok=True)
-    for point, official in zip(points[:point_limit], official_rows[:point_limit]):
+    official_rows = iter_json_array_file(official_path, POINT_COUNT)
+    for point in points[:point_limit]:
+        try:
+            official = next(official_rows)
+        except StopIteration as exc:
+            raise ValidationError(
+                f"official {model} snapshot ended before {point['id']}"
+            ) from exc
         receipt_path = receipts / f"{point['order']:03d}_{point['id']}.json"
         if receipt_path.exists():
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -1471,6 +1574,12 @@ def validate_model(
         )
         if point_delay_seconds > 0 and report["points_completed"] < point_limit:
             time.sleep(point_delay_seconds)
+    if point_limit == POINT_COUNT:
+        sentinel = object()
+        if next(official_rows, sentinel) is not sentinel:
+            raise ValidationError(
+                f"response row count/type mismatch: expected={POINT_COUNT}, actual>={POINT_COUNT + 1}"
+            )
     report["status"] = "passed" if point_limit == POINT_COUNT else "partial"
     report["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     write_json(report_path, report)

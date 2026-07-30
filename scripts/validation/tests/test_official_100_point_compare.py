@@ -132,6 +132,40 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(report["request_units_total"], 10)
         self.assertIsNotNone(report["estimated_finish_at"])
 
+    def test_official_snapshot_rows_are_streamed_from_top_level_array(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "response.json"
+            path.write_text(
+                '[{"id": 1, "value": "a"}, {"id": 2, "value": "b"}]\n',
+                encoding="utf-8",
+            )
+            rows = list(compare.iter_json_array_file(path, 2, chunk_size=7))
+
+        self.assertEqual(rows, [{"id": 1, "value": "a"}, {"id": 2, "value": "b"}])
+
+    def test_official_snapshot_stream_rejects_wrong_row_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "response.json"
+            path.write_text('[{"id": 1}]', encoding="utf-8")
+            with self.assertRaisesRegex(compare.ValidationError, "expected=2, actual=1"):
+                list(compare.iter_json_array_file(path, 2, chunk_size=3))
+
+    def test_official_snapshot_stream_rejects_missing_separator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "response.json"
+            path.write_text('[{"id": 1} {"id": 2}]', encoding="utf-8")
+            with self.assertRaisesRegex(compare.ValidationError, "array separator"):
+                list(compare.iter_json_array_file(path, 2, chunk_size=4))
+
+    def test_sha256_file_matches_bytes_digest(self) -> None:
+        raw = b"immutable-official-snapshot"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "response.json"
+            path.write_bytes(raw)
+            digest = compare.sha256_file(path, chunk_size=4)
+
+        self.assertEqual(digest, compare.sha256_bytes(raw))
+
     def test_local_url_can_request_one_period_chunk(self) -> None:
         url = compare.local_url(
             "http://127.0.0.1:8088",
