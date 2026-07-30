@@ -31,9 +31,9 @@ models=gfs,ec,cams
 port=18089
 api_binary=/opt/1panel/apps/weather_om_api/source/target/release/om-api
 source_root=/opt/1panel/apps/weather_om_api/source
-field_chunk_size=12
-request_delay_seconds=0.5
-point_delay_seconds=2
+field_chunk_size=96
+request_delay_seconds=0
+point_delay_seconds=0
 timeout_seconds=180
 point_limit=100
 

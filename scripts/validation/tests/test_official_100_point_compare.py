@@ -110,6 +110,28 @@ class Official100PointCompareTests(unittest.TestCase):
             ],
         )
 
+    def test_default_plan_coalesces_each_model_period_without_parallelism(self) -> None:
+        for model in ("gfs", "ec"):
+            plan = compare.request_plan(model, compare.DEFAULT_FIELD_CHUNK_SIZE)
+            self.assertEqual([part["period"] for part in plan], ["hourly", "daily"])
+        cams_plan = compare.request_plan("cams", compare.DEFAULT_FIELD_CHUNK_SIZE)
+        self.assertEqual([part["period"] for part in cams_plan], ["hourly"])
+
+    def test_progress_estimate_reports_live_eta(self) -> None:
+        report: dict[str, object] = {}
+        with mock.patch.object(compare.time, "monotonic", return_value=110.0):
+            compare.update_progress_estimate(
+                report,
+                started_monotonic=100.0,
+                request_units_completed=2,
+                request_units_total=10,
+            )
+        self.assertEqual(report["elapsed_seconds"], 10.0)
+        self.assertEqual(report["estimated_remaining_seconds"], 40.0)
+        self.assertEqual(report["request_units_completed"], 2)
+        self.assertEqual(report["request_units_total"], 10)
+        self.assertIsNotNone(report["estimated_finish_at"])
+
     def test_local_url_can_request_one_period_chunk(self) -> None:
         url = compare.local_url(
             "http://127.0.0.1:8088",
@@ -365,6 +387,11 @@ class Official100PointCompareTests(unittest.TestCase):
             self.assertEqual(sleep.call_count, compare.POINT_COUNT - 1)
             self.assertEqual(report["status"], "passed")
             self.assertEqual(report["points_completed"], compare.POINT_COUNT)
+            self.assertEqual(
+                report["request_units_completed"],
+                report["request_units_total"],
+            )
+            self.assertEqual(report["estimated_remaining_seconds"], 0.0)
             self.assertIsNone(report["current_point"])
             self.assertEqual(report["point_delay_seconds"], 0.25)
             self.assertIn("started_at", report)

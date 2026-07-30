@@ -47,9 +47,13 @@ except ImportError:
 SCHEMA_VERSION = 1
 POINT_COUNT = 100
 USER_AGENT = "om-weather-server-official-100-point-validation/1.0"
-DEFAULT_FIELD_CHUNK_SIZE = 12
-DEFAULT_REQUEST_DELAY_SECONDS = 0.5
-DEFAULT_POINT_DELAY_SECONDS = 2.0
+# A single-point response with every public surface field is small, while each
+# HTTP round trip makes the API repeat model lookup and time-axis work.  Keep
+# hourly and daily requests separate, but normally fit each period into one
+# request.  The resource guard before every request remains the throttle.
+DEFAULT_FIELD_CHUNK_SIZE = 96
+DEFAULT_REQUEST_DELAY_SECONDS = 0.0
+DEFAULT_POINT_DELAY_SECONDS = 0.0
 DEFAULT_MIN_AVAILABLE_MEMORY_MIB = 768.0
 DEFAULT_MAX_IO_FULL_PRESSURE_AVG10 = 10.0
 DEFAULT_RESOURCE_WAIT_TIMEOUT_SECONDS = 900.0
@@ -301,6 +305,29 @@ def request_plan(model: str, field_chunk_size: int) -> list[dict[str, Any]]:
 
 def attempt_id_now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def update_progress_estimate(
+    report: dict[str, Any],
+    *,
+    started_monotonic: float,
+    request_units_completed: int,
+    request_units_total: int,
+) -> None:
+    elapsed = max(0.0, time.monotonic() - started_monotonic)
+    report["elapsed_seconds"] = round(elapsed, 3)
+    report["request_units_completed"] = request_units_completed
+    report["request_units_total"] = request_units_total
+    if request_units_completed <= 0:
+        report["estimated_remaining_seconds"] = None
+        report["estimated_finish_at"] = None
+        return
+    remaining_units = max(0, request_units_total - request_units_completed)
+    remaining_seconds = elapsed * remaining_units / request_units_completed
+    report["estimated_remaining_seconds"] = round(remaining_seconds, 3)
+    report["estimated_finish_at"] = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=remaining_seconds)
+    ).isoformat()
 
 
 def linux_available_memory_mib() -> float | None:
@@ -1188,7 +1215,9 @@ def validate_model(
         "hourly_values_compared": 0,
         "daily_values_compared": 0,
         "comparison": "strict_official_json_values_for_field_intersection",
-        "local_request_mode": "sequential_field_chunks",
+        "local_request_mode": "sequential_period_chunks",
+        "concurrency": 1,
+        "first_difference_order": "point_then_period_then_field_then_time",
         "field_chunk_size": field_chunk_size,
         "failure": None,
         "current_point": None,
@@ -1207,6 +1236,15 @@ def validate_model(
         },
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    started_monotonic = time.monotonic()
+    request_units_total = point_limit * len(plan)
+    request_units_completed = 0
+    update_progress_estimate(
+        report,
+        started_monotonic=started_monotonic,
+        request_units_completed=request_units_completed,
+        request_units_total=request_units_total,
+    )
     points = sample_points()
     receipts = output / model / "receipts"
     receipts.mkdir(parents=True, exist_ok=True)
@@ -1220,6 +1258,13 @@ def validate_model(
             )
             report["hourly_values_compared"] += receipt["hourly_values_compared"]
             report["daily_values_compared"] += receipt["daily_values_compared"]
+            request_units_completed += len(plan)
+            update_progress_estimate(
+                report,
+                started_monotonic=started_monotonic,
+                request_units_completed=request_units_completed,
+                request_units_total=request_units_total,
+            )
             continue
         report["current_point"] = point
         report["current_point_hourly_values_compared"] = 0
@@ -1333,6 +1378,13 @@ def validate_model(
             }
             response_parts.append(part_metadata)
             report["local_requests_completed"] += 1
+            request_units_completed += 1
+            update_progress_estimate(
+                report,
+                started_monotonic=started_monotonic,
+                request_units_completed=request_units_completed,
+                request_units_total=request_units_total,
+            )
             if difference is not None:
                 failure = {
                     "point": point,
@@ -1359,6 +1411,11 @@ def validate_model(
                         "period": period,
                         "variables": list(variables),
                         "local_elapsed_seconds": round(elapsed, 6),
+                        "elapsed_seconds": report["elapsed_seconds"],
+                        "estimated_remaining_seconds": report[
+                            "estimated_remaining_seconds"
+                        ],
+                        "estimated_finish_at": report["estimated_finish_at"],
                     },
                     ensure_ascii=False,
                 ),
@@ -1402,6 +1459,11 @@ def validate_model(
                     "points_total": POINT_COUNT,
                     "local_request_count": len(response_parts),
                     "local_elapsed_seconds": round(local_elapsed_seconds, 6),
+                    "elapsed_seconds": report["elapsed_seconds"],
+                    "estimated_remaining_seconds": report[
+                        "estimated_remaining_seconds"
+                    ],
+                    "estimated_finish_at": report["estimated_finish_at"],
                 },
                 ensure_ascii=False,
             ),
