@@ -36,6 +36,7 @@ class ProductConfig:
     missing_variable_fallback_context_hours: int = 0
     missing_variable_fallback_predecessor_runs: int = 0
     forecast_hour_start: int = 0
+    source_mode: str = "spatial_runs"
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,16 @@ def load_models(path: Path) -> ModelsConfig:
             raise ValueError(
                 f"product {name} has unsupported coverage_strategy: {coverage_strategy}"
             )
+        source_mode = str(raw.get("source_mode", "spatial_runs"))
+        if source_mode not in ("spatial_runs", "rolling_time_series"):
+            raise ValueError(
+                f"product {name} has unsupported source_mode: {source_mode}"
+            )
+        if source_mode == "rolling_time_series" and len(required_variables) != 1:
+            raise ValueError(
+                f"product {name} rolling_time_series source requires exactly one "
+                "required variable"
+            )
         forecast_hour_start = int(raw.get("forecast_hour_start", 0))
         forecast_hour_end = int(raw["forecast_hour_end"])
         if forecast_hour_start < 0:
@@ -202,5 +213,6 @@ def load_models(path: Path) -> ModelsConfig:
                 missing_variable_fallback_predecessor_runs
             ),
             forecast_hour_start=forecast_hour_start,
+            source_mode=source_mode,
         )
     return ModelsConfig(version=int(data.get("version", 1)), products=products)

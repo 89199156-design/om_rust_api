@@ -136,6 +136,7 @@
     "ncep_gefs05": {
       "download_product": "om_ncep_gefs05",
       "openmeteo_model": "ncep_gefs05",
+      "source_mode": "rolling_time_series",
       "forecast_hour_start": 3,
       "forecast_hour_end": 384,
       "run_cadence_hours": 6,

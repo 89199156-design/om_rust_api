@@ -61,7 +61,7 @@ static ELEVATION_CACHE: OnceLock<Mutex<ElevationCache>> = OnceLock::new();
 
 pub const ECMWF_UPSTREAM_BASELINE: &str = "acfe608b825da1a8b42a755297eb61121986e9da";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeatherModel {
     Gfs,
     EcmwfIfs025,
@@ -102,6 +102,28 @@ impl WeatherModel {
 thread_local! {
     static REQUEST_WEATHER_MODEL: RefCell<WeatherModel> = const { RefCell::new(WeatherModel::Gfs) };
     static ECMWF_REQUEST_REGULAR_CACHE: RefCell<Option<HashMap<EcmwfRegularCacheKey, Arc<EcmwfRegularSeries>>>> = const { RefCell::new(None) };
+    static GFS_REQUEST_PROBABILITY_SUPPORT_CACHE: RefCell<Option<HashMap<GfsProbabilitySupportCacheKey, Option<f32>>>> = const { RefCell::new(None) };
+    static DAILY_REQUEST_SERIES_CACHE: RefCell<Option<HashMap<DailySeriesCacheKey, Arc<Vec<f32>>>>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GfsProbabilitySupportCacheKey {
+    coverage_ids: Vec<String>,
+    raw_variable: String,
+    unix_time: i64,
+    latitude_bits: u64,
+    longitude_bits: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DailySeriesCacheKey {
+    model: WeatherModel,
+    variable: String,
+    start_unix: i64,
+    end_unix: i64,
+    count: usize,
+    latitude_bits: u64,
+    longitude_bits: u64,
 }
 
 pub fn with_weather_model<T>(
@@ -130,6 +152,44 @@ pub fn with_ecmwf_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Res
     let result = operation();
     if owns_cache {
         ECMWF_REQUEST_REGULAR_CACHE.with(|cache| {
+            cache.borrow_mut().take();
+        });
+    }
+    result
+}
+
+fn with_gfs_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owns_cache = GFS_REQUEST_PROBABILITY_SUPPORT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_some() {
+            false
+        } else {
+            *cache = Some(HashMap::new());
+            true
+        }
+    });
+    let result = operation();
+    if owns_cache {
+        GFS_REQUEST_PROBABILITY_SUPPORT_CACHE.with(|cache| {
+            cache.borrow_mut().take();
+        });
+    }
+    result
+}
+
+fn with_daily_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owns_cache = DAILY_REQUEST_SERIES_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_some() {
+            false
+        } else {
+            *cache = Some(HashMap::new());
+            true
+        }
+    });
+    let result = operation();
+    if owns_cache {
+        DAILY_REQUEST_SERIES_CACHE.with(|cache| {
             cache.borrow_mut().take();
         });
     }
@@ -933,11 +993,15 @@ pub fn forecast_for_query(
     query: &PointQuery,
 ) -> Result<serde_json::Value> {
     let model = WeatherModel::parse(query.models.as_deref())?;
-    with_weather_model(model, || match model {
-        WeatherModel::EcmwfIfs025 => {
-            with_ecmwf_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
-        }
-        WeatherModel::Gfs => forecast_for_query_for_model(snapshot, decoder, query),
+    with_weather_model(model, || {
+        with_daily_request_cache(|| match model {
+            WeatherModel::EcmwfIfs025 => {
+                with_ecmwf_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
+            }
+            WeatherModel::Gfs => {
+                with_gfs_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
+            }
+        })
     })
 }
 
@@ -1136,7 +1200,9 @@ pub fn route_forecast(
         WeatherModel::EcmwfIfs025 => {
             with_ecmwf_request_cache(|| route_forecast_for_model(snapshot, decoder, query))
         }
-        WeatherModel::Gfs => route_forecast_for_model(snapshot, decoder, query),
+        WeatherModel::Gfs => {
+            with_gfs_request_cache(|| route_forecast_for_model(snapshot, decoder, query))
+        }
     })
 }
 
@@ -1750,7 +1816,11 @@ fn daily_weather_value(
         {
             return Ok(f32::NAN);
         }
-        return Ok(dominant_wind_direction(&speed_values, &direction_values));
+        return Ok(dominant_wind_direction(
+            &speed_values,
+            &direction_values,
+            current_weather_model() == WeatherModel::EcmwfIfs025,
+        ));
     }
 
     let source = aggregation.seed_variable();
@@ -1767,22 +1837,13 @@ fn daily_weather_value(
         1
     };
     let times = daily_sample_times(start, end, step_hours);
-    let mut values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
-    round_daily_source_values(source, &mut values);
+    let values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
 
     Ok(aggregate_daily_weather_values(
         aggregation,
         &values,
         step_hours,
     ))
-}
-
-fn round_daily_source_values(source: &str, values: &mut [f32]) {
-    if source == "precipitation_probability" {
-        values
-            .iter_mut()
-            .for_each(|value| *value = round_variable_output_value(source, *value));
-    }
 }
 
 fn aggregate_daily_weather_values(
@@ -1857,6 +1918,45 @@ fn daily_sample_times(
 }
 
 fn read_daily_series(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+) -> Result<Vec<f32>> {
+    let Some((first, last)) = times.first().zip(times.last()) else {
+        return Ok(Vec::new());
+    };
+    let key = DailySeriesCacheKey {
+        model: current_weather_model(),
+        variable: variable.to_string(),
+        start_unix: first.timestamp(),
+        end_unix: last.timestamp(),
+        count: times.len(),
+        latitude_bits: latitude.to_bits(),
+        longitude_bits: longitude.to_bits(),
+    };
+    let cached = DAILY_REQUEST_SERIES_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&key).cloned())
+    });
+    if let Some(values) = cached {
+        return Ok((*values).clone());
+    }
+    let values =
+        read_daily_series_uncached(snapshot, decoder, variable, times, latitude, longitude)?;
+    DAILY_REQUEST_SERIES_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(key, Arc::new(values.clone()));
+        }
+    });
+    Ok(values)
+}
+
+fn read_daily_series_uncached(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
     variable: &str,
@@ -6989,24 +7089,6 @@ fn read_product_history_value_with_rounding(
     bail!("variable/time is not available: {} {}", raw_variable, time)
 }
 
-fn gfs_history_native_times(
-    products: &[Arc<ProductSnapshot>],
-    raw_variable: &str,
-) -> Vec<DateTime<Utc>> {
-    products
-        .iter()
-        .flat_map(|product| {
-            product
-                .entries
-                .keys()
-                .filter(|key| key.variable == raw_variable)
-                .map(|key| key.valid_time_utc)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
 fn gfs_probability_interpolation_position(
     native_times: &[DateTime<Utc>],
     time: DateTime<Utc>,
@@ -7049,6 +7131,96 @@ fn gfs_probability_interpolation_position(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gfs_probability_regularize_source_run(
+    product: &ProductSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    source_run: &str,
+    raw_variable: &str,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<EcmwfRegularRun>> {
+    let mut entries = product
+        .entries_by_source_run
+        .get(source_run)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.variable == raw_variable)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    entries.sort_by_key(|entry| entry.forecast_hour);
+    let min_hour = entries
+        .iter()
+        .map(|entry| entry.forecast_hour)
+        .min()
+        .unwrap();
+    let max_hour = entries
+        .iter()
+        .map(|entry| entry.forecast_hour)
+        .max()
+        .unwrap();
+    if min_hour % 3 != 0 || max_hour % 3 != 0 {
+        bail!("GFS probability source run is not aligned to its 3-hour database axis");
+    }
+    let base = entries[0].valid_time_utc - Duration::hours(entries[0].forecast_hour);
+    if entries
+        .iter()
+        .any(|entry| entry.valid_time_utc - Duration::hours(entry.forecast_hour) != base)
+    {
+        bail!("GFS probability source run has inconsistent reference times: {source_run}");
+    }
+    let start = base + Duration::hours(min_hour);
+    let count = usize::try_from((max_hour - min_hour) / 3 + 1)?;
+    let grid_len = latitudes.len() * longitudes.len();
+    let mut frames = vec![vec![f32::NAN; grid_len]; count];
+    for entry in entries {
+        let index = usize::try_from((entry.forecast_hour - min_hour) / 3)?;
+        frames[index] = if let Some(decoder) = decoder {
+            read_entry_grid(product, entry, decoder, latitudes, longitudes)?
+        } else if grid_len == 1 {
+            vec![read_entry_value(
+                product,
+                entry,
+                None,
+                latitudes[0],
+                longitudes[0],
+            )?]
+        } else {
+            bail!("official OM decoder is required for a GFS probability grid");
+        };
+    }
+    for point in 0..grid_len {
+        let mut values = frames.iter().map(|frame| frame[point]).collect::<Vec<_>>();
+        interpolate_ecmwf_hermite_in_place(&mut values, Some((0.0, 100.0)), false, false);
+        for (frame, value) in frames.iter_mut().zip(values) {
+            frame[point] = if value.is_finite() {
+                round_to_scalefactor(value, 1.0)
+            } else {
+                value
+            };
+        }
+    }
+    Ok(Some(EcmwfRegularRun {
+        source_run: source_run.to_string(),
+        start,
+        frames,
+    }))
+}
+
+fn gfs_history_native_times(
+    products: &[Arc<ProductSnapshot>],
+    raw_variable: &str,
+) -> Vec<DateTime<Utc>> {
+    products
+        .iter()
+        .flat_map(|product| native_times_for_variable(product, raw_variable))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn newest_gfs_history_product_for_time<'a>(
     products: &'a [Arc<ProductSnapshot>],
     raw_variable: &str,
@@ -7062,6 +7234,141 @@ fn newest_gfs_history_product_for_time<'a>(
         .iter()
         .find(|product| product.entries.contains_key(&key))
         .map(AsRef::as_ref)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_support_value(
+    products: &[Arc<ProductSnapshot>],
+    decoder: Option<&OfficialDecoder>,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Option<f32>> {
+    let key = GfsProbabilitySupportCacheKey {
+        coverage_ids: products
+            .iter()
+            .map(|product| product.manifest.coverage_id.clone())
+            .collect(),
+        raw_variable: raw_variable.to_string(),
+        unix_time: time.timestamp(),
+        latitude_bits: latitude.to_bits(),
+        longitude_bits: longitude.to_bits(),
+    };
+    let cached = GFS_REQUEST_PROBABILITY_SUPPORT_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&key).copied())
+    });
+    if let Some(value) = cached {
+        return Ok(value);
+    }
+    let mut runs = Vec::new();
+    for product in products {
+        let mut source_runs = product
+            .entries_by_source_run
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| entry.variable == raw_variable && entry.interpolation_support)
+            })
+            .map(|(source_run, _)| source_run.clone())
+            .collect::<Vec<_>>();
+        source_runs.sort();
+        for source_run in source_runs {
+            if let Some(run) = gfs_probability_regularize_source_run(
+                product,
+                decoder,
+                &source_run,
+                raw_variable,
+                &[latitude],
+                &[longitude],
+            )? {
+                runs.push(run);
+            }
+        }
+    }
+    runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
+    let mut value = None;
+    for run in runs {
+        let elapsed = (time - run.start).num_seconds();
+        if elapsed < 0 || elapsed % (3 * 3600) != 0 {
+            continue;
+        }
+        let index = usize::try_from(elapsed / (3 * 3600))?;
+        let Some(candidate) = run.frames.get(index).and_then(|frame| frame.first()) else {
+            continue;
+        };
+        if candidate.is_finite() {
+            value = Some(*candidate);
+        }
+    }
+    GFS_REQUEST_PROBABILITY_SUPPORT_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(key, value);
+        }
+    });
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_support_grid(
+    products: &[Arc<ProductSnapshot>],
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<Vec<f32>>> {
+    let grid_len = latitudes.len() * longitudes.len();
+    let mut runs = Vec::new();
+    for product in products {
+        let mut source_runs = product
+            .entries_by_source_run
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .iter()
+                    .any(|entry| entry.variable == raw_variable && entry.interpolation_support)
+            })
+            .map(|(source_run, _)| source_run.clone())
+            .collect::<Vec<_>>();
+        source_runs.sort();
+        for source_run in source_runs {
+            if let Some(run) = gfs_probability_regularize_source_run(
+                product,
+                Some(decoder),
+                &source_run,
+                raw_variable,
+                latitudes,
+                longitudes,
+            )? {
+                runs.push(run);
+            }
+        }
+    }
+    runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
+    let mut values = vec![f32::NAN; grid_len];
+    let mut found = false;
+    for run in runs {
+        let elapsed = (time - run.start).num_seconds();
+        if elapsed < 0 || elapsed % (3 * 3600) != 0 {
+            continue;
+        }
+        let index = usize::try_from(elapsed / (3 * 3600))?;
+        let Some(frame) = run.frames.get(index) else {
+            continue;
+        };
+        for (target, candidate) in values.iter_mut().zip(frame) {
+            if candidate.is_finite() {
+                *target = *candidate;
+                found = true;
+            }
+        }
+    }
+    Ok(found.then_some(values))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7155,11 +7462,24 @@ fn read_gfs_probability_history_value_with_rounding(
         .copied()
         .filter(|value| value.is_finite())
         .unwrap_or(b);
-    let d = values
+    let d_time = regular_times[index] + Duration::seconds(regular_seconds * 2);
+    let direct_d = values
         .get(index + 2)
         .copied()
-        .filter(|value| value.is_finite())
-        .unwrap_or(b);
+        .filter(|value| value.is_finite());
+    let support_d = if direct_d.is_none() {
+        read_gfs_probability_support_value(
+            products,
+            decoder,
+            raw_variable,
+            d_time,
+            latitude,
+            longitude,
+        )?
+    } else {
+        None
+    };
+    let d = direct_d.or(support_d).unwrap_or(b);
     let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
     let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
     let coeff_c = -a / 2.0 + c / 2.0;
@@ -7212,7 +7532,18 @@ fn read_gfs_probability_history_grid_with_rounding(
         read(native_times[index] - Duration::seconds(stride_seconds))?.unwrap_or_else(|| b.clone());
     let c_time = native_times[index] + Duration::seconds(stride_seconds);
     let c = read(c_time)?.unwrap_or_else(|| b.clone());
-    let d = read(c_time + Duration::seconds(stride_seconds))?;
+    let d_time = c_time + Duration::seconds(stride_seconds);
+    let d = match read(d_time)? {
+        Some(values) => Some(values),
+        None => read_gfs_probability_support_grid(
+            products,
+            decoder,
+            raw_variable,
+            d_time,
+            latitudes,
+            longitudes,
+        )?,
+    };
     Ok((0..grid_len)
         .map(|point| {
             let b = b[point];
@@ -9087,8 +9418,8 @@ fn grid_index_for_lat_lon(
         }
         return Ok((y as u64, x as u64));
     }
-    if array.dimensions.len() != 2 {
-        bail!("only 2D OM entries are supported by the point API");
+    if !matches!(array.dimensions.len(), 2 | 3) {
+        bail!("only 2D or 3D OM entries are supported by the point API");
     }
     let ny = array.dimensions[0] as f32;
     let nx = array.dimensions[1] as f32;
@@ -9983,7 +10314,7 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_100m",
-                dominant_wind_direction(&speed, &direction),
+                dominant_wind_direction(&speed, &direction, false),
             ),
             serde_json::json!(360)
         );
@@ -10003,7 +10334,7 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_10m",
-                dominant_wind_direction(&speed, &direction),
+                dominant_wind_direction(&speed, &direction, false),
             ),
             serde_json::json!(184)
         );
@@ -10037,7 +10368,7 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_100m",
-                dominant_wind_direction(&speed, &direction),
+                dominant_wind_direction(&speed, &direction, true),
             ),
             serde_json::json!(0)
         );
@@ -11595,7 +11926,7 @@ fn wind_direction(u: f32, v: f32) -> f32 {
 /// Open-Meteo source. The official path derives speed and direction for every
 /// model frame, reconstructs the two components in single precision, sums
 /// those reconstructed components, and only then evaluates the fast angle.
-fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
+fn dominant_wind_direction(speed: &[f32], direction: &[f32], canonicalize_north: bool) -> f32 {
     debug_assert_eq!(speed.len(), direction.len());
     let u = speed
         .iter()
@@ -11611,7 +11942,7 @@ fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
     // quantization ULP. Canonicalize only a numerically indistinguishable
     // northward vector; larger positive components still preserve official
     // 360-degree output (including the frozen p0014 boundary).
-    if v < 0.0 && u.abs() <= f32::EPSILON * v.abs() {
+    if canonicalize_north && v < 0.0 && u.abs() <= f32::EPSILON * v.abs() {
         return 0.0;
     }
     wind_direction(u, v)
@@ -12315,17 +12646,23 @@ mod output_tests {
     }
 
     #[test]
-    fn daily_probability_aggregates_the_published_integer_series() {
-        let mut values = [53.51, 74.0];
-        round_daily_source_values("precipitation_probability", &mut values);
-        assert_eq!(values, [54.0, 74.0]);
+    fn daily_probability_mean_aggregates_the_unrounded_source_series() {
+        let values = [39.49, 39.49];
         assert_eq!(
             aggregate_daily_weather_values(
-                DailyWeatherAggregation::Min("precipitation_probability"),
+                DailyWeatherAggregation::Mean("precipitation_probability"),
                 &values,
                 1,
             ),
-            54.0
+            39.49
+        );
+        assert_eq!(
+            json_array_for_daily_variable(
+                "precipitation_probability_mean",
+                DailyWeatherAggregation::Mean("precipitation_probability"),
+                vec![39.49],
+            ),
+            serde_json::json!([39])
         );
     }
 

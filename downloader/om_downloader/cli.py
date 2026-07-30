@@ -15,6 +15,7 @@ import sys
 import time
 from typing import Any
 from urllib.error import HTTPError
+from urllib.request import urlopen
 
 from .checksum import sha256_file
 from .coverage import (
@@ -633,6 +634,104 @@ def _with_interpolation_support_records(
     return records + support
 
 
+def _rolling_time_series_object_records(
+    product: ProductConfig,
+    plan: Any,
+    *,
+    bucket_url: str,
+) -> list[dict[str, Any]]:
+    """Plan immutable regional reads from Open-Meteo's rolling time-series.
+
+    The GEFS 0.5° rolling database contains the delayed 00Z extension that is
+    intentionally absent from ``data_spatial``.  Those hidden frames are
+    required as right-side Hermite control points at the public 16-day tail.
+    Refuse to mix batches: the rolling metadata must identify the exact same
+    latest run selected by the spatial GFS group.
+    """
+    meta_url = (
+        f"{bucket_url.rstrip('/')}/data/{product.openmeteo_model}/static/meta.json"
+    )
+    with urlopen(meta_url, timeout=30) as response:
+        meta = json.loads(response.read())
+    chunk_time_length = int(meta.get("chunk_time_length") or 0)
+    dt_seconds = int(meta.get("temporal_resolution_seconds") or 0)
+    last_run_epoch = int(meta.get("last_run_initialisation_time") or 0)
+    data_end_epoch = int(meta.get("data_end_time") or 0)
+    if chunk_time_length <= 0 or dt_seconds <= 0:
+        raise ValueError(
+            f"rolling time-series metadata is incomplete: {product.openmeteo_model}"
+        )
+    latest_run_time = datetime.strptime(
+        str(plan.latest_complete_run), "%Y%m%d%H"
+    ).replace(tzinfo=timezone.utc)
+    if int(latest_run_time.timestamp()) != last_run_epoch:
+        actual = datetime.fromtimestamp(last_run_epoch, tz=timezone.utc)
+        raise ValueError(
+            "rolling time-series batch does not match selected spatial run: "
+            f"{product.openmeteo_model} expected={plan.latest_complete_run} "
+            f"actual={actual:%Y%m%d%H}"
+        )
+
+    slots = sorted(plan.slots, key=lambda item: _as_utc(item.valid_time_utc))
+    if not slots:
+        raise ValueError(f"rolling time-series plan is empty: {product.name}")
+    first = _as_utc(slots[0].valid_time_utc) - timedelta(seconds=dt_seconds)
+    # One extra regular frame is enough: the final public hourly interval has
+    # B at -3h, C at the latest spatial frame and D at +3h.
+    last = _as_utc(slots[-1].valid_time_utc) + timedelta(seconds=dt_seconds)
+    if int(last.timestamp()) > data_end_epoch:
+        raise ValueError(
+            f"rolling time-series does not include interpolation lookahead: "
+            f"{product.openmeteo_model} required={_format_utc(last)}"
+        )
+
+    public_times = {_as_utc(slot.valid_time_utc) for slot in slots}
+    aliases_by_chunk: dict[int, list[dict[str, Any]]] = {}
+    cursor = first
+    while cursor <= last:
+        timestamp = int(cursor.timestamp())
+        if timestamp % dt_seconds != 0:
+            raise ValueError("rolling time-series timestamps are not aligned")
+        absolute_index = timestamp // dt_seconds
+        chunk_index, native_time_index = divmod(
+            absolute_index, chunk_time_length
+        )
+        forecast_hour = int((cursor - latest_run_time).total_seconds() // 3600)
+        aliases_by_chunk.setdefault(chunk_index, []).append(
+            {
+                "valid_time_utc": _format_utc(cursor),
+                "source_run": str(plan.latest_complete_run),
+                "forecast_hour": forecast_hour,
+                "coverage_source_run": str(plan.latest_complete_run),
+                "coverage_forecast_hour": forecast_hour,
+                "interpolation_support": cursor not in public_times,
+                "native_time_index": native_time_index,
+            }
+        )
+        cursor += timedelta(seconds=dt_seconds)
+
+    records = []
+    variable = product.required_variables[0]
+    for chunk_index, aliases in sorted(aliases_by_chunk.items()):
+        records.append(
+            {
+                **aliases[0],
+                "rolling_time_series": True,
+                "rolling_variable": variable,
+                "rolling_time_range": [
+                    min(int(item["native_time_index"]) for item in aliases),
+                    max(int(item["native_time_index"]) for item in aliases) + 1,
+                ],
+                "rolling_aliases": aliases,
+                "url": (
+                    f"{bucket_url.rstrip('/')}/data/{product.openmeteo_model}/"
+                    f"{variable}/chunk_{chunk_index}.om"
+                ),
+            }
+        )
+    return records
+
+
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -1125,19 +1224,26 @@ def _download_openmeteo_product(
         )
         return reused_manifest
 
-    object_records = coverage_object_records(
-        plan,
-        runs,
-        bucket_url=bucket_url,
-        openmeteo_model=product.openmeteo_model,
-    )
-    object_records = _with_interpolation_support_records(
-        product,
-        plan,
-        runs,
-        object_records,
-        bucket_url=bucket_url,
-    )
+    if product.source_mode == "rolling_time_series":
+        object_records = _rolling_time_series_object_records(
+            product,
+            plan,
+            bucket_url=bucket_url,
+        )
+    else:
+        object_records = coverage_object_records(
+            plan,
+            runs,
+            bucket_url=bucket_url,
+            openmeteo_model=product.openmeteo_model,
+        )
+        object_records = _with_interpolation_support_records(
+            product,
+            plan,
+            runs,
+            object_records,
+            bucket_url=bucket_url,
+        )
     region_plan: dict[str, Any] | None = None
     missing_object_required_variables = []
     wanted_variables = tuple(
@@ -1166,6 +1272,51 @@ def _download_openmeteo_product(
         return cached
 
     def plan_object_entries(object_record: dict[str, Any]) -> dict[str, Any]:
+        if object_record.get("rolling_time_series"):
+            source = HttpByteRangeSource(object_record["url"])
+            remote_content_length = source.content_length()
+            inventory = load_remote_om_inventory(source)
+            array = inventory.arrays.get("")
+            if array is None:
+                raise ValueError(
+                    f"rolling OM chunk has no root array: {object_record['url']}"
+                )
+            if len(array.dimensions) != 3 or len(array.chunks) != 3:
+                raise ValueError(
+                    f"rolling OM chunk is not a three-dimensional time series: "
+                    f"{object_record['url']}"
+                )
+            object_region_plan, spatial_ranges = plan_region_for_array(
+                product, array
+            )
+            time_range = tuple(int(value) for value in object_record["rolling_time_range"])
+            bundle = plan_variable_range_bundle(
+                source,
+                array,
+                selection_ranges=spatial_ranges + (time_range,),
+                lut_codec=lut_codec,
+                lut_workers=planning_workers,
+                io_size_merge=range_io_merge_gap,
+                io_size_max=range_io_size_max,
+            )
+            bundle["variable"] = str(object_record["rolling_variable"])
+            bundle["path"] = ""
+            bundle["manifest_selection_ranges"] = [
+                list(item) for item in spatial_ranges
+            ]
+            return {
+                "object_record": object_record,
+                "region_plan": object_region_plan,
+                "missing_required_variables": [],
+                "entries": [
+                    {
+                        "object_record": object_record,
+                        "bundle": bundle,
+                        "source_url": object_record["url"],
+                        "remote_content_length": remote_content_length,
+                    }
+                ],
+            }
         source, remote_content_length, inventory = inventory_for_url(
             object_record["url"],
             wanted_variables,
@@ -1553,6 +1704,29 @@ def _download_openmeteo_product(
                 object_range_max_bytes=object_range_max_bytes,
             )
         )
+    if product.source_mode == "rolling_time_series" and files:
+        base_entries = {
+            str(entry.get("source_url")): entry
+            for entry in files[0].get("entries") or []
+        }
+        aliases = []
+        for object_record in object_records:
+            base = base_entries.get(str(object_record["url"]))
+            if base is None:
+                raise ValueError(
+                    f"rolling bundle entry is missing: {object_record['url']}"
+                )
+            for alias in object_record["rolling_aliases"]:
+                expanded = dict(base)
+                expanded.update(alias)
+                aliases.append(expanded)
+        aliases.sort(
+            key=lambda entry: (
+                str(entry["valid_time_utc"]),
+                str(entry["source_run"]),
+            )
+        )
+        files[0]["entries"] = aliases
     if region_plan is None:
         region_plan = _build_region_plan(product)
     manifest = build_latest_manifest(product, runs, plan, files, region_plan)

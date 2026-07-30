@@ -194,7 +194,11 @@ CAMS_OFFICIAL_DERIVED = (
     "us_aqi_co",
 )
 CAMS_HOURLY_OFFICIAL = CAMS_RAW + CAMS_OFFICIAL_DERIVED
-CAMS_HOURLY_LOCAL = CAMS_HOURLY_OFFICIAL
+# The local CAMS endpoint intentionally publishes the raw concentration fields
+# plus its own Chinese AQI derivatives. European/US AQI fields exist only in
+# the official snapshot, while Chinese AQI exists only locally, so neither
+# derived family belongs to the strict official/local field intersection.
+CAMS_HOURLY_LOCAL = CAMS_RAW
 CAMS_DAILY: tuple[str, ...] = ()
 
 MODEL_SPECS: dict[str, dict[str, Any]] = {
@@ -293,13 +297,24 @@ def chunks(values: tuple[str, ...], size: int) -> list[tuple[str, ...]]:
 
 def request_plan(model: str, field_chunk_size: int) -> list[dict[str, Any]]:
     spec = MODEL_SPECS[model]
+    hourly_groups = chunks(tuple(spec["local_hourly"]), field_chunk_size)
+    daily_groups = chunks(
+        tuple(spec["daily"]) if model != "cams" else (), field_chunk_size
+    )
     plan: list[dict[str, Any]] = []
-    for period, variables in (
-        ("hourly", tuple(spec["local_hourly"])),
-        ("daily", tuple(spec["daily"]) if model != "cams" else ()),
-    ):
-        for group in chunks(variables, field_chunk_size):
-            plan.append({"period": period, "variables": group})
+    # The local API supports hourly and daily fields in one request. Pair their
+    # chunks so snapshot setup, file descriptors and decoder caches are reused.
+    # Comparison order remains hourly then daily, preserving first-difference
+    # determinism.
+    for index in range(max(len(hourly_groups), len(daily_groups))):
+        plan.append(
+            {
+                "hourly": (
+                    hourly_groups[index] if index < len(hourly_groups) else ()
+                ),
+                "daily": daily_groups[index] if index < len(daily_groups) else (),
+            }
+        )
     return plan
 
 
@@ -313,17 +328,22 @@ def update_progress_estimate(
     started_monotonic: float,
     request_units_completed: int,
     request_units_total: int,
+    timed_request_units_completed: int,
 ) -> None:
     elapsed = max(0.0, time.monotonic() - started_monotonic)
     report["elapsed_seconds"] = round(elapsed, 3)
     report["request_units_completed"] = request_units_completed
     report["request_units_total"] = request_units_total
-    if request_units_completed <= 0:
+    report["request_units_reused"] = (
+        request_units_completed - timed_request_units_completed
+    )
+    report["request_units_executed_this_attempt"] = timed_request_units_completed
+    if timed_request_units_completed <= 0:
         report["estimated_remaining_seconds"] = None
         report["estimated_finish_at"] = None
         return
     remaining_units = max(0, request_units_total - request_units_completed)
-    remaining_seconds = elapsed * remaining_units / request_units_completed
+    remaining_seconds = elapsed * remaining_units / timed_request_units_completed
     report["estimated_remaining_seconds"] = round(remaining_seconds, 3)
     report["estimated_finish_at"] = (
         dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=remaining_seconds)
@@ -867,7 +887,8 @@ def local_url(
     *,
     hourly: tuple[str, ...] | None = None,
     daily: tuple[str, ...] | None = None,
-    time_range: tuple[str, str] | None = None,
+    hourly_time_range: tuple[str, str] | None = None,
+    daily_time_range: tuple[str, str] | None = None,
 ) -> str:
     spec = MODEL_SPECS[model]
     if hourly is None and daily is None:
@@ -880,14 +901,17 @@ def local_url(
         "timeformat": "iso8601",
         "cell_selection": "nearest",
     }
-    if time_range is None:
+    if hourly_time_range is None and daily_time_range is None:
         params["forecast_days"] = str(spec["forecast_days"])
-    elif hourly:
-        params["start_hour"], params["end_hour"] = time_range
-    elif daily:
-        params["start_date"], params["end_date"] = time_range
     else:
-        raise ValidationError("an explicit local time range requires one response period")
+        if hourly:
+            if hourly_time_range is None:
+                raise ValidationError("hourly fields require an hourly time range")
+            params["start_hour"], params["end_hour"] = hourly_time_range
+        if daily:
+            if daily_time_range is None:
+                raise ValidationError("daily fields require a daily time range")
+            params["start_date"], params["end_date"] = daily_time_range
     if hourly:
         params["hourly"] = ",".join(hourly)
     if daily:
@@ -1311,7 +1335,7 @@ def validate_model(
         "hourly_values_compared": 0,
         "daily_values_compared": 0,
         "comparison": "strict_official_json_values_for_field_intersection",
-        "local_request_mode": "sequential_period_chunks",
+        "local_request_mode": "paired_hourly_daily_chunks",
         "concurrency": 1,
         "first_difference_order": "point_then_period_then_field_then_time",
         "field_chunk_size": field_chunk_size,
@@ -1335,11 +1359,13 @@ def validate_model(
     started_monotonic = time.monotonic()
     request_units_total = point_limit * len(plan)
     request_units_completed = 0
+    timed_request_units_completed = 0
     update_progress_estimate(
         report,
         started_monotonic=started_monotonic,
         request_units_completed=request_units_completed,
         request_units_total=request_units_total,
+        timed_request_units_completed=timed_request_units_completed,
     )
     points = sample_points()
     receipts = output / model / "receipts"
@@ -1367,6 +1393,7 @@ def validate_model(
                 started_monotonic=started_monotonic,
                 request_units_completed=request_units_completed,
                 request_units_total=request_units_total,
+                timed_request_units_completed=timed_request_units_completed,
             )
             continue
         report["current_point"] = point
@@ -1391,19 +1418,32 @@ def validate_model(
         local_elapsed_seconds = 0.0
         response_parts: list[dict[str, Any]] = []
         for request_index, request_part in enumerate(plan):
-            period = request_part["period"]
-            variables = request_part["variables"]
-            official_period = official.get(period)
-            official_times = (
-                official_period.get("time")
-                if isinstance(official_period, dict)
-                else None
-            )
-            if not isinstance(official_times, list) or not official_times:
-                raise ValidationError(
-                    f"official {model} point {point['id']} has no {period} time axis"
+            hourly_variables = request_part["hourly"]
+            daily_variables = request_part["daily"]
+            periods = [
+                (period, variables)
+                for period, variables in (
+                    ("hourly", hourly_variables),
+                    ("daily", daily_variables),
                 )
-            time_range = (str(official_times[0]), str(official_times[-1]))
+                if variables
+            ]
+            time_ranges: dict[str, tuple[str, str]] = {}
+            for period, _variables in periods:
+                official_period = official.get(period)
+                official_times = (
+                    official_period.get("time")
+                    if isinstance(official_period, dict)
+                    else None
+                )
+                if not isinstance(official_times, list) or not official_times:
+                    raise ValidationError(
+                        f"official {model} point {point['id']} has no {period} time axis"
+                    )
+                time_ranges[period] = (
+                    str(official_times[0]),
+                    str(official_times[-1]),
+                )
             resource_snapshot = wait_for_safe_local_resources(
                 local_base=local_base,
                 min_available_memory_mib=min_available_memory_mib,
@@ -1416,16 +1456,22 @@ def validate_model(
                 local_base,
                 model,
                 point,
-                hourly=variables if period == "hourly" else (),
-                daily=variables if period == "daily" else (),
-                time_range=time_range,
+                hourly=hourly_variables,
+                daily=daily_variables,
+                hourly_time_range=time_ranges.get("hourly"),
+                daily_time_range=time_ranges.get("daily"),
             )
             report["current_request"] = {
                 "index": request_index,
                 "count": len(plan),
-                "period": period,
-                "variables": list(variables),
-                "time_range": list(time_range),
+                "periods": [period for period, _variables in periods],
+                "variables": {
+                    period: list(variables) for period, variables in periods
+                },
+                "time_ranges": {
+                    period: list(time_range)
+                    for period, time_range in time_ranges.items()
+                },
                 "local_url": url,
                 "resources": resource_snapshot,
             }
@@ -1436,7 +1482,15 @@ def validate_model(
                         "model": model,
                         "event": "request_started",
                         "point": point,
-                        **report["current_request"],
+                        "index": request_index,
+                        "count": len(plan),
+                        "periods": [period for period, _variables in periods],
+                        "variable_counts": {
+                            period: len(variables)
+                            for period, variables in periods
+                        },
+                        "time_ranges": report["current_request"]["time_ranges"],
+                        "resources": resource_snapshot,
                     },
                     ensure_ascii=False,
                 ),
@@ -1457,22 +1511,32 @@ def validate_model(
                 / "attempts"
                 / attempt_id
                 / f"{point['order']:03d}_{point['id']}"
-                / f"{request_index:03d}_{period}.json"
+                / (
+                    f"{request_index:03d}_"
+                    + "_".join(period for period, _variables in periods)
+                    + ".json"
+                )
             )
             write_once(local_path, raw)
             local = normalize_rows(json.loads(raw), 1)[0]
-            difference, hourly_part, daily_part = first_period_difference(
-                period, variables, official, local
-            )
-            hourly_count += hourly_part
-            daily_count += daily_part
+            difference = None
+            for period, variables in periods:
+                difference, hourly_part, daily_part = first_period_difference(
+                    period, variables, official, local
+                )
+                hourly_count += hourly_part
+                daily_count += daily_part
+                if difference is not None:
+                    break
             report["current_point_hourly_values_compared"] = hourly_count
             report["current_point_daily_values_compared"] = daily_count
             local_elapsed_seconds += elapsed
             part_metadata = {
                 "index": request_index,
-                "period": period,
-                "variables": list(variables),
+                "periods": [period for period, _variables in periods],
+                "variables": {
+                    period: list(variables) for period, variables in periods
+                },
                 "local_response_file": str(local_path),
                 "local_response_sha256": sha256_bytes(raw),
                 "local_elapsed_seconds": round(elapsed, 6),
@@ -1482,11 +1546,13 @@ def validate_model(
             response_parts.append(part_metadata)
             report["local_requests_completed"] += 1
             request_units_completed += 1
+            timed_request_units_completed += 1
             update_progress_estimate(
                 report,
                 started_monotonic=started_monotonic,
                 request_units_completed=request_units_completed,
                 request_units_total=request_units_total,
+                timed_request_units_completed=timed_request_units_completed,
             )
             if difference is not None:
                 failure = {
@@ -1511,8 +1577,11 @@ def validate_model(
                         "point": point,
                         "request_index": request_index,
                         "request_count": len(plan),
-                        "period": period,
-                        "variables": list(variables),
+                        "periods": [period for period, _variables in periods],
+                        "variable_counts": {
+                            period: len(variables)
+                            for period, variables in periods
+                        },
                         "local_elapsed_seconds": round(elapsed, 6),
                         "elapsed_seconds": report["elapsed_seconds"],
                         "estimated_remaining_seconds": report[

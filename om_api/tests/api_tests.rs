@@ -44,6 +44,26 @@ fn write_product_coverage_timed(
     entries: Vec<TimedTestEntry>,
     make_current: bool,
 ) {
+    write_product_coverage_timed_with_source_run(
+        root,
+        product,
+        coverage_id,
+        entries,
+        make_current,
+        "2026070800",
+        false,
+    );
+}
+
+fn write_product_coverage_timed_with_source_run(
+    root: &Path,
+    product: &str,
+    coverage_id: &str,
+    entries: Vec<TimedTestEntry>,
+    make_current: bool,
+    source_run: &str,
+    derive_forecast_hour: bool,
+) {
     let product_root = root.join(product);
     let coverage_root = product_root.join("coverages").join(coverage_id);
     fs::create_dir_all(&coverage_root).unwrap();
@@ -54,12 +74,27 @@ fn write_product_coverage_timed(
         let bundle_offset = bundle.len() as u64;
         let payload = floats_to_bytes(&entry.values);
         bundle.extend_from_slice(&payload);
+        let forecast_hour = if derive_forecast_hour {
+            let valid_time = chrono::DateTime::parse_from_rfc3339(entry.valid_time_utc)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let source_date =
+                chrono::NaiveDate::parse_from_str(&source_run[..8], "%Y%m%d").unwrap();
+            let source_hour = source_run[8..10].parse::<u32>().unwrap();
+            let source_time = source_date
+                .and_hms_opt(source_hour, 0, 0)
+                .unwrap()
+                .and_utc();
+            (valid_time - source_time).num_hours()
+        } else {
+            0
+        };
         manifest_entries.push(serde_json::json!({
             "variable": entry.variable,
             "variable_path": entry.variable,
             "valid_time_utc": entry.valid_time_utc,
-            "source_run": "2026070800",
-            "forecast_hour": 0,
+            "source_run": source_run,
+            "forecast_hour": forecast_hour,
             "source_url": "fixture",
             "selection_ranges": [[0, 2], [0, 2]],
             "array": {
@@ -85,7 +120,7 @@ fn write_product_coverage_timed(
         "model": product,
         "coverage_id": coverage_id,
         "status": "complete",
-        "latest_complete_run": "2026070800",
+        "latest_complete_run": source_run,
         "files": [{
             "kind": "om_coverage_bundle",
             "path": format!("coverages/{coverage_id}/{product}.omranges"),
@@ -1522,13 +1557,13 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
             TimedTestEntry {
                 variable: "temperature_2m",
                 values: [23.0; 4],
-                valid_time_utc: "2026-07-08T07:00:00Z",
+                valid_time_utc: "2026-07-08T09:00:00Z",
             },
         ],
         false,
     );
     let gefs025 = "ncep_gefs025_probability";
-    write_product_coverage_timed(
+    write_product_coverage_timed_with_source_run(
         root.path(),
         "ncep_gefs025",
         gefs025,
@@ -1540,28 +1575,8 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
             },
             TimedTestEntry {
                 variable: "precipitation_probability",
-                values: [27.0; 4],
-                valid_time_utc: "2026-07-08T01:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [31.0; 4],
-                valid_time_utc: "2026-07-08T02:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
                 values: [35.0; 4],
                 valid_time_utc: "2026-07-08T03:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [39.0; 4],
-                valid_time_utc: "2026-07-08T04:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [43.0; 4],
-                valid_time_utc: "2026-07-08T05:00:00Z",
             },
             TimedTestEntry {
                 variable: "precipitation_probability",
@@ -1570,9 +1585,11 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
             },
         ],
         false,
+        "2026070800",
+        true,
     );
     let gefs05 = "ncep_gefs05_probability";
-    write_product_coverage_timed(
+    write_product_coverage_timed_with_source_run(
         root.path(),
         "ncep_gefs05",
         gefs05,
@@ -1584,28 +1601,8 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
             },
             TimedTestEntry {
                 variable: "precipitation_probability",
-                values: [83.0; 4],
-                valid_time_utc: "2026-07-08T01:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [75.0; 4],
-                valid_time_utc: "2026-07-08T02:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
                 values: [67.0; 4],
                 valid_time_utc: "2026-07-08T03:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [59.0; 4],
-                valid_time_utc: "2026-07-08T04:00:00Z",
-            },
-            TimedTestEntry {
-                variable: "precipitation_probability",
-                values: [51.0; 4],
-                valid_time_utc: "2026-07-08T05:00:00Z",
             },
             TimedTestEntry {
                 variable: "precipitation_probability",
@@ -1614,6 +1611,8 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
             },
         ],
         false,
+        "2026070800",
+        true,
     );
     write_group_ready(
         root.path(),
@@ -1629,14 +1628,14 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation_probability&forecast_hours=8",
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=precipitation_probability&forecast_hours=10",
     )
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["hourly"]["precipitation_probability"],
-        serde_json::json!([0, 27, 31, 43, 49, 49, 64, null])
+        serde_json::json!([0, 12, 27, 43, 51, 57, 64, 64, 64, null])
     );
     assert_eq!(body["hourly_units"]["precipitation_probability"], "%");
     assert_eq!(
@@ -1646,7 +1645,7 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
     );
     assert_eq!(
         body["hourly"]["precipitation_probability"][1].as_i64(),
-        Some(27),
+        Some(12),
         "GEFS 0.25° must take precedence when both products cover the hour"
     );
     assert_eq!(
@@ -1655,7 +1654,7 @@ async fn gfs_precipitation_probability_prefers_gefs025_fills_from_gefs05_and_kee
         "GEFS 0.5° must fill the same-hour gap left by GEFS 0.25°"
     );
     assert!(
-        body["hourly"]["precipitation_probability"][7].is_null(),
+        body["hourly"]["precipitation_probability"][9].is_null(),
         "an hour missing from both ensemble products must not be synthesized as 0%"
     );
 }
@@ -1683,7 +1682,7 @@ async fn gfs_precipitation_probability_interpolates_across_newer_run_overlays() 
         false,
     );
     let previous = "ncep_gefs025_probability_previous";
-    write_product_coverage_timed(
+    write_product_coverage_timed_with_source_run(
         root.path(),
         "ncep_gefs025",
         previous,
@@ -1710,9 +1709,11 @@ async fn gfs_precipitation_probability_interpolates_across_newer_run_overlays() 
             },
         ],
         false,
+        "2026070718",
+        true,
     );
     let current = "ncep_gefs025_probability_current";
-    write_product_coverage_timed(
+    write_product_coverage_timed_with_source_run(
         root.path(),
         "ncep_gefs025",
         current,
@@ -1734,6 +1735,8 @@ async fn gfs_precipitation_probability_interpolates_across_newer_run_overlays() 
             },
         ],
         false,
+        "2026070800",
+        true,
     );
     write_group_release(
         root.path(),

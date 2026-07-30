@@ -144,7 +144,9 @@ def _coverage_bundle_entry(
         ),
         "interpolation_support": bool(object_record.get("interpolation_support")),
         "source_url": source_url,
-        "selection_ranges": bundle["selection_ranges"],
+        "selection_ranges": bundle.get(
+            "manifest_selection_ranges", bundle["selection_ranges"]
+        ),
         "array": bundle["array"],
         "lut_byte_ranges": bundle["lut_byte_ranges"],
         "data_byte_ranges": bundle["data_byte_ranges"],
@@ -152,6 +154,11 @@ def _coverage_bundle_entry(
         "byte_ranges": [item.as_manifest() for item in byte_ranges],
         "bundle_offset": bundle_offset,
         "bundle_bytes": bundle_bytes,
+        **(
+            {"native_time_index": int(object_record["native_time_index"])}
+            if object_record.get("native_time_index") is not None
+            else {}
+        ),
     }
 
 

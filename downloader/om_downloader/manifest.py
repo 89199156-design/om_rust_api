@@ -79,6 +79,7 @@ def product_config_fingerprint(product: ProductConfig) -> str:
         "history_hours": product.history_hours,
         "timezone_anchors": list(product.timezone_anchors),
         "coverage_strategy": product.coverage_strategy,
+        "source_mode": product.source_mode,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -116,6 +117,7 @@ def build_latest_manifest(
         "forecast_hour_start": product.forecast_hour_start,
         "forecast_hour_end": product.forecast_hour_end,
         "coverage_strategy": product.coverage_strategy,
+        "source_mode": product.source_mode,
         "latest_complete_run": plan.latest_complete_run,
         "valid_time_count": len(plan.slots),
         "timezone_anchors": list(product.timezone_anchors),

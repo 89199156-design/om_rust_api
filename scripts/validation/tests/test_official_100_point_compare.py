@@ -53,7 +53,13 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertTrue(expected.issubset(compare.ECMWF_DAILY))
 
     def test_cams_scope_excludes_local_only_chinese_and_daily_outputs(self) -> None:
-        self.assertEqual(compare.CAMS_HOURLY_LOCAL, compare.CAMS_HOURLY_OFFICIAL)
+        self.assertEqual(compare.CAMS_HOURLY_LOCAL, compare.CAMS_RAW)
+        self.assertTrue(
+            set(compare.CAMS_HOURLY_LOCAL).issubset(compare.CAMS_HOURLY_OFFICIAL)
+        )
+        self.assertTrue(
+            set(compare.CAMS_OFFICIAL_DERIVED).isdisjoint(compare.CAMS_HOURLY_LOCAL)
+        )
         self.assertEqual(compare.CAMS_DAILY, ())
         self.assertNotIn("chinese_aqi", compare.CAMS_HOURLY_LOCAL)
 
@@ -89,7 +95,7 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertIn("precipitation_probability", payload["hourly"])
         self.assertIn("precipitation_probability_max", payload["daily"])
 
-    def test_local_request_plan_chunks_hourly_and_daily_separately(self) -> None:
+    def test_local_request_plan_pairs_hourly_and_daily_chunks(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
         compare.MODEL_SPECS["gfs"] = {
             **original,
@@ -104,18 +110,21 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertEqual(
             plan,
             [
-                {"period": "hourly", "variables": ("h1", "h2")},
-                {"period": "hourly", "variables": ("h3",)},
-                {"period": "daily", "variables": ("d1", "d2")},
+                {"hourly": ("h1", "h2"), "daily": ("d1", "d2")},
+                {"hourly": ("h3",), "daily": ()},
             ],
         )
 
     def test_default_plan_coalesces_each_model_period_without_parallelism(self) -> None:
         for model in ("gfs", "ec"):
             plan = compare.request_plan(model, compare.DEFAULT_FIELD_CHUNK_SIZE)
-            self.assertEqual([part["period"] for part in plan], ["hourly", "daily"])
+            self.assertEqual(len(plan), 1)
+            self.assertTrue(plan[0]["hourly"])
+            self.assertTrue(plan[0]["daily"])
         cams_plan = compare.request_plan("cams", compare.DEFAULT_FIELD_CHUNK_SIZE)
-        self.assertEqual([part["period"] for part in cams_plan], ["hourly"])
+        self.assertEqual(len(cams_plan), 1)
+        self.assertTrue(cams_plan[0]["hourly"])
+        self.assertEqual(cams_plan[0]["daily"], ())
 
     def test_progress_estimate_reports_live_eta(self) -> None:
         report: dict[str, object] = {}
@@ -125,12 +134,28 @@ class Official100PointCompareTests(unittest.TestCase):
                 started_monotonic=100.0,
                 request_units_completed=2,
                 request_units_total=10,
+                timed_request_units_completed=2,
             )
         self.assertEqual(report["elapsed_seconds"], 10.0)
         self.assertEqual(report["estimated_remaining_seconds"], 40.0)
         self.assertEqual(report["request_units_completed"], 2)
         self.assertEqual(report["request_units_total"], 10)
+        self.assertEqual(report["request_units_reused"], 0)
         self.assertIsNotNone(report["estimated_finish_at"])
+
+    def test_progress_estimate_excludes_reused_receipts_from_throughput(self) -> None:
+        report: dict[str, object] = {}
+        with mock.patch.object(compare.time, "monotonic", return_value=110.0):
+            compare.update_progress_estimate(
+                report,
+                started_monotonic=100.0,
+                request_units_completed=6,
+                request_units_total=10,
+                timed_request_units_completed=1,
+            )
+        self.assertEqual(report["request_units_reused"], 5)
+        self.assertEqual(report["request_units_executed_this_attempt"], 1)
+        self.assertEqual(report["estimated_remaining_seconds"], 40.0)
 
     def test_official_snapshot_rows_are_streamed_from_top_level_array(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -187,7 +212,7 @@ class Official100PointCompareTests(unittest.TestCase):
             compare.sample_points()[0],
             hourly=(),
             daily=("temperature_2m_max",),
-            time_range=("2026-07-29", "2026-08-12"),
+            daily_time_range=("2026-07-29", "2026-08-12"),
         )
 
         self.assertIn("start_date=2026-07-29", url)
@@ -435,7 +460,7 @@ class Official100PointCompareTests(unittest.TestCase):
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
-    def test_validate_model_uses_separate_attempt_scoped_field_chunks(self) -> None:
+    def test_validate_model_uses_paired_attempt_scoped_field_chunks(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
         compare.MODEL_SPECS["gfs"] = {
             **original,
@@ -451,12 +476,15 @@ class Official100PointCompareTests(unittest.TestCase):
 
         def fake_request(_method, url, **_kwargs):
             if "hourly=h1" in url:
-                value = {"hourly": {"time": ["h"], "h1": [1]}}
+                self.assertIn("daily=d1", url)
+                value = {
+                    "hourly": {"time": ["h"], "h1": [1]},
+                    "daily": {"time": ["d"], "d1": [3]},
+                }
             elif "hourly=h2" in url:
                 value = {"hourly": {"time": ["h"], "h2": [2]}}
             else:
-                self.assertIn("daily=d1", url)
-                value = {"daily": {"time": ["d"], "d1": [3]}}
+                self.fail(f"unexpected URL: {url}")
             return compare.canonical_bytes(value), {}, 0.01
 
         try:
@@ -513,15 +541,15 @@ class Official100PointCompareTests(unittest.TestCase):
                     ).glob("*.json")
                 )
 
-            self.assertEqual(request.call_count, 3)
-            self.assertEqual(resource_guard.call_count, 3)
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(resource_guard.call_count, 2)
             self.assertEqual(report["status"], "partial")
             self.assertEqual(report["points_target"], 1)
-            self.assertEqual(report["local_requests_per_point"], 3)
-            self.assertEqual(report["local_requests_completed"], 3)
-            self.assertEqual(receipt["local_request_count"], 3)
-            self.assertEqual(len(receipt["local_response_parts"]), 3)
-            self.assertEqual(len(local_parts), 3)
+            self.assertEqual(report["local_requests_per_point"], 2)
+            self.assertEqual(report["local_requests_completed"], 2)
+            self.assertEqual(receipt["local_request_count"], 2)
+            self.assertEqual(len(receipt["local_response_parts"]), 2)
+            self.assertEqual(len(local_parts), 2)
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
