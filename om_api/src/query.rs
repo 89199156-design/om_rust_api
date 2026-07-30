@@ -6244,7 +6244,7 @@ fn ecmwf_second_stage_value(
     longitude: f32,
     output_dt_seconds: i64,
 ) -> f32 {
-    ecmwf_second_stage_value_with_terminal_hold(
+    ecmwf_second_stage_value_with_terminal_extension(
         values,
         regular_times,
         kind,
@@ -6257,7 +6257,7 @@ fn ecmwf_second_stage_value(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn ecmwf_second_stage_value_with_terminal_hold(
+fn ecmwf_second_stage_value_with_terminal_extension(
     values: &[f32],
     regular_times: &[DateTime<Utc>],
     kind: InterpolationKind,
@@ -6265,7 +6265,7 @@ fn ecmwf_second_stage_value_with_terminal_hold(
     latitude: f32,
     longitude: f32,
     output_dt_seconds: i64,
-    hold_terminal_interval: bool,
+    extend_terminal_interval: bool,
 ) -> f32 {
     if values.is_empty() || regular_times.is_empty() || time < regular_times[0] {
         return f32::NAN;
@@ -6278,22 +6278,30 @@ fn ecmwf_second_stage_value_with_terminal_hold(
         .unwrap_or(3 * 3600);
     let last_time = regular_times[regular_times.len() - 1];
     if time > last_time {
-        if !hold_terminal_interval || time >= last_time + Duration::seconds(regular_dt_seconds) {
+        if !extend_terminal_interval || time >= last_time + Duration::seconds(regular_dt_seconds) {
             return f32::NAN;
         }
-        let value = values.last().copied().unwrap_or(f32::NAN);
-        if !value.is_finite() {
-            return f32::NAN;
+        // Open-Meteo still evaluates the final Hermite interval with the
+        // missing C/D control points replaced by B. A flat or gently changing
+        // tail can look like a constant hold, but a steep final slope may
+        // legitimately round to a different published integer.
+        if matches!(kind, InterpolationKind::Hermite { .. }) {
+            // Continue into the normal Hermite branch below.
+        } else {
+            let value = values.last().copied().unwrap_or(f32::NAN);
+            if !value.is_finite() {
+                return f32::NAN;
+            }
+            let scalefactor = match kind {
+                InterpolationKind::Direct => 1.0,
+                InterpolationKind::BackwardsSum { scalefactor }
+                | InterpolationKind::Backwards { scalefactor }
+                | InterpolationKind::Linear { scalefactor }
+                | InterpolationKind::Hermite { scalefactor, .. }
+                | InterpolationKind::SolarBackwardsAveraged { scalefactor } => scalefactor,
+            };
+            return round_to_scalefactor(value, scalefactor);
         }
-        let scalefactor = match kind {
-            InterpolationKind::Direct => 1.0,
-            InterpolationKind::BackwardsSum { scalefactor }
-            | InterpolationKind::Backwards { scalefactor }
-            | InterpolationKind::Linear { scalefactor }
-            | InterpolationKind::Hermite { scalefactor, .. }
-            | InterpolationKind::SolarBackwardsAveraged { scalefactor } => scalefactor,
-        };
-        return round_to_scalefactor(value, scalefactor);
     }
     let elapsed = (time - regular_times[0]).num_seconds();
     // A request on the native regular axis is a database read, not another
@@ -6561,7 +6569,7 @@ fn read_ecmwf_product_grid_series(
             .map(|frame| frame[point])
             .collect::<Vec<_>>();
         for (output_frame, time) in output.iter_mut().zip(times) {
-            output_frame[point] = ecmwf_second_stage_value_with_terminal_hold(
+            output_frame[point] = ecmwf_second_stage_value_with_terminal_extension(
                 &values,
                 regular_times,
                 kind,
@@ -10384,7 +10392,7 @@ mod tests {
     }
 
     #[test]
-    fn ecmwf_probability_holds_last_native_value_until_next_regular_frame() {
+    fn ecmwf_probability_extends_the_final_hermite_interval() {
         let start = Utc.with_ymd_and_hms(2026, 8, 12, 9, 0, 0).unwrap();
         let kind = InterpolationKind::Hermite {
             scalefactor: 1.0,
@@ -10393,8 +10401,8 @@ mod tests {
         let values = vec![60.0, 57.0];
         let times = vec![start, start + Duration::hours(3)];
 
-        let value_at = |hours, hold_terminal_interval| {
-            ecmwf_second_stage_value_with_terminal_hold(
+        let value_at = |hours, extend_terminal_interval| {
+            ecmwf_second_stage_value_with_terminal_extension(
                 &values,
                 &times,
                 kind,
@@ -10402,7 +10410,7 @@ mod tests {
                 20.0,
                 134.0,
                 3600,
-                hold_terminal_interval,
+                extend_terminal_interval,
             )
         };
 
@@ -10411,6 +10419,34 @@ mod tests {
         assert_eq!(value_at(5, true), 57.0);
         assert!(value_at(6, true).is_nan());
         assert!(value_at(4, false).is_nan());
+
+        let rising = vec![26.0, 45.0];
+        assert_eq!(
+            ecmwf_second_stage_value_with_terminal_extension(
+                &rising,
+                &times,
+                kind,
+                start + Duration::hours(4),
+                34.0,
+                76.0,
+                3600,
+                true,
+            ),
+            46.0
+        );
+        assert_eq!(
+            ecmwf_second_stage_value_with_terminal_extension(
+                &rising,
+                &times,
+                kind,
+                start + Duration::hours(5),
+                34.0,
+                76.0,
+                3600,
+                true,
+            ),
+            46.0
+        );
     }
 
     #[test]
