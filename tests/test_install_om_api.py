@@ -96,6 +96,15 @@ class InstallOmApiTests(unittest.TestCase):
         self.assertIn("ExecReload=/bin/kill -HUP \\$MAINPID", self.content)
         self.assertIn("ProtectSystem=full", self.content)
         self.assertIn("ReadOnlyPaths=$DATA_ROOT", self.content)
+        self.assertIn(
+            'CONFIGURE_HOST_NGINX="${OM_API_CONFIGURE_HOST_NGINX:-auto}"',
+            self.content,
+        )
+        self.assertIn('echo "host_nginx=skipped"', self.content)
+        self.assertIn(
+            'if [ "$configure_host_nginx" = true ]; then',
+            self.content,
+        )
         nginx_content = (
             REPOSITORY_ROOT / "nginx" / "om_client_api.conf"
         ).read_text(encoding="utf-8")
@@ -477,6 +486,28 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
         self.assertEqual(result.returncode, 2)
         self.assertIn(
             "OM_API_CARGO_TARGET_DIR must be an absolute path: relative-target",
+            result.stderr,
+        )
+
+    @unittest.skipUnless(
+        POSIX_DEPLOY_TESTS_AVAILABLE,
+        "requires a POSIX deployment shell",
+    )
+    def test_installer_rejects_an_invalid_host_nginx_mode(self) -> None:
+        environment = os.environ.copy()
+        environment["OM_API_CONFIGURE_HOST_NGINX"] = "sometimes"
+        result = subprocess.run(
+            ["bash", str(INSTALL_SCRIPT), "/tmp/weather-om-api-unused"],
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "OM_API_CONFIGURE_HOST_NGINX must be auto, 0, or 1: sometimes",
             result.stderr,
         )
 

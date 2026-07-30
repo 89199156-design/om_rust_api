@@ -9,6 +9,8 @@ INSTALL_OWNER="${OM_API_USER:-ubuntu}"
 API_DEM_ROOT="${OM_API_DEM_ROOT:-$INSTALL_DIR/static}"
 MODEL_STATIC_ROOT="${OM_API_MODEL_STATIC_ROOT:-$INSTALL_DIR}"
 STRICT_DATA_ROOT="${OM_STRICT_DATA_ROOT:-}"
+CONFIGURE_HOST_NGINX="${OM_API_CONFIGURE_HOST_NGINX:-auto}"
+HOST_NGINX_ROOT="${OM_API_HOST_NGINX_ROOT:-/etc/nginx}"
 DEM_LATITUDE_CHUNK_MIN=0
 DEM_LATITUDE_CHUNK_MAX=58
 GFS013_STATIC_URL="${OM_GFS013_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ncep_gfs013/static/HSURF.om}"
@@ -46,6 +48,29 @@ fi
 if [[ "$MODEL_STATIC_ROOT" != /* ]]; then
   echo "OM_API_MODEL_STATIC_ROOT must be an absolute path: $MODEL_STATIC_ROOT" >&2
   exit 2
+fi
+if [[ "$HOST_NGINX_ROOT" != /* ]]; then
+  echo "OM_API_HOST_NGINX_ROOT must be an absolute path: $HOST_NGINX_ROOT" >&2
+  exit 2
+fi
+case "$CONFIGURE_HOST_NGINX" in
+  auto|0|1) ;;
+  *)
+    echo "OM_API_CONFIGURE_HOST_NGINX must be auto, 0, or 1: $CONFIGURE_HOST_NGINX" >&2
+    exit 2
+    ;;
+esac
+configure_host_nginx=false
+if [ "$CONFIGURE_HOST_NGINX" = "1" ]; then
+  if [ ! -d "$HOST_NGINX_ROOT" ] || ! command -v nginx >/dev/null 2>&1; then
+    echo "host Nginx was explicitly requested but is unavailable: $HOST_NGINX_ROOT" >&2
+    exit 1
+  fi
+  configure_host_nginx=true
+elif [ "$CONFIGURE_HOST_NGINX" = "auto" ] \
+  && [ -d "$HOST_NGINX_ROOT" ] \
+  && command -v nginx >/dev/null 2>&1; then
+  configure_host_nginx=true
 fi
 if [ -n "$STRICT_DATA_ROOT" ]; then
   if ! mountpoint -q -- "$STRICT_DATA_ROOT"; then
@@ -476,10 +501,17 @@ ReadOnlyPaths=$MODEL_STATIC_ROOT/static
 WantedBy=multi-user.target
 EOF
 
-$SUDO install -m 0644 "$APP_ROOT/nginx/om_client_api.conf" /etc/nginx/snippets/om_client_api.conf
+if [ "$configure_host_nginx" = true ]; then
+  $SUDO install -d -m 0755 \
+    "$HOST_NGINX_ROOT/snippets" \
+    "$HOST_NGINX_ROOT/sites-available" \
+    "$HOST_NGINX_ROOT/sites-enabled"
+  $SUDO install -m 0644 \
+    "$APP_ROOT/nginx/om_client_api.conf" \
+    "$HOST_NGINX_ROOT/snippets/om_client_api.conf"
 
-if [ ! -e /etc/nginx/sites-enabled/om-client-api ]; then
-  $SUDO tee /etc/nginx/sites-available/om-client-api >/dev/null <<'EOF'
+  if [ ! -e "$HOST_NGINX_ROOT/sites-enabled/om-client-api" ]; then
+    $SUDO tee "$HOST_NGINX_ROOT/sites-available/om-client-api" >/dev/null <<'EOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
@@ -492,14 +524,21 @@ server {
     }
 }
 EOF
-  $SUDO ln -s /etc/nginx/sites-available/om-client-api /etc/nginx/sites-enabled/om-client-api
+    $SUDO ln -s \
+      "$HOST_NGINX_ROOT/sites-available/om-client-api" \
+      "$HOST_NGINX_ROOT/sites-enabled/om-client-api"
+  fi
+else
+  echo "host_nginx=skipped"
 fi
 
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE_NAME"
 $SUDO systemctl restart "$SERVICE_NAME"
-$SUDO nginx -t
-$SUDO systemctl reload nginx
+if [ "$configure_host_nginx" = true ]; then
+  $SUDO nginx -t
+  $SUDO systemctl reload nginx
+fi
 
 echo "installed=$INSTALL_DIR"
 echo "service=$SERVICE_NAME"
