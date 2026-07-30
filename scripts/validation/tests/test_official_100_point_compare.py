@@ -124,6 +124,20 @@ class Official100PointCompareTests(unittest.TestCase):
         )
         self.assertNotIn("daily=", url)
 
+    def test_local_url_freezes_saved_daily_snapshot_range(self) -> None:
+        url = compare.local_url(
+            "http://127.0.0.1:8088",
+            "ec",
+            compare.sample_points()[0],
+            hourly=(),
+            daily=("temperature_2m_max",),
+            time_range=("2026-07-29", "2026-08-12"),
+        )
+
+        self.assertIn("start_date=2026-07-29", url)
+        self.assertIn("end_date=2026-08-12", url)
+        self.assertNotIn("forecast_days=", url)
+
     def test_resource_guard_refuses_a_third_local_api(self) -> None:
         with (
             mock.patch.object(compare, "local_om_api_process_count", return_value=3),

@@ -6234,6 +6234,7 @@ fn ecmwf_regularize_source_run(
     }))
 }
 
+#[cfg(test)]
 fn ecmwf_second_stage_value(
     values: &[f32],
     regular_times: &[DateTime<Utc>],
@@ -6243,17 +6244,58 @@ fn ecmwf_second_stage_value(
     longitude: f32,
     output_dt_seconds: i64,
 ) -> f32 {
-    if values.is_empty() || time < regular_times[0] || time > regular_times[regular_times.len() - 1]
-    {
+    ecmwf_second_stage_value_with_terminal_hold(
+        values,
+        regular_times,
+        kind,
+        time,
+        latitude,
+        longitude,
+        output_dt_seconds,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ecmwf_second_stage_value_with_terminal_hold(
+    values: &[f32],
+    regular_times: &[DateTime<Utc>],
+    kind: InterpolationKind,
+    time: DateTime<Utc>,
+    latitude: f32,
+    longitude: f32,
+    output_dt_seconds: i64,
+    hold_terminal_interval: bool,
+) -> f32 {
+    if values.is_empty() || regular_times.is_empty() || time < regular_times[0] {
         return f32::NAN;
     }
-    let elapsed = (time - regular_times[0]).num_seconds();
     let output_dt_seconds = output_dt_seconds.max(1);
     let regular_dt_seconds = regular_times
         .windows(2)
         .map(|pair| (pair[1] - pair[0]).num_seconds())
         .find(|seconds| *seconds > 0)
         .unwrap_or(3 * 3600);
+    let last_time = regular_times[regular_times.len() - 1];
+    if time > last_time {
+        if !hold_terminal_interval || time >= last_time + Duration::seconds(regular_dt_seconds) {
+            return f32::NAN;
+        }
+        let value = values.last().copied().unwrap_or(f32::NAN);
+        if !value.is_finite() {
+            return f32::NAN;
+        }
+        let scalefactor = match kind {
+            InterpolationKind::Direct => 1.0,
+            InterpolationKind::BackwardsSum { scalefactor }
+            | InterpolationKind::Backwards { scalefactor }
+            | InterpolationKind::Linear { scalefactor }
+            | InterpolationKind::Hermite { scalefactor, .. }
+            | InterpolationKind::SolarBackwardsAveraged { scalefactor } => scalefactor,
+        };
+        return round_to_scalefactor(value, scalefactor);
+    }
+    let elapsed = (time - regular_times[0]).num_seconds();
     // A request on the native regular axis is a database read, not another
     // interpolation pass. Re-running solar interpolation at a low-angle
     // native frame can replace a valid 1 W/m² value with the neighbouring
@@ -6519,7 +6561,7 @@ fn read_ecmwf_product_grid_series(
             .map(|frame| frame[point])
             .collect::<Vec<_>>();
         for (output_frame, time) in output.iter_mut().zip(times) {
-            output_frame[point] = ecmwf_second_stage_value(
+            output_frame[point] = ecmwf_second_stage_value_with_terminal_hold(
                 &values,
                 regular_times,
                 kind,
@@ -6527,6 +6569,8 @@ fn read_ecmwf_product_grid_series(
                 latitudes[point / width] as f32,
                 longitudes[point % width] as f32,
                 output_dt_seconds,
+                product.product == "ecmwf_ifs025_ensemble"
+                    && raw_variable == "precipitation_probability",
             );
         }
     }
@@ -6550,9 +6594,19 @@ fn ecmwf_coverage_is_full(coverage_plan: &[CoveragePlanEntry]) -> bool {
         .is_some_and(|(first, last)| last - first > Duration::hours(6))
 }
 
-fn ecmwf_snapshot_covers_time(product: &ProductSnapshot, time: DateTime<Utc>) -> bool {
-    ecmwf_coverage_bounds(&product.manifest.coverage_plan)
-        .is_some_and(|(first, last)| time >= first && time <= last)
+fn ecmwf_snapshot_covers_time(
+    product: &ProductSnapshot,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+) -> bool {
+    ecmwf_coverage_bounds(&product.manifest.coverage_plan).is_some_and(|(first, last)| {
+        if product.product == "ecmwf_ifs025_ensemble" && raw_variable == "precipitation_probability"
+        {
+            time >= first && time < last + Duration::hours(3)
+        } else {
+            time >= first && time <= last
+        }
+    })
 }
 
 fn fill_nan_from_fallback(values: &mut [f32], fallback: &[f32]) {
@@ -6582,7 +6636,7 @@ fn read_ecmwf_window_grid_series(
         .map(|time| {
             products
                 .iter()
-                .position(|product| ecmwf_snapshot_covers_time(product, *time))
+                .position(|product| ecmwf_snapshot_covers_time(product, raw_variable, *time))
         })
         .collect::<Vec<_>>();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
@@ -6631,7 +6685,11 @@ fn read_ecmwf_window_grid_series(
             }
             full_products.iter().copied().find(|candidate| {
                 Some(*candidate) != *selected
-                    && ecmwf_snapshot_covers_time(&products[*candidate], times[time_index])
+                    && ecmwf_snapshot_covers_time(
+                        &products[*candidate],
+                        raw_variable,
+                        times[time_index],
+                    )
             })
         })
         .collect::<Vec<_>>();
@@ -10323,6 +10381,36 @@ mod tests {
         );
 
         assert_eq!(hour_88, 6.7);
+    }
+
+    #[test]
+    fn ecmwf_probability_holds_last_native_value_until_next_regular_frame() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 12, 9, 0, 0).unwrap();
+        let kind = InterpolationKind::Hermite {
+            scalefactor: 1.0,
+            bounds: Some((0.0, 100.0)),
+        };
+        let values = vec![60.0, 57.0];
+        let times = vec![start, start + Duration::hours(3)];
+
+        let value_at = |hours, hold_terminal_interval| {
+            ecmwf_second_stage_value_with_terminal_hold(
+                &values,
+                &times,
+                kind,
+                start + Duration::hours(hours),
+                20.0,
+                134.0,
+                3600,
+                hold_terminal_interval,
+            )
+        };
+
+        assert_eq!(value_at(3, true), 57.0);
+        assert_eq!(value_at(4, true), 57.0);
+        assert_eq!(value_at(5, true), 57.0);
+        assert!(value_at(6, true).is_nan());
+        assert!(value_at(4, false).is_nan());
     }
 
     #[test]

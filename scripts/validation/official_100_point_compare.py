@@ -742,6 +742,7 @@ def local_url(
     *,
     hourly: tuple[str, ...] | None = None,
     daily: tuple[str, ...] | None = None,
+    time_range: tuple[str, str] | None = None,
 ) -> str:
     spec = MODEL_SPECS[model]
     if hourly is None and daily is None:
@@ -750,11 +751,18 @@ def local_url(
     params: dict[str, Any] = {
         "latitude": f"{point['latitude']:.4f}",
         "longitude": f"{point['longitude']:.4f}",
-        "forecast_days": str(spec["forecast_days"]),
         "timezone": "GMT",
         "timeformat": "iso8601",
         "cell_selection": "nearest",
     }
+    if time_range is None:
+        params["forecast_days"] = str(spec["forecast_days"])
+    elif hourly:
+        params["start_hour"], params["end_hour"] = time_range
+    elif daily:
+        params["start_date"], params["end_date"] = time_range
+    else:
+        raise ValidationError("an explicit local time range requires one response period")
     if hourly:
         params["hourly"] = ",".join(hourly)
     if daily:
@@ -1237,6 +1245,17 @@ def validate_model(
         for request_index, request_part in enumerate(plan):
             period = request_part["period"]
             variables = request_part["variables"]
+            official_period = official.get(period)
+            official_times = (
+                official_period.get("time")
+                if isinstance(official_period, dict)
+                else None
+            )
+            if not isinstance(official_times, list) or not official_times:
+                raise ValidationError(
+                    f"official {model} point {point['id']} has no {period} time axis"
+                )
+            time_range = (str(official_times[0]), str(official_times[-1]))
             resource_snapshot = wait_for_safe_local_resources(
                 local_base=local_base,
                 min_available_memory_mib=min_available_memory_mib,
@@ -1245,11 +1264,21 @@ def validate_model(
                 wait_timeout_seconds=resource_wait_timeout_seconds,
                 poll_seconds=resource_poll_seconds,
             )
+            url = local_url(
+                local_base,
+                model,
+                point,
+                hourly=variables if period == "hourly" else (),
+                daily=variables if period == "daily" else (),
+                time_range=time_range,
+            )
             report["current_request"] = {
                 "index": request_index,
                 "count": len(plan),
                 "period": period,
                 "variables": list(variables),
+                "time_range": list(time_range),
+                "local_url": url,
                 "resources": resource_snapshot,
             }
             write_json(report_path, report)
@@ -1264,13 +1293,6 @@ def validate_model(
                     ensure_ascii=False,
                 ),
                 flush=True,
-            )
-            url = local_url(
-                local_base,
-                model,
-                point,
-                hourly=variables if period == "hourly" else (),
-                daily=variables if period == "daily" else (),
             )
             raw, headers, elapsed = request_json(
                 "GET",
