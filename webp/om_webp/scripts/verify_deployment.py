@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import subprocess
 from pathlib import Path
 
-APP = Path("/opt/1panel/apps/weather_om_webp")
-RAW = Path("/data/om_raw")
-WEBP = Path("/data/om_webp")
-PUBLIC = Path("/opt/1panel/apps/weather/data")
 EXPECTED = {
     "gfs": {
         "ready_group": "gfs",
@@ -42,27 +40,83 @@ EXPECTED = {
 }
 
 
+def absolute_path(value: str) -> Path:
+    path = Path(value)
+    # The deployment target is Linux, while this repository is also tested
+    # from Windows workstations where pathlib does not classify "/opt/..." as
+    # absolute. Keep the CLI contract explicitly POSIX.
+    if not value.startswith("/"):
+        raise argparse.ArgumentTypeError(f"path must be absolute: {value}")
+    return path
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Verify immutable OM-to-WebP production deployments."
+    )
+    parser.add_argument(
+        "--app-root",
+        type=absolute_path,
+        default=absolute_path(
+            os.environ.get("OM_WEBP_APP_ROOT", "/opt/1panel/apps/weather_om_webp")
+        ),
+    )
+    parser.add_argument(
+        "--raw-root",
+        type=absolute_path,
+        default=absolute_path(os.environ.get("OM_DATA_ROOT", "/data/om_raw")),
+    )
+    parser.add_argument(
+        "--webp-root",
+        type=absolute_path,
+        default=absolute_path(
+            os.environ.get("OM_WEBP_DATA_ROOT", "/data/om_webp")
+        ),
+    )
+    parser.add_argument(
+        "--public-root",
+        type=absolute_path,
+        default=absolute_path(
+            os.environ.get(
+                "OM_WEBP_PUBLIC_ROOT",
+                "/opt/1panel/apps/weather/data",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--scope",
+        action="append",
+        choices=tuple(EXPECTED),
+        dest="scopes",
+        help="verify only this scope; repeat for multiple scopes (default: all)",
+    )
+    args = parser.parse_args(argv)
+    args.scopes = tuple(dict.fromkeys(args.scopes or EXPECTED))
+    return args
+
+
 def load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def main() -> None:
+def verify(args: argparse.Namespace) -> dict[str, object]:
     report: dict[str, object] = {"status": "success", "groups": {}}
-    catalog = load(PUBLIC / "weather_layer_catalog.json")
-    for group, expected in EXPECTED.items():
+    catalog = load(args.public_root / "weather_layer_catalog.json")
+    for group in args.scopes:
+        expected = EXPECTED[group]
         ready = load(
-            RAW
+            args.raw_root
             / "groups"
             / expected["ready_group"]
             / "current"
             / "ready_for_processing.json"
         )
-        marker = load(WEBP / "current" / f"{group}.json")
+        marker = load(args.webp_root / "current" / f"{group}.json")
         assert ready["status"] == "complete"
         assert marker["status"] == "complete"
         assert marker["release_id"] == ready["release_id"]
         assert marker["run"] == ready["latest_complete_run"]
-        product_link = PUBLIC / expected["product"]
+        product_link = args.public_root / expected["product"]
         assert product_link.is_symlink()
         product_root = product_link.resolve(strict=True)
         assert product_root.parent == Path(marker["path"]).resolve(strict=True)
@@ -92,7 +146,14 @@ def main() -> None:
         sample = next((product_root / sorted(expected["layers"])[0]).glob("*.webp"))
         inspected = json.loads(
             subprocess.check_output(
-                [str(APP / "bin" / "om-webp-inspect"), str(sample), "--x", "0", "--y", "0"],
+                [
+                    str(args.app_root / "bin" / "om-webp-inspect"),
+                    str(sample),
+                    "--x",
+                    "0",
+                    "--y",
+                    "0",
+                ],
                 text=True,
             )
         )
@@ -105,9 +166,14 @@ def main() -> None:
             "webp_files": sum(layer_counts.values()),
             "public_target": str(product_root),
         }
-    staging = WEBP / "staging"
+    staging = args.webp_root / "staging"
     report["staging_entries"] = len(list(staging.iterdir())) if staging.exists() else 0
     assert report["staging_entries"] == 0
+    return report
+
+
+def main(argv: list[str] | None = None) -> None:
+    report = verify(parse_args(argv))
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 

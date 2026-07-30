@@ -64,6 +64,12 @@ renderer never mutates `OM_DATA_ROOT`.
 
 ```bash
 python3 /opt/1panel/apps/weather_om_webp/scripts/verify_deployment.py
+# Split-disk deployment or one-model post-publish verification:
+python3 /opt/1panel/apps/weather_om_webp/scripts/verify_deployment.py \
+  --raw-root /opt/1panel/apps/weather_forecast_server/data/om_producer \
+  --webp-root /opt/1panel/apps/weather_om_webp/data \
+  --public-root /opt/1panel/apps/weather/data \
+  --scope gfs
 /opt/1panel/apps/weather_om_webp/bin/om-grid-verify \
   --scope gfs \
   --data-root /data/om_raw \
