@@ -513,23 +513,28 @@ def _with_interpolation_support_records(
         return records
 
     runs_by_id = {run.run_id: run for run in runs}
-    selected_bounds: dict[str, tuple[datetime, datetime]] = {}
-    for slot in plan.slots:
+    selected_spans: list[tuple[str, datetime, datetime]] = []
+    current_run: str | None = None
+    first_selected: datetime | None = None
+    last_selected: datetime | None = None
+    for slot in sorted(plan.slots, key=lambda item: _as_utc(item.valid_time_utc)):
         valid_time = _as_utc(slot.valid_time_utc)
-        first_selected, last_selected = selected_bounds.get(
-            slot.source_run,
-            (valid_time, valid_time),
-        )
-        selected_bounds[slot.source_run] = (
-            min(valid_time, first_selected),
-            max(valid_time, last_selected),
-        )
+        if current_run == slot.source_run:
+            last_selected = valid_time
+            continue
+        if current_run is not None and first_selected is not None and last_selected is not None:
+            selected_spans.append((current_run, first_selected, last_selected))
+        current_run = slot.source_run
+        first_selected = valid_time
+        last_selected = valid_time
+    if current_run is not None and first_selected is not None and last_selected is not None:
+        selected_spans.append((current_run, first_selected, last_selected))
     existing = {
         (str(record["source_run"]), _parse_utc(str(record["valid_time_utc"])))
         for record in records
     }
     support: list[dict[str, Any]] = []
-    for run_id, (first_valid_time, last_valid_time) in selected_bounds.items():
+    for run_id, first_valid_time, last_valid_time in selected_spans:
         run = runs_by_id[run_id]
         support_start = first_valid_time - timedelta(
             hours=product.interpolation_support_hours
@@ -545,7 +550,11 @@ def _with_interpolation_support_records(
             if (run_id, valid_time) in existing:
                 continue
             forecast_hour = _forecast_hour_for_run(run, valid_time)
-            if forecast_hour is None:
+            if (
+                forecast_hour is None
+                or forecast_hour < product.forecast_hour_start
+                or forecast_hour > product.forecast_hour_end
+            ):
                 continue
             support.append(
                 {
@@ -563,6 +572,7 @@ def _with_interpolation_support_records(
                     ),
                 }
             )
+            existing.add((run_id, valid_time))
     support.sort(key=lambda item: (item["source_run"], item["valid_time_utc"]))
     return records + support
 

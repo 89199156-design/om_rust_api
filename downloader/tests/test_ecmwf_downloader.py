@@ -349,8 +349,12 @@ class EcmwfDownloaderTests(unittest.TestCase):
             ),
         ]
         short_end = short_base + timedelta(hours=144)
+        long_early_start = long_base + timedelta(hours=3)
         long_tail_start = long_base + timedelta(hours=156)
         selected = [
+            ("2026072812", long_early_start),
+            ("2026072812", long_early_start + timedelta(hours=3)),
+            ("2026072818", short_base + timedelta(hours=3)),
             ("2026072818", short_end - timedelta(hours=3)),
             ("2026072818", short_end),
             ("2026072812", long_tail_start),
@@ -394,6 +398,7 @@ class EcmwfDownloaderTests(unittest.TestCase):
         self.assertIn(("2026072812", "2026-08-03T12:00:00Z"), support)
         self.assertIn(("2026072812", "2026-08-03T18:00:00Z"), support)
         self.assertNotIn(("2026072812", "2026-08-03T06:00:00Z"), support)
+        self.assertNotIn(("2026072812", "2026-07-28T12:00:00Z"), support)
 
     def test_ecmwf_group_command_dispatches_frozen_reference_to_regular_release(self):
         with patch.object(
