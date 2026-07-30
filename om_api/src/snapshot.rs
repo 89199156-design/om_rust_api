@@ -83,14 +83,23 @@ impl OmDataSnapshot {
                 &mut historical_products,
             )?;
         }
-        load_group_products(&data_root, "ecmwf", ECMWF_PRODUCTS, &mut products)?;
-        load_group_release_history(
+        let ecmwf_native = load_native_group_products(
             &data_root,
             "ecmwf",
             ECMWF_PRODUCTS,
-            &products,
+            &mut products,
             &mut historical_products,
         )?;
+        if !ecmwf_native {
+            load_group_products(&data_root, "ecmwf", ECMWF_PRODUCTS, &mut products)?;
+            load_group_release_history(
+                &data_root,
+                "ecmwf",
+                ECMWF_PRODUCTS,
+                &products,
+                &mut historical_products,
+            )?;
+        }
         Ok(Self {
             data_root,
             products,

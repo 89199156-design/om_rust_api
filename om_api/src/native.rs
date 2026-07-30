@@ -48,6 +48,10 @@ struct NativeReady {
 struct NativeProductReady {
     runtime_domain: String,
     grid: NativeGridMetadata,
+    #[serde(default)]
+    source_runs: Vec<String>,
+    #[serde(default)]
+    source_run_max_forecast_hours: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,6 +293,23 @@ fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<
         (0..=max_forecast_hour.min(120))
             .chain((123..=max_forecast_hour).filter(|forecast_hour| forecast_hour % 3 == 0))
             .collect()
+    } else if runtime_domain == "ncep_gefs025" {
+        (3..=max_forecast_hour).step_by(3).collect()
+    } else if runtime_domain == "ncep_gefs05" {
+        (3..max_forecast_hour.min(240))
+            .step_by(3)
+            .chain((240..=max_forecast_hour).step_by(6))
+            .collect()
+    } else if runtime_domain.starts_with("ecmwf_ifs025") {
+        let start = if runtime_domain.ends_with("_ensemble") {
+            3
+        } else {
+            0
+        };
+        (start..=max_forecast_hour.min(144))
+            .filter(|forecast_hour| forecast_hour % 3 == 0)
+            .chain((150..=max_forecast_hour).filter(|forecast_hour| forecast_hour % 6 == 0))
+            .collect()
     } else if runtime_domain == "cams_global_greenhouse_gases" {
         (0..=max_forecast_hour).step_by(3).collect()
     } else {
@@ -320,21 +341,52 @@ fn validate_run_time_axis(
     Ok(())
 }
 
-fn run_horizon(ready: &NativeReady, product: &str, source_run: &str) -> Result<i64> {
-    if product == "cams_global_greenhouse_gases" {
-        return Ok(120);
+fn product_source_runs<'a>(
+    ready: &'a NativeReady,
+    product: &str,
+    product_ready: &'a NativeProductReady,
+) -> &'a [String] {
+    if !product_ready.source_runs.is_empty() {
+        return &product_ready.source_runs;
     }
-    let index = ready
-        .source_runs
+    if product == "cams_global_greenhouse_gases" {
+        return &ready.greenhouse_source_runs;
+    }
+    &ready.source_runs
+}
+
+fn run_horizon(
+    ready: &NativeReady,
+    product: &str,
+    product_ready: &NativeProductReady,
+    source_run: &str,
+) -> Result<i64> {
+    let source_runs = product_source_runs(ready, product, product_ready);
+    let index = source_runs
         .iter()
         .position(|run| run == source_run)
         .with_context(|| format!("source run is not declared by marker: {source_run}"))?;
-    if ready.group == "gfs" {
+    if !product_ready.source_run_max_forecast_hours.is_empty() {
+        return product_ready
+            .source_run_max_forecast_hours
+            .get(index)
+            .copied()
+            .context("native product has no horizon for source run");
+    }
+    if product == "cams_global_greenhouse_gases" {
+        return Ok(120);
+    }
+    if ready.group == "gfs" || ready.group == "ecmwf" {
         return ready
             .source_run_max_forecast_hours
             .get(index)
             .copied()
-            .context("GFS marker has no horizon for source run");
+            .with_context(|| {
+                format!(
+                    "{} marker has no horizon for source run",
+                    ready.group.to_uppercase()
+                )
+            });
     }
     Ok(120)
 }
@@ -398,7 +450,7 @@ fn attach_static_elevation(
 fn product_uses_static_elevation(product: &str) -> bool {
     matches!(
         product,
-        "gfs013_surface" | "gfs025" | "gfs_pressure_profile"
+        "gfs013_surface" | "gfs025" | "gfs_pressure_profile" | "ecmwf_ifs025"
     )
 }
 
@@ -426,7 +478,7 @@ fn load_native_product_run(
     validate_run_time_axis(
         &product_ready.runtime_domain,
         &meta,
-        run_horizon(ready, product, source_run)?,
+        run_horizon(ready, product, product_ready, source_run)?,
     )?;
 
     let mut entries = HashMap::new();
@@ -551,9 +603,12 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
             ready.group
         );
     }
-    let (expected_runs, cadence_hours) = match group {
-        "gfs" => (5, 6),
-        "cams" => (3, 12),
+    let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
+        "gfs" => (5, &[6, 6, 6, 6]),
+        "cams" => (3, &[12, 12]),
+        // ECMWF deterministic imports retain three preceding 6-hour cycles,
+        // the previous long 00/12 cycle, and the target long cycle.
+        "ecmwf" => (5, &[6, 6, 6, 12]),
         _ => bail!("unsupported native group: {group}"),
     };
     if ready.source_runs.len() != expected_runs {
@@ -566,9 +621,10 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     if parsed
         .windows(2)
-        .any(|pair| pair[1] - pair[0] != Duration::hours(cadence_hours))
+        .zip(expected_cadence_hours)
+        .any(|(pair, cadence_hours)| pair[1] - pair[0] != Duration::hours(*cadence_hours))
     {
-        bail!("native {group} source runs are not consecutive");
+        bail!("native {group} source runs do not match the retained cadence");
     }
     if ready.source_runs.last() != Some(&ready.latest_complete_run) {
         bail!("native latest_complete_run is not the final source run");
@@ -582,6 +638,13 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
             || ready.source_run_max_forecast_hours != [5, 5, 5, 384, 384])
     {
         bail!("native GFS marker must declare three short and two complete runs");
+    }
+    if group == "ecmwf"
+        && (ready.short_run_count != Some(3)
+            || ready.full_run_count != Some(2)
+            || ready.source_run_max_forecast_hours != [6, 6, 6, 360, 360])
+    {
+        bail!("native ECMWF marker must declare three short and two complete runs");
     }
     if group == "cams" && ready.products.contains_key("cams_global_greenhouse_gases") {
         if ready.greenhouse_source_runs.len() != 3 {
@@ -598,6 +661,37 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                 .any(|pair| pair[1] - pair[0] != Duration::hours(24))
         {
             bail!("native CAMS greenhouse runs must be consecutive daily 00 UTC runs");
+        }
+    }
+    for (product, product_ready) in &ready.products {
+        if product_ready.source_runs.is_empty()
+            != product_ready.source_run_max_forecast_hours.is_empty()
+        {
+            bail!("native product {product} must declare source runs and horizons together");
+        }
+        if product_ready.source_runs.is_empty() {
+            continue;
+        }
+        if product_ready.source_runs.len() != product_ready.source_run_max_forecast_hours.len() {
+            bail!("native product {product} source run and horizon counts differ");
+        }
+        let product_runs = product_ready
+            .source_runs
+            .iter()
+            .map(|run| parse_run(run))
+            .collect::<Result<Vec<_>>>()?;
+        if product_runs
+            .windows(2)
+            .any(|pair| pair[1] - pair[0] != Duration::hours(6))
+        {
+            bail!("native product {product} source runs are not consecutive");
+        }
+        if product_ready
+            .source_run_max_forecast_hours
+            .iter()
+            .any(|horizon| *horizon < 0)
+        {
+            bail!("native product {product} contains a negative horizon");
         }
     }
     Ok(())
@@ -752,11 +846,7 @@ pub fn load_native_group_products(
         let Some(product_ready) = ready.products.get(*product) else {
             continue;
         };
-        let source_runs = if *product == "cams_global_greenhouse_gases" {
-            &ready.greenhouse_source_runs
-        } else {
-            &ready.source_runs
-        };
+        let source_runs = product_source_runs(&ready, product, product_ready);
         let latest = source_runs
             .last()
             .with_context(|| format!("native product has no source runs: {product}"))?;
@@ -877,6 +967,133 @@ mod tests {
             native_time_indices("cams_global", &meta, 41).unwrap(),
             (0..=120).step_by(3).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn validates_native_probability_source_schedules() {
+        assert_eq!(
+            expected_forecast_hours("ncep_gefs025", 240),
+            (3..=240).step_by(3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expected_forecast_hours("ncep_gefs05", 384),
+            (3..240)
+                .step_by(3)
+                .chain((240..=384).step_by(6))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expected_forecast_hours("ecmwf_ifs025", 360),
+            (0..=144)
+                .step_by(3)
+                .chain((150..=360).step_by(6))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expected_forecast_hours("ecmwf_ifs025_ensemble", 144),
+            (3..=144).step_by(3).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn product_specific_runs_override_group_history() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "gfs",
+            "coverage_id": "gfs_native_2026073000",
+            "latest_complete_run": "2026073000",
+            "source_runs": [
+                "2026072900",
+                "2026072906",
+                "2026072912",
+                "2026072918",
+                "2026073000"
+            ],
+            "public_start_utc": "2026-07-29T00:00:00Z",
+            "coverage_path": "coverages/gfs/gfs_native_2026073000",
+            "products": {
+                "ncep_gefs025": {
+                    "runtime_domain": "ncep_gefs025",
+                    "grid": {
+                        "grid_type": "regional_regular_lat_lon",
+                        "nx": 289,
+                        "ny": 241,
+                        "lon_min": 69.0,
+                        "lat_min": -1.0,
+                        "dx": 0.25,
+                        "dy": 0.25,
+                        "dt_seconds": 10800,
+                        "om_file_length": 481
+                    },
+                    "source_runs": ["2026073000"],
+                    "source_run_max_forecast_hours": [240]
+                }
+            },
+            "source_run_max_forecast_hours": [5, 5, 5, 384, 384]
+        }))
+        .unwrap();
+        let product = ready.products.get("ncep_gefs025").unwrap();
+
+        assert_eq!(
+            product_source_runs(&ready, "ncep_gefs025", product),
+            ["2026073000"]
+        );
+        assert_eq!(
+            run_horizon(&ready, "ncep_gefs025", product, "2026073000").unwrap(),
+            240
+        );
+    }
+
+    #[test]
+    fn ecmwf_deterministic_runs_use_group_specific_horizons() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "ecmwf",
+            "coverage_id": "ecmwf_native_2026073000",
+            "latest_complete_run": "2026073000",
+            "source_runs": [
+                "2026072818",
+                "2026072900",
+                "2026072906",
+                "2026072912",
+                "2026073000"
+            ],
+            "public_start_utc": "2026-07-28T18:00:00Z",
+            "coverage_path": "coverages/ecmwf/ecmwf_native_2026073000",
+            "short_run_count": 3,
+            "full_run_count": 2,
+            "products": {
+                "ecmwf_ifs025": {
+                    "runtime_domain": "ecmwf_ifs025",
+                    "grid": {
+                        "grid_type": "regional_regular_lat_lon",
+                        "nx": 297,
+                        "ny": 249,
+                        "lon_min": 68.0,
+                        "lat_min": -2.0,
+                        "dx": 0.25,
+                        "dy": 0.25,
+                        "dt_seconds": 10800,
+                        "om_file_length": 104
+                    }
+                }
+            },
+            "source_run_max_forecast_hours": [6, 6, 6, 360, 360]
+        }))
+        .unwrap();
+        let product = ready.products.get("ecmwf_ifs025").unwrap();
+
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026072818").unwrap(),
+            6
+        );
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026073000").unwrap(),
+            360
+        );
+        validate_ready(&ready, "ecmwf").unwrap();
     }
 
     #[test]

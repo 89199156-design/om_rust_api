@@ -93,6 +93,9 @@ class InstallOmApiTests(unittest.TestCase):
 
     def test_service_file_limit_covers_native_forecast_inventory(self) -> None:
         self.assertIn("LimitNOFILE=65536", self.content)
+        self.assertIn("ExecReload=/bin/kill -HUP \\$MAINPID", self.content)
+        self.assertIn("ProtectSystem=full", self.content)
+        self.assertIn("ReadOnlyPaths=$DATA_ROOT", self.content)
         nginx_content = (
             REPOSITORY_ROOT / "nginx" / "om_client_api.conf"
         ).read_text(encoding="utf-8")
@@ -393,6 +396,10 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             self.assertIn(f"OM_DEM_ROOT={dem_root}\n", service_environment)
             self.assertIn(
                 f"OM_MODEL_STATIC_ROOT={install_root}\n",
+                service_environment,
+            )
+            self.assertIn(
+                "OM_SNAPSHOT_REFRESH_SECONDS=0\n",
                 service_environment,
             )
             self.assertNotIn("OM_API_DEM_ROOT=", service_environment)

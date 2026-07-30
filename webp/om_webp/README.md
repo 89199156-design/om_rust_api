@@ -50,6 +50,16 @@ Production binaries are built and installed from a clean Git worktree with:
 The installer records the exact Git revision and SHA-256 identities under the
 production application directory.
 
+### Two-disk nodes
+
+`OM_DATA_ROOT` is a read-only OM source and may reside on the system disk.
+`OM_WEBP_DATA_ROOT` contains staging, immutable releases, and current markers;
+it must reside on the same separately mounted filesystem as
+`OM_STRICT_DATA_ROOT`. It may be addressed directly below that root or through
+a verified bind mount. This permits small nodes to keep GFS/CAMS source bundles
+on the system disk while writing all large WebP artifacts to a data disk. The
+renderer never mutates `OM_DATA_ROOT`.
+
 ## Verification
 
 ```bash

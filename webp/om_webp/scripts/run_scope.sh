@@ -40,6 +40,15 @@ ready_marker="$data_root/groups/$ready_group/current/ready_for_processing.json"
 export OM_DEM_ROOT="$dem_root"
 export OM_MODEL_STATIC_ROOT="$model_static_root"
 
+if [[ "$data_root" != /* ]]; then
+  echo "OM_DATA_ROOT must be an absolute read-only source path: $data_root" >&2
+  exit 2
+fi
+if [[ ! -d "$data_root" ]]; then
+  echo "OM_DATA_ROOT does not exist: $data_root" >&2
+  exit 1
+fi
+
 if [[ ! "$minimum_open_files" =~ ^[1-9][0-9]*$ ]]; then
   echo "OM_WEBP_MIN_OPEN_FILES must be a positive integer: $minimum_open_files" >&2
   exit 2

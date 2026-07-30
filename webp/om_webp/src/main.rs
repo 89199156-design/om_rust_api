@@ -352,6 +352,12 @@ struct Args {
     data_root: PathBuf,
     #[arg(long, default_value = "/data/om_webp", env = "OM_WEBP_DATA_ROOT")]
     output_root: PathBuf,
+    /// Dedicated filesystem that contains every large writable WebP artifact.
+    ///
+    /// The raw OM source may be on a different, read-only filesystem. This is
+    /// intentional on small two-disk nodes: rendering must never write through
+    /// `data_root`, while staging, releases, and current markers must remain on
+    /// this dedicated output filesystem.
     #[arg(long, default_value = "/data", env = "OM_STRICT_DATA_ROOT")]
     strict_data_root: PathBuf,
     #[arg(
@@ -642,16 +648,13 @@ fn validate_strict_data_layout(strict_root: &Path, paths: &[&Path]) -> Result<()
             let suffix = path.strip_prefix(&ancestor).unwrap_or(Path::new(""));
             ancestor.join(suffix)
         };
-        if !resolved.starts_with(&resolved_root) {
+        let ancestor = existing_ancestor(path)?;
+        if fs::metadata(&ancestor)?.dev() != root_device {
             bail!(
-                "strict data path escapes {}: {}",
+                "strict data path is not on the dedicated output filesystem {}: {}",
                 resolved_root.display(),
                 resolved.display()
             );
-        }
-        let ancestor = existing_ancestor(path)?;
-        if fs::metadata(&ancestor)?.dev() != root_device {
-            bail!("strict data path is on another device: {}", path.display());
         }
     }
     Ok(())
@@ -704,10 +707,7 @@ fn estimate_staging_bytes(grid_points: usize, layers: usize, frames: usize) -> R
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    validate_strict_data_layout(
-        &args.strict_data_root,
-        &[&args.data_root, &args.output_root],
-    )?;
+    validate_strict_data_layout(&args.strict_data_root, &[&args.output_root])?;
     let workers = if args.workers == 0 {
         std::thread::available_parallelism()
             .map(usize::from)

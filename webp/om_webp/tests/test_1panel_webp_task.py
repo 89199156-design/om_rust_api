@@ -33,6 +33,25 @@ class WebpTaskGateTests(unittest.TestCase):
             content,
         )
         self.assertIn('ulimit -Sn "$minimum_open_files"', content)
+        self.assertIn(
+            'OM_DATA_ROOT must be an absolute read-only source path',
+            content,
+        )
+
+    def test_installer_accepts_verified_bind_mount_on_output_device(self):
+        content = (
+            Path(__file__).resolve().parents[1] / "scripts" / "install_om_webp.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('data_ancestor="$DATA_DIR"', content)
+        self.assertIn(
+            '"$(stat -c %d "$data_ancestor")" != "$(stat -c %d "$strict_real")"',
+            content,
+        )
+        self.assertIn(
+            "WebP data path is not on the strict data filesystem",
+            content,
+        )
 
     def test_standalone_tasks_are_disabled_and_do_not_render(self):
         for name, scope in (

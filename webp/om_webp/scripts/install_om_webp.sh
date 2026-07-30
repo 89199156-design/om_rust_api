@@ -31,11 +31,22 @@ if [ "$(stat -c %d /)" = "$(stat -c %d "$STRICT_DATA_ROOT")" ]; then
 fi
 strict_real="$(readlink -f -- "$STRICT_DATA_ROOT")"
 data_real="$(readlink -m -- "$DATA_DIR")"
+data_ancestor="$DATA_DIR"
+while [ ! -e "$data_ancestor" ]; do
+  next_ancestor="$(dirname -- "$data_ancestor")"
+  if [ "$next_ancestor" = "$data_ancestor" ]; then
+    echo "WebP data path has no existing ancestor: $DATA_DIR" >&2
+    exit 1
+  fi
+  data_ancestor="$next_ancestor"
+done
 case "$data_real" in
   "$strict_real"|"$strict_real"/*) ;;
   *)
-    echo "WebP data path escapes strict data root: $DATA_DIR" >&2
-    exit 1
+    if [ "$(stat -c %d "$data_ancestor")" != "$(stat -c %d "$strict_real")" ]; then
+      echo "WebP data path is not on the strict data filesystem: $DATA_DIR" >&2
+      exit 1
+    fi
     ;;
 esac
 if ! id "$INSTALL_OWNER" >/dev/null 2>&1; then
