@@ -137,6 +137,19 @@ struct ProductReady {
     coverage_id: String,
 }
 
+fn retained_product_run_is_not_newer(
+    current_run: Option<&str>,
+    retained_run: Option<&str>,
+) -> bool {
+    match (
+        current_run.filter(|value| !value.is_empty()),
+        retained_run.filter(|value| !value.is_empty()),
+    ) {
+        (Some(current), Some(retained)) => retained <= current,
+        _ => true,
+    }
+}
+
 fn load_group_products(
     data_root: &Path,
     group: &str,
@@ -299,6 +312,16 @@ fn load_group_release_history(
                             product, product_ready.coverage_id, group
                         )
                     })?;
+            if !retained_product_run_is_not_newer(
+                current.manifest.latest_complete_run.as_deref(),
+                snapshot.manifest.latest_complete_run.as_deref(),
+            ) {
+                // A deliberately frozen mixed ECMWF group can coexist with a
+                // release captured later for just one independently published
+                // product. Such a release is future data, not history, and
+                // must never extend the frozen public horizon.
+                continue;
+            }
             historical_products
                 .entry((*product).to_string())
                 .or_default()
@@ -311,4 +334,31 @@ fn load_group_release_history(
 fn load_manifest_like<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let text = fs::read_to_string(path)?;
     Ok(serde_json::from_str(&text)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retained_product_run_is_not_newer;
+
+    #[test]
+    fn frozen_product_history_never_loads_a_newer_independent_run() {
+        assert!(!retained_product_run_is_not_newer(
+            Some("2026072818"),
+            Some("2026072900")
+        ));
+        assert!(retained_product_run_is_not_newer(
+            Some("2026072818"),
+            Some("2026072812")
+        ));
+        assert!(retained_product_run_is_not_newer(
+            Some("2026072818"),
+            Some("2026072818")
+        ));
+    }
+
+    #[test]
+    fn legacy_missing_run_metadata_remains_loadable() {
+        assert!(retained_product_run_is_not_newer(Some("2026072818"), None));
+        assert!(retained_product_run_is_not_newer(None, Some("2026072900")));
+    }
 }
