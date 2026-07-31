@@ -62,8 +62,8 @@ impl Scope {
 
     fn endpoint(self) -> &'static str {
         match self {
-            Self::Gfs => "v1/forecast",
-            Self::Cams => "v1/air-quality",
+            Self::Gfs => "v1/gfs",
+            Self::Cams => "v1/cams",
             Self::EcmwfIfs025 => "v1/ecmwf",
         }
     }
@@ -865,5 +865,12 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(samples.len(), 256);
         assert_eq!(unique.len(), samples.len());
+    }
+
+    #[test]
+    fn scopes_use_explicit_model_routes() {
+        assert_eq!(Scope::Gfs.endpoint(), "v1/gfs");
+        assert_eq!(Scope::Cams.endpoint(), "v1/cams");
+        assert_eq!(Scope::EcmwfIfs025.endpoint(), "v1/ecmwf");
     }
 }
