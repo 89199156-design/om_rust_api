@@ -615,9 +615,10 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
         "gfs" => (5, &[6, 6, 6, 6]),
         "cams" => (3, &[12, 12]),
-        // ECMWF deterministic imports retain three preceding 6-hour cycles,
-        // the previous long 00/12 cycle, and the target long cycle.
-        "ecmwf" => (5, &[6, 6, 6, 12]),
+        // ECMWF deterministic imports retain five consecutive 6-hour cycles.
+        // The previous and target 00/12 cycles are complete; the other three
+        // are short support runs used at interpolation boundaries.
+        "ecmwf" => (5, &[6, 6, 6, 6]),
         _ => bail!("unsupported native group: {group}"),
     };
     if ready.source_runs.len() != expected_runs {
@@ -651,7 +652,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if group == "ecmwf"
         && (ready.short_run_count != Some(3)
             || ready.full_run_count != Some(2)
-            || ready.source_run_max_forecast_hours != [6, 6, 6, 360, 360])
+            || ready.source_run_max_forecast_hours != [6, 6, 360, 6, 360])
     {
         bail!("native ECMWF marker must declare three short and two complete runs");
     }
@@ -1063,13 +1064,13 @@ mod tests {
             "coverage_id": "ecmwf_native_2026073000",
             "latest_complete_run": "2026073000",
             "source_runs": [
-                "2026072818",
                 "2026072900",
                 "2026072906",
                 "2026072912",
+                "2026072918",
                 "2026073000"
             ],
-            "public_start_utc": "2026-07-28T18:00:00Z",
+            "public_start_utc": "2026-07-29T00:00:00Z",
             "coverage_path": "coverages/ecmwf/ecmwf_native_2026073000",
             "short_run_count": 3,
             "full_run_count": 2,
@@ -1089,13 +1090,21 @@ mod tests {
                     }
                 }
             },
-            "source_run_max_forecast_hours": [6, 6, 6, 360, 360]
+            "source_run_max_forecast_hours": [6, 6, 360, 6, 360]
         }))
         .unwrap();
         let product = ready.products.get("ecmwf_ifs025").unwrap();
 
         assert_eq!(
-            run_horizon(&ready, "ecmwf_ifs025", product, "2026072818").unwrap(),
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026072900").unwrap(),
+            6
+        );
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026072912").unwrap(),
+            360
+        );
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026072918").unwrap(),
             6
         );
         assert_eq!(
