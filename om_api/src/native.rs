@@ -318,10 +318,14 @@ fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<
     } else if runtime_domain == "ncep_gefs025" {
         (3..=max_forecast_hour).step_by(3).collect()
     } else if runtime_domain == "ncep_gefs05" {
-        (3..max_forecast_hour.min(240))
-            .step_by(3)
-            .chain((240..=max_forecast_hour).step_by(6))
-            .collect()
+        if max_forecast_hour < 240 {
+            (3..=max_forecast_hour).step_by(3).collect()
+        } else {
+            (3..240)
+                .step_by(3)
+                .chain((240..=max_forecast_hour).step_by(6))
+                .collect()
+        }
     } else if runtime_domain == "ecmwf_ifs025" && max_forecast_hour == 186 {
         (3..=max_forecast_hour.min(90))
             .step_by(3)
@@ -1129,6 +1133,8 @@ mod tests {
 
     #[test]
     fn validates_native_probability_source_schedules() {
+        assert_eq!(expected_forecast_hours("ncep_gefs025", 6), vec![3, 6]);
+        assert_eq!(expected_forecast_hours("ncep_gefs05", 6), vec![3, 6]);
         assert_eq!(
             expected_forecast_hours("ncep_gefs025", 240),
             (3..=240).step_by(3).collect::<Vec<_>>()
