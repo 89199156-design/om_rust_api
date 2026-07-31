@@ -605,6 +605,34 @@ fn load_native_product_run(
     })
 }
 
+fn merge_native_support_run(current: &mut ProductSnapshot, support: ProductSnapshot) {
+    // Native ECMWF production writes one immutable directory per source run,
+    // whereas an official prepared coverage exposes all retained source runs
+    // through one snapshot. Keep the latest run authoritative for overlapping
+    // valid times, but retain older values and their file handles so ECMWF's
+    // run-stitching interpolation can see the complete retained run stack.
+    for (key, entry) in support.entries {
+        current.entries.entry(key).or_insert(entry);
+    }
+    for (source_run, entries) in support.entries_by_source_run {
+        current.entries_by_source_run.insert(source_run, entries);
+    }
+    for (variable, entry) in support.static_entries {
+        current.static_entries.entry(variable).or_insert(entry);
+    }
+    current.native_handles.extend(support.native_handles);
+    current
+        .manifest
+        .coverage_plan
+        .extend(support.manifest.coverage_plan);
+    current.manifest.coverage_plan.sort_by(|left, right| {
+        left.valid_time_utc
+            .cmp(&right.valid_time_utc)
+            .then_with(|| left.source_run.cmp(&right.source_run))
+            .then_with(|| left.forecast_hour.cmp(&right.forecast_hour))
+    });
+}
+
 fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if ready.group != group {
         bail!(
@@ -860,9 +888,27 @@ pub fn load_native_group_products(
         let latest = source_runs
             .last()
             .with_context(|| format!("native product has no source runs: {product}"))?;
-        let current =
+        let mut current =
             load_native_product_run(&coverage_root, &ready, product, product_ready, latest, true)
                 .with_context(|| format!("load native current {product} {latest}"))?;
+
+        if group == "ecmwf" {
+            for source_run in &source_runs[..source_runs.len() - 1] {
+                let support = load_native_product_run(
+                    &coverage_root,
+                    &ready,
+                    product,
+                    product_ready,
+                    source_run,
+                    false,
+                )
+                .with_context(|| format!("load native support {product} {source_run}"))?;
+                merge_native_support_run(&mut current, support);
+            }
+            products.insert((*product).to_string(), Arc::new(current));
+            continue;
+        }
+
         products.insert((*product).to_string(), Arc::new(current));
 
         let history = historical_products
@@ -1302,5 +1348,118 @@ mod tests {
                 .collect::<Vec<_>>(),
             [384, 5, 5, 5]
         );
+    }
+
+    #[test]
+    fn merges_ecmwf_native_runs_into_one_stitchable_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let coverage_id = "ecmwf_native_2026073012";
+        let coverage = root.join("coverages/ecmwf").join(coverage_id);
+        fs::create_dir_all(&coverage).unwrap();
+        fs::write(coverage.join("coverage.json"), b"{}").unwrap();
+        let source_runs = [
+            "2026072912",
+            "2026072918",
+            "2026073000",
+            "2026073006",
+            "2026073012",
+        ];
+        let horizons = [6_i64, 6, 360, 6, 360];
+        for (run, horizon) in source_runs.iter().zip(horizons) {
+            let reference = parse_run(run).unwrap();
+            let forecast_hours = expected_forecast_hours("ecmwf_ifs025", horizon);
+            let run_root = coverage
+                .join("data_run/ecmwf_ifs025")
+                .join(run_relative_path(run).unwrap());
+            fs::create_dir_all(&run_root).unwrap();
+            write_fake_om(
+                &run_root.join("wind_gusts_10m.om"),
+                [2, 3, forecast_hours.len() as u64],
+            );
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference,
+                    "variables": ["wind_gusts_10m"],
+                    "valid_times": forecast_hours
+                        .iter()
+                        .map(|hour| reference + Duration::hours(*hour))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let marker = json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "ecmwf",
+            "coverage_id": coverage_id,
+            "latest_complete_run": "2026073012",
+            "source_runs": source_runs,
+            "short_run_count": 3,
+            "full_run_count": 2,
+            "source_run_max_forecast_hours": horizons,
+            "public_start_utc": "2026-07-29T12:00:00Z",
+            "coverage_path": format!("coverages/ecmwf/{coverage_id}"),
+            "products": {
+                "ecmwf_ifs025": {
+                    "runtime_domain": "ecmwf_ifs025",
+                    "grid": {
+                        "nx": 3, "ny": 2,
+                        "lon_min": 70.0, "lat_min": 0.0,
+                        "dx": 0.25, "dy": 0.25,
+                        "dt_seconds": 10800,
+                        "om_file_length": 121
+                    }
+                }
+            }
+        });
+        let marker_path = root.join("groups/ecmwf/current/ready_for_processing.json");
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let mut products = HashMap::new();
+        let mut history = HashMap::new();
+        assert!(load_native_group_products(
+            root,
+            "ecmwf",
+            &["ecmwf_ifs025"],
+            &mut products,
+            &mut history,
+        )
+        .unwrap());
+
+        let current = products.get("ecmwf_ifs025").unwrap();
+        let mut loaded_runs = current
+            .entries_by_source_run
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        loaded_runs.sort_unstable();
+        assert_eq!(loaded_runs, source_runs);
+        assert_eq!(current.manifest.coverage_plan.len(), 179);
+        assert_eq!(current.native_handles.len(), source_runs.len());
+        assert!(!history.contains_key("ecmwf_ifs025"));
+
+        let latest_time = parse_run("2026073012").unwrap();
+        let latest = current
+            .entries
+            .get(&EntryKey {
+                variable: "wind_gusts_10m".to_string(),
+                valid_time_utc: latest_time,
+            })
+            .unwrap();
+        assert_eq!(latest.source_run, "2026073012");
+        let oldest_time = parse_run("2026072912").unwrap();
+        let oldest = current
+            .entries
+            .get(&EntryKey {
+                variable: "wind_gusts_10m".to_string(),
+                valid_time_utc: oldest_time,
+            })
+            .unwrap();
+        assert_eq!(oldest.source_run, "2026072912");
     }
 }
