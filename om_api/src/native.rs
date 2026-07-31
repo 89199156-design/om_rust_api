@@ -730,10 +730,23 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                     .context("native ECMWF local midnight is invalid")?;
                 DateTime::<Utc>::from_naive_utc_and_offset(local_midnight, Utc) - offset
             }
+            // Transitional markers published by the first local-day rollout
+            // already contain generated_at and the UTC+8 public boundary, but
+            // predate the explicit local_utc_offset_hours field. Accept that
+            // one historical contract without weakening validation for new
+            // markers; the producer now always writes the offset.
+            (Some(generated_at), None) => {
+                let offset = Duration::hours(8);
+                let local_midnight = (generated_at + offset)
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .context("native ECMWF transitional local midnight is invalid")?;
+                DateTime::<Utc>::from_naive_utc_and_offset(local_midnight, Utc) - offset
+            }
             (None, None) => *parsed
                 .last()
                 .context("native ECMWF source run list is empty")?,
-            _ => bail!("native ECMWF local-day metadata is incomplete"),
+            (None, Some(_)) => bail!("native ECMWF local-day metadata is incomplete"),
         }
     } else {
         parsed[0]
@@ -1632,6 +1645,14 @@ mod tests {
         assert_eq!(current.manifest.coverage_plan.len(), 358);
         assert_eq!(current.native_handles.len(), source_runs.len());
         assert!(!history.contains_key("ecmwf_ifs025"));
+
+        let mut transitional_marker = marker;
+        transitional_marker
+            .as_object_mut()
+            .unwrap()
+            .remove("local_utc_offset_hours");
+        let transitional_ready: NativeReady = serde_json::from_value(transitional_marker).unwrap();
+        validate_ready(&transitional_ready, "ecmwf").unwrap();
 
         let latest_time = parse_run("2026073012").unwrap();
         let latest = current
