@@ -1966,20 +1966,28 @@ async fn forecast_endpoint_exposes_all_soil_temperature_and_moisture_layers() {
 }
 
 #[tokio::test]
-async fn forecast_endpoint_hides_radiation_and_internal_wind_components() {
-    let root = fixture_root();
+async fn forecast_endpoint_exposes_solar_radiation_but_hides_internal_wind_components() {
+    let root = daily_weather_fixture_root();
     let state = AppState::new(root.path().to_path_buf(), None).unwrap();
     let app = router(state);
     let (status, body) = request_json(
-        app,
-        "/v1/gfs?latitude=-90&longitude=-180&hourly=shortwave_radiation,wind_u_component_10m&forecast_hours=1",
+        app.clone(),
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=shortwave_radiation&start_hour=2026-07-07T18:00&end_hour=2026-07-07T18:00",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["hourly"].get("shortwave_radiation").is_some());
+
+    let (status, body) = request_json(
+        app,
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=wind_u_component_10m&forecast_hours=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["error"]
         .as_str()
         .unwrap()
-        .contains("unsupported public hourly variable: shortwave_radiation"));
+        .contains("unsupported public hourly variable: wind_u_component_10m"));
 }
 
 #[tokio::test]
@@ -3238,7 +3246,7 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
     let app = router(state);
     let (status, body) = request_json(
         app,
-        "/v1/gfs?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max,wind_direction_10m_dominant&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
+        "/v1/gfs?latitude=-90&longitude=-180&daily=temperature_2m_max,temperature_2m_min,temperature_2m_mean,apparent_temperature_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max,wind_direction_10m_dominant,shortwave_radiation_sum,sunshine_duration&start_date=2026-07-08&end_date=2026-07-08&timezone=Asia%2FShanghai",
     )
     .await;
 
@@ -3272,6 +3280,10 @@ async fn daily_weather_uses_official_aggregation_for_shanghai_local_day() {
         body["daily"]["wind_direction_10m_dominant"],
         serde_json::json!([90])
     );
+    assert!(body["daily"]["shortwave_radiation_sum"][0].is_number());
+    assert!(body["daily"]["sunshine_duration"].is_array());
+    assert_eq!(body["daily_units"]["shortwave_radiation_sum"], "MJ/m²");
+    assert_eq!(body["daily_units"]["sunshine_duration"], "s");
     assert!(body.get("hourly").is_none());
     assert!(body.get("hourly_units").is_none());
 }

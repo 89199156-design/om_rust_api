@@ -730,6 +730,8 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "cape"
             | "uv_index"
             | "uv_index_clear_sky"
+            | "shortwave_radiation"
+            | "shortwave_radiation_instant"
             | "sunshine_duration"
             | "et0_fao_evapotranspiration"
             | "vapour_pressure_deficit"
@@ -838,6 +840,8 @@ fn is_gfs_public_daily_variable(variable: &str) -> bool {
             | "snow_depth_mean"
             | "uv_index_max"
             | "uv_index_clear_sky_max"
+            | "shortwave_radiation_sum"
+            | "sunshine_duration"
     )
 }
 
@@ -12423,6 +12427,8 @@ mod output_tests {
         for variable in [
             "temperature_2m",
             "apparent_temperature",
+            "shortwave_radiation",
+            "shortwave_radiation_instant",
             "sunshine_duration",
             "et0_fao_evapotranspiration",
             "vapour_pressure_deficit",
@@ -12438,7 +12444,6 @@ mod output_tests {
             assert!(is_public_hourly_variable(variable), "{variable}");
         }
         for variable in [
-            "shortwave_radiation",
             "direct_normal_irradiance",
             "wind_u_component_10m",
             "wind_u_component_850hPa",
@@ -12452,6 +12457,8 @@ mod output_tests {
     #[test]
     fn official_daily_radiation_and_cape_aggregations_are_supported() {
         assert!(daily_weather_aggregation("shortwave_radiation_sum").is_ok());
+        assert!(is_gfs_public_daily_variable("shortwave_radiation_sum"));
+        assert!(is_gfs_public_daily_variable("sunshine_duration"));
         assert!(daily_weather_aggregation("cape_max").is_ok());
         assert!(daily_weather_aggregation("uv_index_max").is_ok());
     }
