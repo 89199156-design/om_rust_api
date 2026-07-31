@@ -3133,6 +3133,7 @@ def _reconcile_gfs_retention_window(
         api_root,
         "gfs",
         retain_complete_releases=GFS_TOTAL_RELEASE_RETENTION,
+        preserve_current=defer_activation,
     )
     print(
         json.dumps(

@@ -1120,9 +1120,12 @@ def prune_expired_group_releases(
     current_is_native = False
     if current_path.exists():
         current = _load_json(current_path)
-        current_release_id = group_release_id(
-            current,
-            allow_legacy_products=True,
+        current_release_id = str(
+            current.get("release_id")
+            or group_release_id(
+                current,
+                allow_legacy_products=True,
+            )
         )
         current_is_native = current.get("runtime_format") == "openmeteo-native-v1"
         if not current_is_native and all(
@@ -1155,7 +1158,8 @@ def prune_expired_group_releases(
     retained_releases: list[tuple[Path, dict[str, Any]]] = []
     expired_releases: list[tuple[Path, dict[str, Any]]] = []
     retained_runs: set[str] = set()
-    preserve_release_id = current_release_id if preserve_current and not current_is_native else None
+    preserved_run: str | None = None
+    preserve_release_id = current_release_id if preserve_current else None
     if preserve_release_id is not None:
         current_release = next(
             (
@@ -1174,7 +1178,13 @@ def prune_expired_group_releases(
         )
         if current_release is not None:
             retained_releases.append(current_release)
-            retained_runs.add(str(current_release[1].get("latest_complete_run") or ""))
+            preserved_run = str(
+                current_release[1].get("latest_complete_run") or ""
+            )
+            # A deliberately frozen native current can be older than the next
+            # source window being downloaded for deferred materialization.
+            # Preserve its exact source release in addition to the configured
+            # retention window so the live API can still resolve sidecars.
     for release in releases:
         payload = release[1]
         run = str(payload.get("latest_complete_run") or "")
@@ -1186,6 +1196,7 @@ def prune_expired_group_releases(
             continue
         if (
             (retained_run_filter is not None and run not in retained_run_filter)
+            or (preserved_run is not None and run == preserved_run)
             or run in retained_runs
             or (
                 retained_run_filter is None

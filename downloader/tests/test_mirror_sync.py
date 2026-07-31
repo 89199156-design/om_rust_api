@@ -1104,6 +1104,84 @@ class MirrorSyncTests(unittest.TestCase):
         self.assertEqual(len(retained), 5)
         self.assertTrue(duplicate_removed)
 
+    def test_frozen_native_current_source_release_is_preserved_beyond_window(self):
+        products = GFS_GROUP_PRODUCTS
+        retained_runs = [
+            "2026072018",
+            "2026072012",
+            "2026072006",
+            "2026072000",
+            "2026071918",
+        ]
+        frozen_run = "2026071900"
+
+        def release(run: str) -> dict:
+            payload = {
+                "group": "gfs",
+                "status": "complete",
+                "latest_complete_run": run,
+                "static_assets": _external_static_asset_records(products),
+                "product_manifests": {
+                    product: {
+                        "coverage_id": f"{product}_{run}",
+                        "status": "complete",
+                        "latest_complete_run": run,
+                    }
+                    for product in products
+                },
+            }
+            payload["release_id"] = group_release_id(payload)
+            return payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            releases_root = root / "groups" / "gfs" / "releases"
+            releases_root.mkdir(parents=True)
+            payloads = [release(run) for run in [*retained_runs, frozen_run]]
+            for payload in payloads:
+                (releases_root / f"{payload['release_id']}.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                for product, summary in payload["product_manifests"].items():
+                    (
+                        root
+                        / product
+                        / "coverages"
+                        / summary["coverage_id"]
+                    ).mkdir(parents=True)
+
+            frozen = dict(payloads[-1])
+            frozen.update(
+                {
+                    "runtime_format": "openmeteo-native-v1",
+                    "coverage_id": "gfs_native_2026071900_frozen",
+                    "coverage_path": "coverages/gfs/gfs_native_2026071900_frozen",
+                }
+            )
+            current = root / "groups" / "gfs" / "current"
+            current.mkdir(parents=True)
+            (current / "ready_for_processing.json").write_text(
+                json.dumps(frozen), encoding="utf-8"
+            )
+
+            prune_expired_group_releases(
+                root,
+                "gfs",
+                retain_complete_releases=5,
+                preserve_current=True,
+            )
+
+            retained = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in releases_root.glob("*.json")
+            ]
+
+        self.assertEqual(
+            {payload["latest_complete_run"] for payload in retained},
+            {*retained_runs, frozen_run},
+        )
+        self.assertEqual(len(retained), 6)
+
     def test_exact_run_filter_removes_newer_obsolete_release_without_dropping_oldest_target(self):
         target_runs = [
             "2026072712",

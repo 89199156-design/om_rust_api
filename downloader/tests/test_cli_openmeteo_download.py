@@ -1167,7 +1167,11 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 },
             ),
             patch.object(cli_module, "activate_group_release") as activate,
-            patch.object(cli_module, "prune_expired_group_releases", return_value=[]),
+            patch.object(
+                cli_module,
+                "prune_expired_group_releases",
+                return_value=[],
+            ) as prune,
             redirect_stdout(stdout),
         ):
             result = cli_module._reconcile_gfs_retention_window(
@@ -1178,6 +1182,7 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertTrue(json.loads(stdout.getvalue())["activation_deferred"])
         activate.assert_not_called()
+        self.assertTrue(prune.call_args_list[-1].kwargs["preserve_current"])
 
     def test_cams_reconcile_downloads_missing_runs_before_activation_and_prune(self):
         products = [
