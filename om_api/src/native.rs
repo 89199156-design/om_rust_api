@@ -42,6 +42,12 @@ struct NativeReady {
     full_run_count: Option<usize>,
     #[serde(default)]
     source_run_max_forecast_hours: Vec<i64>,
+    #[serde(default)]
+    source_run_roles: Vec<String>,
+    #[serde(default)]
+    gust_support_run_count: Option<usize>,
+    #[serde(default)]
+    gust_support_max_forecast_hour: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +305,11 @@ fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<
         (3..max_forecast_hour.min(240))
             .step_by(3)
             .chain((240..=max_forecast_hour).step_by(6))
+            .collect()
+    } else if runtime_domain == "ecmwf_ifs025" && max_forecast_hour == 186 {
+        (3..=max_forecast_hour.min(90))
+            .step_by(3)
+            .chain((150..=max_forecast_hour).step_by(6))
             .collect()
     } else if runtime_domain.starts_with("ecmwf_ifs025") {
         let start = if runtime_domain.ends_with("_ensemble") {
@@ -643,10 +654,10 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
         "gfs" => (5, &[6, 6, 6, 6]),
         "cams" => (3, &[12, 12]),
-        // ECMWF deterministic imports retain five consecutive 6-hour cycles.
-        // The previous and target 00/12 cycles are complete; the other three
-        // are short support runs used at interpolation boundaries.
-        "ecmwf" => (5, &[6, 6, 6, 6]),
+        // ECMWF retains five bounded older gust runs, the previous complete
+        // run, the adjacent short cycle, and the target complete run. This is
+        // the source-run stack used by the official rolling gust database.
+        "ecmwf" => (8, &[12, 12, 12, 12, 12, 6, 6]),
         _ => bail!("unsupported native group: {group}"),
     };
     if ready.source_runs.len() != expected_runs {
@@ -667,8 +678,15 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if ready.source_runs.last() != Some(&ready.latest_complete_run) {
         bail!("native latest_complete_run is not the final source run");
     }
-    if ready.public_start_utc != parsed[0] {
-        bail!("native public_start_utc is not the oldest retained source run");
+    let expected_public_start = if group == "ecmwf" {
+        *parsed
+            .last()
+            .context("native ECMWF source run list is empty")?
+    } else {
+        parsed[0]
+    };
+    if ready.public_start_utc != expected_public_start {
+        bail!("native public_start_utc does not match the public run boundary");
     }
     if group == "gfs"
         && (ready.short_run_count != Some(3)
@@ -678,11 +696,24 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         bail!("native GFS marker must declare three short and two complete runs");
     }
     if group == "ecmwf"
-        && (ready.short_run_count != Some(3)
+        && (ready.short_run_count != Some(1)
             || ready.full_run_count != Some(2)
-            || ready.source_run_max_forecast_hours != [6, 6, 360, 6, 360])
+            || ready.gust_support_run_count != Some(5)
+            || ready.gust_support_max_forecast_hour != Some(186)
+            || ready.source_run_max_forecast_hours != [186, 186, 186, 186, 186, 360, 6, 360]
+            || ready.source_run_roles
+                != [
+                    "gust-support",
+                    "gust-support",
+                    "gust-support",
+                    "gust-support",
+                    "gust-support",
+                    "previous-complete",
+                    "short-history",
+                    "target",
+                ])
     {
-        bail!("native ECMWF marker must declare three short and two complete runs");
+        bail!("native ECMWF marker does not match the rolling gust support contract");
     }
     if group == "cams" && ready.products.contains_key("cams_global_greenhouse_gases") {
         if ready.greenhouse_source_runs.len() != 3 {
@@ -893,7 +924,7 @@ pub fn load_native_group_products(
                 .with_context(|| format!("load native current {product} {latest}"))?;
 
         if group == "ecmwf" {
-            for source_run in &source_runs[..source_runs.len() - 1] {
+            for source_run in source_runs[..source_runs.len() - 1].iter().rev() {
                 let support = load_native_product_run(
                     &coverage_root,
                     &ready,
@@ -1110,16 +1141,31 @@ mod tests {
             "coverage_id": "ecmwf_native_2026073000",
             "latest_complete_run": "2026073000",
             "source_runs": [
+                "2026072700",
+                "2026072712",
+                "2026072800",
+                "2026072812",
                 "2026072900",
-                "2026072906",
                 "2026072912",
                 "2026072918",
                 "2026073000"
             ],
-            "public_start_utc": "2026-07-29T00:00:00Z",
+            "source_run_roles": [
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "previous-complete",
+                "short-history",
+                "target"
+            ],
+            "public_start_utc": "2026-07-30T00:00:00Z",
             "coverage_path": "coverages/ecmwf/ecmwf_native_2026073000",
-            "short_run_count": 3,
+            "short_run_count": 1,
             "full_run_count": 2,
+            "gust_support_run_count": 5,
+            "gust_support_max_forecast_hour": 186,
             "products": {
                 "ecmwf_ifs025": {
                     "runtime_domain": "ecmwf_ifs025",
@@ -1136,14 +1182,14 @@ mod tests {
                     }
                 }
             },
-            "source_run_max_forecast_hours": [6, 6, 360, 6, 360]
+            "source_run_max_forecast_hours": [186, 186, 186, 186, 186, 360, 6, 360]
         }))
         .unwrap();
         let product = ready.products.get("ecmwf_ifs025").unwrap();
 
         assert_eq!(
-            run_horizon(&ready, "ecmwf_ifs025", product, "2026072900").unwrap(),
-            6
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026072700").unwrap(),
+            186
         );
         assert_eq!(
             run_horizon(&ready, "ecmwf_ifs025", product, "2026072912").unwrap(),
@@ -1359,13 +1405,16 @@ mod tests {
         fs::create_dir_all(&coverage).unwrap();
         fs::write(coverage.join("coverage.json"), b"{}").unwrap();
         let source_runs = [
+            "2026072712",
+            "2026072800",
+            "2026072812",
+            "2026072900",
             "2026072912",
-            "2026072918",
             "2026073000",
             "2026073006",
             "2026073012",
         ];
-        let horizons = [6_i64, 6, 360, 6, 360];
+        let horizons = [186_i64, 186, 186, 186, 186, 360, 6, 360];
         for (run, horizon) in source_runs.iter().zip(horizons) {
             let reference = parse_run(run).unwrap();
             let forecast_hours = expected_forecast_hours("ecmwf_ifs025", horizon);
@@ -1373,9 +1422,14 @@ mod tests {
                 .join("data_run/ecmwf_ifs025")
                 .join(run_relative_path(run).unwrap());
             fs::create_dir_all(&run_root).unwrap();
+            let stored_time_count = if horizon == 186 {
+                forecast_hours.len()
+            } else {
+                forecast_hours.len() - 1
+            };
             write_fake_om(
                 &run_root.join("wind_gusts_10m.om"),
-                [2, 3, forecast_hours.len() as u64],
+                [2, 3, stored_time_count as u64],
             );
             fs::write(
                 run_root.join("meta.json"),
@@ -1398,10 +1452,22 @@ mod tests {
             "coverage_id": coverage_id,
             "latest_complete_run": "2026073012",
             "source_runs": source_runs,
-            "short_run_count": 3,
+            "source_run_roles": [
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "previous-complete",
+                "short-history",
+                "target"
+            ],
+            "short_run_count": 1,
             "full_run_count": 2,
+            "gust_support_run_count": 5,
+            "gust_support_max_forecast_hour": 186,
             "source_run_max_forecast_hours": horizons,
-            "public_start_utc": "2026-07-29T12:00:00Z",
+            "public_start_utc": "2026-07-30T12:00:00Z",
             "coverage_path": format!("coverages/ecmwf/{coverage_id}"),
             "products": {
                 "ecmwf_ifs025": {
@@ -1439,7 +1505,7 @@ mod tests {
             .collect::<Vec<_>>();
         loaded_runs.sort_unstable();
         assert_eq!(loaded_runs, source_runs);
-        assert_eq!(current.manifest.coverage_plan.len(), 179);
+        assert_eq!(current.manifest.coverage_plan.len(), 358);
         assert_eq!(current.native_handles.len(), source_runs.len());
         assert!(!history.contains_key("ecmwf_ifs025"));
 
@@ -1451,8 +1517,8 @@ mod tests {
                 valid_time_utc: latest_time,
             })
             .unwrap();
-        assert_eq!(latest.source_run, "2026073012");
-        let oldest_time = parse_run("2026072912").unwrap();
+        assert_eq!(latest.source_run, "2026073006");
+        let oldest_time = parse_run("2026072712").unwrap() + Duration::hours(3);
         let oldest = current
             .entries
             .get(&EntryKey {
@@ -1460,6 +1526,6 @@ mod tests {
                 valid_time_utc: oldest_time,
             })
             .unwrap();
-        assert_eq!(oldest.source_run, "2026072912");
+        assert_eq!(oldest.source_run, "2026072712");
     }
 }
