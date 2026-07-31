@@ -1,6 +1,6 @@
 use crate::manifest::{
-    ArrayMetadata, BundleEntry, EntryKey, ManifestFile, NativeGridMetadata, ProductManifest,
-    ProductSnapshot,
+    ArrayMetadata, BundleEntry, CoveragePlanEntry, EntryKey, ManifestFile, NativeGridMetadata,
+    ProductManifest, ProductSnapshot,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDateTime, Timelike, Utc};
@@ -573,6 +573,15 @@ fn load_native_product_run(
         source_run.to_string(),
         entries.values().cloned().collect::<Vec<_>>(),
     )]);
+    let coverage_plan = meta
+        .valid_times
+        .iter()
+        .map(|valid_time| CoveragePlanEntry {
+            valid_time_utc: *valid_time,
+            source_run: source_run.to_string(),
+            forecast_hour: (*valid_time - reference_time).num_hours(),
+        })
+        .collect();
     Ok(ProductSnapshot {
         product: product.to_string(),
         product_root: coverage_root.to_path_buf(),
@@ -584,7 +593,7 @@ fn load_native_product_run(
             config_fingerprint: None,
             public_start_utc: Some(ready.public_start_utc),
             files: vec![bundle_file.clone()],
-            coverage_plan: Vec::new(),
+            coverage_plan,
         },
         bundle_file,
         bundle_path: manifest_path,
@@ -1245,6 +1254,23 @@ mod tests {
             Some("2026071300")
         );
         assert_eq!(current.entries.len(), 209);
+        assert_eq!(current.manifest.coverage_plan.len(), 209);
+        assert_eq!(
+            current
+                .manifest
+                .coverage_plan
+                .first()
+                .map(|entry| entry.forecast_hour),
+            Some(0)
+        );
+        assert_eq!(
+            current
+                .manifest
+                .coverage_plan
+                .last()
+                .map(|entry| entry.forecast_hour),
+            Some(384)
+        );
         let candidates = history.get("gfs013_surface").unwrap();
         assert_eq!(
             candidates
