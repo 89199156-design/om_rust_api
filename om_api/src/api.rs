@@ -116,6 +116,30 @@ impl AppState {
         Ok(guard.snapshot.clone())
     }
 
+    fn data_identity(&self) -> Result<serde_json::Value> {
+        fn group(identity: Option<&GroupIdentity>) -> serde_json::Value {
+            match identity {
+                Some(identity) => json!({
+                    "status": identity.status,
+                    "runtime_format": identity.runtime_format,
+                    "latest_complete_run": identity.latest_complete_run,
+                    "coverage_id": identity.coverage_id,
+                }),
+                None => serde_json::Value::Null,
+            }
+        }
+
+        let guard = self
+            .cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
+        Ok(json!({
+            "gfs": group(guard.identity.gfs_ready.as_ref()),
+            "cams": group(guard.identity.cams_ready.as_ref()),
+            "ecmwf": group(guard.identity.ecmwf_ready.as_ref()),
+        }))
+    }
+
     fn weather_snapshot(&self, model: WeatherModel) -> Result<(Arc<OmDataSnapshot>, String)> {
         let guard = self
             .cache
@@ -210,6 +234,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(source_offer))
         .route("/v1/source", get(source_offer))
+        .route("/v1/data-identity", get(data_identity))
         .route(
             "/.well-known/weather-attribution.json",
             get(weather_attribution),
@@ -238,6 +263,10 @@ async fn source_offer() -> Json<serde_json::Value> {
         "weather_attribution_url": "/.well-known/weather-attribution.json",
         "notice": "Corresponding Source for this network service is available at source_code."
     }))
+}
+
+async fn data_identity(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(state.data_identity()?))
 }
 
 fn weather_attribution_payload() -> serde_json::Value {
@@ -578,6 +607,47 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn data_identity_reports_the_exact_loaded_coverage() {
+        let root = TempDir::new().unwrap();
+        let marker = root
+            .path()
+            .join("groups/gfs/current/ready_for_processing.json");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(
+            marker,
+            br#"{
+                "status":"incomplete",
+                "runtime_format":"openmeteo-native-v1",
+                "latest_complete_run":"2026073006",
+                "coverage_id":"gfs_native_2026073006_probability",
+                "products":{}
+            }"#,
+        )
+        .unwrap();
+        let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/data-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["gfs"]["coverage_id"],
+            "gfs_native_2026073006_probability"
+        );
+        assert_eq!(payload["gfs"]["latest_complete_run"], "2026073006");
+        assert!(payload["cams"].is_null());
     }
 
     #[tokio::test]

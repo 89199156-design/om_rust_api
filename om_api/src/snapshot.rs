@@ -7,7 +7,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub const GFS_NATIVE_PRODUCTS: &[&str] = &["gfs013_surface", "gfs025", "gfs_pressure_profile"];
 pub const GFS_SIDECAR_PRODUCTS: &[&str] = &["ncep_gefs025", "ncep_gefs05"];
 pub const GFS_PRODUCTS: &[&str] = &[
     "gfs013_surface",
@@ -34,7 +33,7 @@ impl OmDataSnapshot {
         let gfs_native = load_native_group_products(
             &data_root,
             "gfs",
-            GFS_NATIVE_PRODUCTS,
+            GFS_PRODUCTS,
             &mut products,
             &mut historical_products,
         )?;
@@ -55,10 +54,11 @@ impl OmDataSnapshot {
                 &mut historical_products,
             )?;
         } else {
-            // The native GFS marker intentionally materializes only the three
-            // deterministic products. Load GEFS probability from the exact
-            // immutable source release named by that marker, never from an
-            // independently advancing "latest" directory.
+            // A Swift-produced native marker can embed deterministic and GEFS
+            // products in one immutable coverage. A materialized official
+            // marker can instead keep GEFS in the exact source release named
+            // by that marker. Load that selected release as a compatibility
+            // path, never an independently advancing "latest" directory.
             load_selected_source_release_products(
                 &data_root,
                 "gfs",
