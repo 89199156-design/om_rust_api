@@ -651,13 +651,21 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
             ready.group
         );
     }
+    let ecmwf_rolling_gust = group == "ecmwf"
+        && ready.gust_support_run_count == Some(5)
+        && ready.gust_support_max_forecast_hour == Some(186);
     let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
         "gfs" => (5, &[6, 6, 6, 6]),
         "cams" => (3, &[12, 12]),
         // ECMWF retains five bounded older gust runs, the previous complete
         // run, the adjacent short cycle, and the target complete run. This is
         // the source-run stack used by the official rolling gust database.
-        "ecmwf" => (8, &[12, 12, 12, 12, 12, 6, 6]),
+        "ecmwf" if ecmwf_rolling_gust => (8, &[12, 12, 12, 12, 12, 6, 6]),
+        // One production restart must remain possible while the previous
+        // immutable five-run coverage is still current. After the producer
+        // atomically publishes the rolling-gust marker, reload switches to the
+        // strict eight-run contract above without an alternate service/root.
+        "ecmwf" => (5, &[6, 6, 6, 12]),
         _ => bail!("unsupported native group: {group}"),
     };
     if ready.source_runs.len() != expected_runs {
@@ -678,7 +686,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if ready.source_runs.last() != Some(&ready.latest_complete_run) {
         bail!("native latest_complete_run is not the final source run");
     }
-    let expected_public_start = if group == "ecmwf" {
+    let expected_public_start = if ecmwf_rolling_gust {
         *parsed
             .last()
             .context("native ECMWF source run list is empty")?
@@ -696,6 +704,17 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         bail!("native GFS marker must declare three short and two complete runs");
     }
     if group == "ecmwf"
+        && !ecmwf_rolling_gust
+        && (ready.short_run_count != Some(3)
+            || ready.full_run_count != Some(2)
+            || ready.source_run_max_forecast_hours != [6, 6, 6, 360, 360]
+            || !ready.source_run_roles.is_empty()
+            || ready.gust_support_run_count.is_some()
+            || ready.gust_support_max_forecast_hour.is_some())
+    {
+        bail!("native ECMWF legacy production marker is invalid");
+    }
+    if ecmwf_rolling_gust
         && (ready.short_run_count != Some(1)
             || ready.full_run_count != Some(2)
             || ready.gust_support_run_count != Some(5)
@@ -1203,6 +1222,33 @@ mod tests {
             run_horizon(&ready, "ecmwf_ifs025", product, "2026073000").unwrap(),
             360
         );
+        validate_ready(&ready, "ecmwf").unwrap();
+    }
+
+    #[test]
+    fn accepts_only_the_exact_previous_ecmwf_production_marker_during_rollover() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "ecmwf",
+            "coverage_id": "ecmwf_native_2026073012_7ea06487fb66",
+            "latest_complete_run": "2026073012",
+            "source_runs": [
+                "2026072906",
+                "2026072912",
+                "2026072918",
+                "2026073000",
+                "2026073012"
+            ],
+            "source_run_max_forecast_hours": [6, 6, 6, 360, 360],
+            "public_start_utc": "2026-07-29T06:00:00Z",
+            "coverage_path": "coverages/ecmwf/ecmwf_native_2026073012_7ea06487fb66",
+            "short_run_count": 3,
+            "full_run_count": 2,
+            "products": {}
+        }))
+        .unwrap();
+
         validate_ready(&ready, "ecmwf").unwrap();
     }
 
