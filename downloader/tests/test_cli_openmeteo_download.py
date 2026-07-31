@@ -494,15 +494,23 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                 )
             discovered.append((run_id, plans))
 
+        frozen_reference = datetime(2026, 7, 15, 0, tzinfo=timezone.utc)
         with patch.object(
             cli_module,
             "_discover_recent_complete_group_plans",
             return_value=discovered,
-        ):
+        ) as discover:
             ranked = cli_module._discover_recent_gfs_retention_plans(
                 products,
                 bucket_url="https://example.invalid",
+                latest_reference_time_utc=frozen_reference,
             )
+        discover.assert_called_once_with(
+            products,
+            bucket_url="https://example.invalid",
+            count=5,
+            latest_reference_time_utc=frozen_reference,
+        )
 
         for _run, plans in ranked[:2]:
             self.assertEqual(
@@ -531,6 +539,77 @@ class CliOpenMeteoDownloadTests(unittest.TestCase):
                     **{name: (3,) for name in GFS_PROBABILITY_PRODUCTS},
                 },
             )
+
+    def test_frozen_complete_group_discovery_starts_at_exact_reference(self):
+        frozen_reference = datetime(2026, 7, 30, 6, tzinfo=timezone.utc)
+        products = [
+            SimpleNamespace(
+                name="gfs013_surface",
+                openmeteo_model="ncep_gfs013",
+                run_cadence_hours=6,
+                forecast_hour_end=384,
+            ),
+            SimpleNamespace(
+                name="gfs025",
+                openmeteo_model="ncep_gfs025",
+                run_cadence_hours=6,
+                forecast_hour_end=384,
+            ),
+        ]
+
+        def frozen_catalog(model, reference_time, *, bucket_url):
+            self.assertEqual(reference_time, frozen_reference)
+            self.assertEqual(bucket_url, "https://example.invalid")
+            return SimpleNamespace(
+                model=model,
+                reference_time_utc=frozen_reference,
+                completed=True,
+                max_forecast_hour=384,
+            )
+
+        with (
+            patch.object(cli_module, "load_openmeteo_spatial_latest") as load_latest,
+            patch.object(
+                cli_module,
+                "load_openmeteo_spatial_run",
+                side_effect=frozen_catalog,
+            ) as load_run,
+            patch.object(
+                cli_module,
+                "_complete_run_plan_data",
+                side_effect=lambda product, catalog: (
+                    catalog,
+                    [SimpleNamespace()],
+                    SimpleNamespace(latest_complete_run="2026073006"),
+                ),
+            ),
+        ):
+            discovered = cli_module._discover_recent_complete_group_plans(
+                products,
+                bucket_url="https://example.invalid",
+                count=1,
+                latest_reference_time_utc=frozen_reference,
+            )
+
+        load_latest.assert_not_called()
+        self.assertEqual(load_run.call_count, len(products))
+        self.assertEqual([run for run, _plans in discovered], ["2026073006"])
+
+    def test_gfs_group_accepts_reference_time_for_frozen_retention(self):
+        args = SimpleNamespace(
+            download_openmeteo_group="gfs",
+            reference_time="2026-07-30T06:00:00Z",
+        )
+        with patch.object(
+            cli_module,
+            "_reconcile_gfs_retention_window",
+            return_value=0,
+        ) as reconcile:
+            result = cli_module._download_openmeteo_group(args, SimpleNamespace())
+
+        self.assertEqual(result, 0)
+        reconcile.assert_called_once()
+        self.assertIs(reconcile.call_args.args[0], args)
 
     def test_exact_gfs_short_run_keeps_probability_f003_without_requiring_f000(self):
         products = [

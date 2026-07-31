@@ -2339,16 +2339,28 @@ def _discover_recent_complete_group_plans(
     *,
     bucket_url: str,
     count: int,
+    latest_reference_time_utc: datetime | None = None,
 ) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
     if count < 1:
         raise ValueError("complete group run count must be positive")
-    latest_catalogs = {
-        product.name: load_openmeteo_spatial_latest(
-            product.openmeteo_model,
-            bucket_url=bucket_url,
-        )
-        for product in products
-    }
+    if latest_reference_time_utc is None:
+        latest_catalogs = {
+            product.name: load_openmeteo_spatial_latest(
+                product.openmeteo_model,
+                bucket_url=bucket_url,
+            )
+            for product in products
+        }
+    else:
+        frozen_reference = _as_utc(latest_reference_time_utc)
+        latest_catalogs = {
+            product.name: load_openmeteo_spatial_run(
+                product.openmeteo_model,
+                frozen_reference,
+                bucket_url=bucket_url,
+            )
+            for product in products
+        }
     cadence_step = products[0].run_cadence_hours
     for product in products[1:]:
         cadence_step = gcd(cadence_step, product.run_cadence_hours)
@@ -2415,11 +2427,13 @@ def _discover_recent_gfs_retention_plans(
     products: list[ProductConfig],
     *,
     bucket_url: str,
+    latest_reference_time_utc: datetime | None = None,
 ) -> list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]]:
     discovered = _discover_recent_complete_group_plans(
         products,
         bucket_url=bucket_url,
         count=GFS_TOTAL_RELEASE_RETENTION,
+        latest_reference_time_utc=latest_reference_time_utc,
     )
     product_by_name = {product.name: product for product in products}
     ranked: list[tuple[str, dict[str, tuple[Any, list[Any], Any]]]] = []
@@ -3013,6 +3027,11 @@ def _reconcile_gfs_retention_window(
     target_plans = _discover_recent_gfs_retention_plans(
         products,
         bucket_url=args.openmeteo_bucket_url,
+        latest_reference_time_utc=(
+            _parse_utc(args.reference_time)
+            if getattr(args, "reference_time", None)
+            else None
+        ),
     )
     source_root = Path(args.output) / "published"
     api_root = (
@@ -3301,10 +3320,11 @@ def _recover_openmeteo_gfs_short_run(
 
 
 def _download_openmeteo_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    if args.reference_time and args.download_openmeteo_group in ("gfs", "cams"):
+    if args.reference_time and args.download_openmeteo_group == "cams":
         parser.error(
-            "--reference-time is supported by direct product/group downloads; "
-            "GFS/CAMS retention reconciliation selects its own run window"
+            "--reference-time is supported by direct product/group downloads and "
+            "frozen GFS retention; CAMS retention reconciliation selects its own "
+            "run window"
         )
     if args.download_openmeteo_group == "gfs":
         return _reconcile_gfs_retention_window(args, parser)
