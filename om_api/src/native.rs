@@ -253,6 +253,7 @@ fn product_accepts_variable(product: &str, variable: &str) -> bool {
 
 fn native_time_indices(
     runtime_domain: &str,
+    variable: &str,
     meta: &NativeRunMeta,
     stored_time_count: usize,
 ) -> Result<Vec<usize>> {
@@ -266,6 +267,21 @@ fn native_time_indices(
         && meta.valid_times.first() == Some(&meta.reference_time)
     {
         return Ok((1..meta.valid_times.len()).collect());
+    }
+    if runtime_domain == "ecmwf_ifs025" && variable == "wind_gusts_10m" {
+        let indices = meta
+            .valid_times
+            .iter()
+            .enumerate()
+            .filter_map(|(index, valid_time)| {
+                let forecast_hour = (*valid_time - meta.reference_time).num_hours();
+                (forecast_hour > 0 && (forecast_hour <= 90 || forecast_hour >= 150))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if indices.len() == stored_time_count {
+            return Ok(indices);
+        }
     }
     for (index, valid_time) in meta.valid_times.iter().enumerate() {
         if *valid_time - meta.reference_time != Duration::hours(index as i64) {
@@ -519,9 +535,16 @@ fn load_native_product_run(
         }
         let time_indices = native_time_indices(
             &product_ready.runtime_domain,
+            variable,
             &meta,
             usize::try_from(array.dimensions[2])?,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "map native time indices for {} {source_run} {variable}",
+                product_ready.runtime_domain
+            )
+        })?;
         let relative = file_path
             .strip_prefix(coverage_root)?
             .to_string_lossy()
@@ -1037,7 +1060,7 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            native_time_indices("ncep_gfs013", &meta, 209).unwrap(),
+            native_time_indices("ncep_gfs013", "temperature_2m", &meta, 209).unwrap(),
             (0..209).collect::<Vec<_>>()
         );
     }
@@ -1053,7 +1076,7 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            native_time_indices("ncep_gfs013", &meta, 385).unwrap(),
+            native_time_indices("ncep_gfs013", "temperature_2m", &meta, 385).unwrap(),
             (0..385).collect::<Vec<_>>()
         );
         validate_run_time_axis("ncep_gfs013", &meta, 384).unwrap();
@@ -1070,9 +1093,38 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            native_time_indices("cams_global", &meta, 41).unwrap(),
+            native_time_indices("cams_global", "dust", &meta, 41).unwrap(),
             (0..=120).step_by(3).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn maps_official_ecmwf_gust_gap_without_relaxing_other_variables() {
+        let reference_time = "2026-07-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let hours = expected_forecast_hours("ecmwf_ifs025", 360);
+        let meta = NativeRunMeta {
+            reference_time,
+            variables: vec!["wind_gusts_10m".to_string()],
+            valid_times: hours
+                .iter()
+                .map(|hour| reference_time + Duration::hours(*hour))
+                .collect(),
+        };
+        let expected = hours
+            .iter()
+            .enumerate()
+            .filter_map(|(index, forecast_hour)| {
+                (*forecast_hour > 0 && (*forecast_hour <= 90 || *forecast_hour >= 150))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(expected.len(), 66);
+        assert_eq!(
+            native_time_indices("ecmwf_ifs025", "wind_gusts_10m", &meta, 66).unwrap(),
+            expected
+        );
+        assert!(native_time_indices("ecmwf_ifs025", "temperature_2m", &meta, 66).is_err());
     }
 
     #[test]
