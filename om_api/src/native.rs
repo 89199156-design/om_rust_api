@@ -32,6 +32,10 @@ struct NativeReady {
     #[serde(default)]
     greenhouse_source_runs: Vec<String>,
     public_start_utc: DateTime<Utc>,
+    #[serde(default)]
+    generated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    local_utc_offset_hours: Option<i64>,
     coverage_path: String,
     products: HashMap<String, NativeProductReady>,
     #[serde(default)]
@@ -714,9 +718,23 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         bail!("native latest_complete_run is not the final source run");
     }
     let expected_public_start = if ecmwf_rolling_gust {
-        *parsed
-            .last()
-            .context("native ECMWF source run list is empty")?
+        match (ready.generated_at, ready.local_utc_offset_hours) {
+            (Some(generated_at), Some(offset_hours)) => {
+                if !(-23..=23).contains(&offset_hours) {
+                    bail!("native ECMWF local UTC offset is invalid");
+                }
+                let offset = Duration::hours(offset_hours);
+                let local_midnight = (generated_at + offset)
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .context("native ECMWF local midnight is invalid")?;
+                DateTime::<Utc>::from_naive_utc_and_offset(local_midnight, Utc) - offset
+            }
+            (None, None) => *parsed
+                .last()
+                .context("native ECMWF source run list is empty")?,
+            _ => bail!("native ECMWF local-day metadata is incomplete"),
+        }
     } else {
         parsed[0]
     };
@@ -1571,7 +1589,9 @@ mod tests {
             "gust_support_run_count": 5,
             "gust_support_max_forecast_hour": 186,
             "source_run_max_forecast_hours": horizons,
-            "public_start_utc": "2026-07-30T12:00:00Z",
+            "public_start_utc": "2026-07-30T16:00:00Z",
+            "generated_at": "2026-07-30T20:00:00Z",
+            "local_utc_offset_hours": 8,
             "coverage_path": format!("coverages/ecmwf/{coverage_id}"),
             "products": {
                 "ecmwf_ifs025": {
