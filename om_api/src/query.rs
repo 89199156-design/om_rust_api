@@ -6074,8 +6074,9 @@ struct EcmwfRegularCacheKey {
 
 #[derive(Debug)]
 struct EcmwfRegularSeries {
-    times: Vec<DateTime<Utc>>,
-    frames: Vec<Vec<f32>>,
+    runs: Vec<EcmwfRegularRun>,
+    public_start_utc: Option<DateTime<Utc>>,
+    latest_source_run: Option<String>,
 }
 
 #[cfg(test)]
@@ -6582,77 +6583,38 @@ fn build_ecmwf_regular_series(
     if runs.is_empty() {
         return Ok(None);
     }
-    Ok(Some(stitch_ecmwf_regular_runs(
+    runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
+    Ok(Some(EcmwfRegularSeries {
         runs,
-        latitudes.len() * longitudes.len(),
-        product.manifest.public_start_utc,
-        product.manifest.latest_complete_run.as_deref(),
-    )?))
+        public_start_utc: product.manifest.public_start_utc,
+        latest_source_run: product.manifest.latest_complete_run.clone(),
+    }))
 }
 
-fn stitch_ecmwf_regular_runs(
-    mut runs: Vec<EcmwfRegularRun>,
-    grid_len: usize,
-    public_start_utc: Option<DateTime<Utc>>,
+fn ecmwf_latest_support_start(
+    run_start: DateTime<Utc>,
+    public_start_utc: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let regular_step_seconds = 3 * 3600;
+    let elapsed_seconds = (public_start_utc - run_start).num_seconds().max(0);
+    let containing_frame_seconds =
+        elapsed_seconds.div_euclid(regular_step_seconds) * regular_step_seconds;
+    run_start + Duration::seconds((containing_frame_seconds - regular_step_seconds).max(0))
+}
+
+fn ecmwf_run_is_eligible(
+    source_run: &str,
+    run_start: DateTime<Utc>,
     latest_source_run: Option<&str>,
-) -> Result<EcmwfRegularSeries> {
-    // Oldest-to-newest insertion reproduces Open-Meteo's rolling database:
-    // newer runs overwrite only finite frames they can actually reconstruct.
-    // A boundary NaN must retain the older run's fully supported interpolation.
-    runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
-    let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
-    for run in runs {
-        let latest_support_start = if latest_source_run == Some(run.source_run.as_str()) {
-            public_start_utc.map(|boundary| {
-                let regular_step_seconds = 3 * 3600;
-                let elapsed_seconds = (boundary - run.start).num_seconds().max(0);
-                let containing_frame_seconds =
-                    elapsed_seconds.div_euclid(regular_step_seconds) * regular_step_seconds;
-                run.start
-                    + Duration::seconds((containing_frame_seconds - regular_step_seconds).max(0))
-            })
-        } else {
-            None
-        };
-        for (index, frame) in run.frames.into_iter().enumerate() {
-            let time = run.start + Duration::hours(index as i64 * 3);
-            if latest_support_start.is_some_and(|support_start| time < support_start) {
-                continue;
-            }
-            let target = stitched
-                .entry(time)
-                .or_insert_with(|| vec![f32::NAN; frame.len()]);
-            for (target_value, value) in target.iter_mut().zip(frame) {
-                if value.is_finite() {
-                    *target_value = value;
-                }
-            }
-        }
+    public_start_utc: Option<DateTime<Utc>>,
+    time: DateTime<Utc>,
+) -> bool {
+    if latest_source_run != Some(source_run) {
+        return true;
     }
-    let first = *stitched
-        .keys()
-        .next()
-        .context("ECMWF regular series is empty")?;
-    let last = *stitched
-        .keys()
-        .next_back()
-        .context("ECMWF regular series is empty")?;
-    let count = usize::try_from((last - first).num_hours() / 3 + 1)?;
-    let mut regular_times = Vec::with_capacity(count);
-    let mut regular_frames = Vec::with_capacity(count);
-    for index in 0..count {
-        let time = first + Duration::hours(index as i64 * 3);
-        regular_times.push(time);
-        regular_frames.push(
-            stitched
-                .remove(&time)
-                .unwrap_or_else(|| vec![f32::NAN; grid_len]),
-        );
-    }
-    Ok(EcmwfRegularSeries {
-        times: regular_times,
-        frames: regular_frames,
-    })
+    public_start_utc
+        .map(|boundary| time >= ecmwf_latest_support_start(run_start, boundary))
+        .unwrap_or(true)
 }
 
 fn ecmwf_cached_regular_series(
@@ -6705,30 +6667,58 @@ fn read_ecmwf_product_grid_series(
     else {
         return Ok(None);
     };
-    let regular_times = &regular.times;
-    let regular_frames = &regular.frames;
     let kind = ecmwf_interpolation_kind(raw_variable);
     let output_dt_seconds = series_dt_seconds(times);
     let grid_len = latitudes.len() * longitudes.len();
     let width = longitudes.len();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
     for point in 0..grid_len {
-        let values = regular_frames
+        // Interpolate every source run independently before choosing the
+        // seamless rolling value. Mixing native control points from adjacent
+        // runs changes Hermite extrema at the rollover boundary.
+        let point_runs = regular
+            .runs
             .iter()
-            .map(|frame| frame[point])
+            .rev()
+            .map(|run| {
+                let regular_times = (0..run.frames.len())
+                    .map(|index| run.start + Duration::hours(index as i64 * 3))
+                    .collect::<Vec<_>>();
+                let values = run
+                    .frames
+                    .iter()
+                    .map(|frame| frame[point])
+                    .collect::<Vec<_>>();
+                (run, regular_times, values)
+            })
             .collect::<Vec<_>>();
         for (output_frame, time) in output.iter_mut().zip(times) {
-            output_frame[point] = ecmwf_second_stage_value_with_terminal_extension(
-                &values,
-                regular_times,
-                kind,
-                *time,
-                latitudes[point / width] as f32,
-                longitudes[point % width] as f32,
-                output_dt_seconds,
-                product.product == "ecmwf_ifs025_ensemble"
-                    && raw_variable == "precipitation_probability",
-            );
+            for (run, regular_times, values) in &point_runs {
+                if !ecmwf_run_is_eligible(
+                    &run.source_run,
+                    run.start,
+                    regular.latest_source_run.as_deref(),
+                    regular.public_start_utc,
+                    *time,
+                ) {
+                    continue;
+                }
+                let value = ecmwf_second_stage_value_with_terminal_extension(
+                    values,
+                    regular_times,
+                    kind,
+                    *time,
+                    latitudes[point / width] as f32,
+                    longitudes[point % width] as f32,
+                    output_dt_seconds,
+                    product.product == "ecmwf_ifs025_ensemble"
+                        && raw_variable == "precipitation_probability",
+                );
+                if value.is_finite() {
+                    output_frame[point] = value;
+                    break;
+                }
+            }
         }
     }
     Ok(Some(output))
@@ -10886,53 +10876,46 @@ mod tests {
     }
 
     #[test]
-    fn ecmwf_newer_boundary_nan_preserves_older_interpolated_frame() {
-        let start = Utc.with_ymd_and_hms(2026, 7, 26, 18, 0, 0).unwrap();
-        let stitched = stitch_ecmwf_regular_runs(
-            vec![
-                EcmwfRegularRun {
-                    source_run: "2026072000".to_string(),
-                    start,
-                    frames: vec![vec![7.0], vec![6.8], vec![6.5]],
-                },
-                EcmwfRegularRun {
-                    source_run: "2026072012".to_string(),
-                    start,
-                    frames: vec![vec![7.1], vec![f32::NAN], vec![6.6]],
-                },
-            ],
-            1,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(stitched.frames, vec![vec![7.1], vec![6.8], vec![6.6]]);
-    }
-
-    #[test]
-    fn ecmwf_public_window_keeps_latest_predecessor_interpolation_support() {
+    fn ecmwf_rollover_interpolates_each_source_run_before_selection() {
         let start = Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap();
-        let stitched = stitch_ecmwf_regular_runs(
-            vec![
-                EcmwfRegularRun {
-                    source_run: "2026073012".to_string(),
-                    start,
-                    frames: vec![vec![29.1], vec![29.2], vec![29.4]],
-                },
-                EcmwfRegularRun {
-                    source_run: "2026073100".to_string(),
-                    start,
-                    frames: vec![vec![29.3], vec![29.6], vec![29.5]],
-                },
-            ],
-            1,
-            Some(start + Duration::hours(6)),
+        let public_start = start + Duration::hours(16);
+        assert_eq!(
+            ecmwf_latest_support_start(start, public_start),
+            start + Duration::hours(12)
+        );
+        assert!(!ecmwf_run_is_eligible(
+            "2026073100",
+            start,
             Some("2026073100"),
-        )
-        .unwrap();
+            Some(public_start),
+            start + Duration::hours(11)
+        ));
+        assert!(ecmwf_run_is_eligible(
+            "2026073100",
+            start,
+            Some("2026073100"),
+            Some(public_start),
+            start + Duration::hours(12)
+        ));
 
-        assert_eq!(stitched.frames, vec![vec![29.1], vec![29.6], vec![29.5]]);
+        let probability_times = [9, 12, 15, 18]
+            .into_iter()
+            .map(|hour| start + Duration::hours(hour))
+            .collect::<Vec<_>>();
+        let probability = ecmwf_second_stage_value(
+            &[55.0, 90.0, 94.0, 78.0],
+            &probability_times,
+            InterpolationKind::Hermite {
+                scalefactor: 1.0,
+                bounds: Some((0.0, 100.0)),
+            },
+            start + Duration::hours(14),
+            14.0,
+            140.0,
+            3600,
+        );
+        assert_eq!(probability, 95.0);
+
         assert!(ecmwf_source_run_is_retained(
             "2026073012",
             Some("2026073100"),
@@ -12829,8 +12812,13 @@ mod output_tests {
             let first = ecmwf_cached_regular_series(key.clone(), || {
                 builds.set(builds.get() + 1);
                 Ok(Some(EcmwfRegularSeries {
-                    times: vec![Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap()],
-                    frames: vec![vec![20.0]],
+                    runs: vec![EcmwfRegularRun {
+                        source_run: "2026072300".to_string(),
+                        start: Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap(),
+                        frames: vec![vec![20.0]],
+                    }],
+                    public_start_utc: None,
+                    latest_source_run: Some("2026072300".to_string()),
                 }))
             })?
             .unwrap();
