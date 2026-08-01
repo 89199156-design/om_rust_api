@@ -16,6 +16,7 @@ pub const GFS_PRODUCTS: &[&str] = &[
     "ncep_gefs05",
 ];
 pub const CAMS_PRODUCTS: &[&str] = &["cams_global", "cams_global_greenhouse_gases"];
+pub const CAMS_GREENHOUSE_PRODUCTS: &[&str] = &["cams_global_greenhouse_gases"];
 pub const ECMWF_PRODUCTS: &[&str] = &["ecmwf_ifs025", "ecmwf_ifs025_ensemble"];
 
 #[derive(Debug)]
@@ -80,6 +81,24 @@ impl OmDataSnapshot {
                 "cams",
                 CAMS_PRODUCTS,
                 &products,
+                &mut historical_products,
+            )?;
+        }
+        // CAMS ADS publishes greenhouse gases independently from the main
+        // CAMS cycle. Load that authoritative namespace last so a retained
+        // legacy combined marker cannot overwrite it during migration or
+        // rollback.
+        if data_root
+            .join("groups/cams_greenhouse/current/ready_for_processing.json")
+            .is_file()
+        {
+            products.remove("cams_global_greenhouse_gases");
+            historical_products.remove("cams_global_greenhouse_gases");
+            load_native_group_products(
+                &data_root,
+                "cams_greenhouse",
+                CAMS_GREENHOUSE_PRODUCTS,
+                &mut products,
                 &mut historical_products,
             )?;
         }

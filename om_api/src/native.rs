@@ -384,7 +384,7 @@ fn product_source_runs<'a>(
     if !product_ready.source_runs.is_empty() {
         return &product_ready.source_runs;
     }
-    if product == "cams_global_greenhouse_gases" {
+    if product == "cams_global_greenhouse_gases" && !ready.greenhouse_source_runs.is_empty() {
         return &ready.greenhouse_source_runs;
     }
     &ready.source_runs
@@ -688,6 +688,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
         "gfs" => (5, &[6, 6, 6, 6]),
         "cams" => (3, &[12, 12]),
+        "cams_greenhouse" => (3, &[24, 24]),
         // ECMWF retains five bounded older gust runs, the previous complete
         // run, the adjacent short cycle, and the target complete run. This is
         // the source-run stack used by the official rolling gust database.
@@ -716,6 +717,9 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     }
     if ready.source_runs.last() != Some(&ready.latest_complete_run) {
         bail!("native latest_complete_run is not the final source run");
+    }
+    if group == "cams_greenhouse" && parsed.iter().any(|run| run.hour() != 0) {
+        bail!("native CAMS greenhouse runs must use the daily 00 UTC cycle");
     }
     let expected_public_start = if ecmwf_rolling_gust {
         match (ready.generated_at, ready.local_utc_offset_hours) {
@@ -1130,6 +1134,92 @@ mod tests {
         assert_eq!(
             native_time_indices("cams_global", "dust", &meta, 41).unwrap(),
             (0..=120).step_by(3).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn loads_independent_cams_greenhouse_source_runs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let coverage_id = "cams_greenhouse_native_2026073000_independent-v1";
+        let coverage = root.join("coverages/cams_greenhouse").join(coverage_id);
+        fs::create_dir_all(&coverage).unwrap();
+        fs::write(coverage.join("coverage.json"), b"{}").unwrap();
+        let source_runs = ["2026072800", "2026072900", "2026073000"];
+        let forecast_hours = expected_forecast_hours("cams_global_greenhouse_gases", 120);
+        for run in source_runs {
+            let reference = parse_run(run).unwrap();
+            let run_root = coverage
+                .join("data_run/cams_global_greenhouse_gases")
+                .join(run_relative_path(run).unwrap());
+            fs::create_dir_all(&run_root).unwrap();
+            write_fake_om(
+                &run_root.join("carbon_monoxide.om"),
+                [2, 3, forecast_hours.len() as u64],
+            );
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference,
+                    "variables": ["carbon_monoxide"],
+                    "valid_times": forecast_hours
+                        .iter()
+                        .map(|hour| reference + Duration::hours(*hour))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let marker = json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "cams_greenhouse",
+            "coverage_id": coverage_id,
+            "latest_complete_run": "2026073000",
+            "source_runs": source_runs,
+            "public_start_utc": "2026-07-28T00:00:00Z",
+            "coverage_path": format!("coverages/cams_greenhouse/{coverage_id}"),
+            "products": {
+                "cams_global_greenhouse_gases": {
+                    "runtime_domain": "cams_global_greenhouse_gases",
+                    "grid": {
+                        "nx": 3, "ny": 2,
+                        "lon_min": 70.0, "lat_min": 0.0,
+                        "dx": 0.1, "dy": 0.1,
+                        "dt_seconds": 10800,
+                        "om_file_length": 72
+                    }
+                }
+            }
+        });
+        let marker_path = root.join("groups/cams_greenhouse/current/ready_for_processing.json");
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let mut products = HashMap::new();
+        let mut history = HashMap::new();
+        assert!(load_native_group_products(
+            root,
+            "cams_greenhouse",
+            &["cams_global_greenhouse_gases"],
+            &mut products,
+            &mut history,
+        )
+        .unwrap());
+
+        let current = products.get("cams_global_greenhouse_gases").unwrap();
+        assert_eq!(
+            current.manifest.latest_complete_run.as_deref(),
+            Some("2026073000")
+        );
+        assert_eq!(current.entries.len(), 41);
+        assert_eq!(
+            history["cams_global_greenhouse_gases"]
+                .iter()
+                .map(|candidate| candidate.manifest.latest_complete_run.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["2026072900", "2026072800"]
         );
     }
 

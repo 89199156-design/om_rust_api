@@ -48,6 +48,7 @@ struct SnapshotCache {
 struct SnapshotIdentity {
     gfs_ready: Option<GroupIdentity>,
     cams_ready: Option<GroupIdentity>,
+    cams_greenhouse_ready: Option<GroupIdentity>,
     ecmwf_ready: Option<GroupIdentity>,
 }
 
@@ -92,6 +93,7 @@ impl SnapshotIdentity {
         Ok(Self {
             gfs_ready: marker(data_root, "gfs")?,
             cams_ready: marker(data_root, "cams")?,
+            cams_greenhouse_ready: marker(data_root, "cams_greenhouse")?,
             ecmwf_ready: marker(data_root, "ecmwf")?,
         })
     }
@@ -136,6 +138,7 @@ impl AppState {
         Ok(json!({
             "gfs": group(guard.identity.gfs_ready.as_ref()),
             "cams": group(guard.identity.cams_ready.as_ref()),
+            "cams_greenhouse": group(guard.identity.cams_greenhouse_ready.as_ref()),
             "ecmwf": group(guard.identity.ecmwf_ready.as_ref()),
         }))
     }
@@ -648,6 +651,7 @@ mod tests {
         );
         assert_eq!(payload["gfs"]["latest_complete_run"], "2026073006");
         assert!(payload["cams"].is_null());
+        assert!(payload["cams_greenhouse"].is_null());
     }
 
     #[tokio::test]
