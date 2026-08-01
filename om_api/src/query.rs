@@ -6070,7 +6070,6 @@ struct EcmwfRegularCacheKey {
     raw_variable: String,
     latitudes: Vec<u64>,
     longitudes: Vec<u64>,
-    include_latest_source_run: bool,
 }
 
 #[derive(Debug)]
@@ -6522,6 +6521,19 @@ fn ecmwf_second_stage_value_with_terminal_extension(
     }
 }
 
+fn ecmwf_source_run_is_retained(
+    source_run: &str,
+    latest_source_run: Option<&str>,
+    max_forecast_hour: Option<i64>,
+) -> bool {
+    // The seamless IFS025 database rolls between the 00Z/12Z long cycles.
+    // Intermediate 06Z/18Z cycles end at f144 (the compact Singapore
+    // deterministic history may end at f006) and must not overwrite that
+    // history. Older f186 gust-only cycles remain interpolation fallbacks.
+    latest_source_run == Some(source_run)
+        || max_forecast_hour.is_some_and(|max_forecast_hour| max_forecast_hour > 144)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ecmwf_regular_series(
     product: &ProductSnapshot,
@@ -6529,7 +6541,6 @@ fn build_ecmwf_regular_series(
     raw_variable: &str,
     latitudes: &[f64],
     longitudes: &[f64],
-    include_latest_source_run: bool,
 ) -> Result<Option<EcmwfRegularSeries>> {
     if !is_ecmwf_product(&product.product) {
         return Ok(None);
@@ -6539,6 +6550,19 @@ fn build_ecmwf_regular_series(
     let mut source_runs = product
         .entries_by_source_run
         .keys()
+        .filter(|source_run| {
+            ecmwf_source_run_is_retained(
+                source_run,
+                product.manifest.latest_complete_run.as_deref(),
+                product
+                    .entries_by_source_run
+                    .get(*source_run)
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| entry.forecast_hour)
+                    .max(),
+            )
+        })
         .cloned()
         .collect::<Vec<_>>();
     source_runs.sort();
@@ -6558,22 +6582,19 @@ fn build_ecmwf_regular_series(
     if runs.is_empty() {
         return Ok(None);
     }
-    if !include_latest_source_run {
-        let latest_source_run = product.manifest.latest_complete_run.as_deref();
-        runs.retain(|run| Some(run.source_run.as_str()) != latest_source_run);
-        if runs.is_empty() {
-            return Ok(None);
-        }
-    }
     Ok(Some(stitch_ecmwf_regular_runs(
         runs,
         latitudes.len() * longitudes.len(),
+        product.manifest.public_start_utc,
+        product.manifest.latest_complete_run.as_deref(),
     )?))
 }
 
 fn stitch_ecmwf_regular_runs(
     mut runs: Vec<EcmwfRegularRun>,
     grid_len: usize,
+    public_start_utc: Option<DateTime<Utc>>,
+    latest_source_run: Option<&str>,
 ) -> Result<EcmwfRegularSeries> {
     // Oldest-to-newest insertion reproduces Open-Meteo's rolling database:
     // newer runs overwrite only finite frames they can actually reconstruct.
@@ -6581,8 +6602,23 @@ fn stitch_ecmwf_regular_runs(
     runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
     let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
     for run in runs {
+        let latest_support_start = if latest_source_run == Some(run.source_run.as_str()) {
+            public_start_utc.map(|boundary| {
+                let regular_step_seconds = 3 * 3600;
+                let elapsed_seconds = (boundary - run.start).num_seconds().max(0);
+                let containing_frame_seconds =
+                    elapsed_seconds.div_euclid(regular_step_seconds) * regular_step_seconds;
+                run.start
+                    + Duration::seconds((containing_frame_seconds - regular_step_seconds).max(0))
+            })
+        } else {
+            None
+        };
         for (index, frame) in run.frames.into_iter().enumerate() {
             let time = run.start + Duration::hours(index as i64 * 3);
+            if latest_support_start.is_some_and(|support_start| time < support_start) {
+                continue;
+            }
             let target = stitched
                 .entry(time)
                 .or_insert_with(|| vec![f32::NAN; frame.len()]);
@@ -6644,13 +6680,6 @@ fn ecmwf_cached_regular_series(
     Ok(Some(built))
 }
 
-fn ecmwf_uses_historical_series(
-    public_start_utc: Option<DateTime<Utc>>,
-    time: DateTime<Utc>,
-) -> bool {
-    public_start_utc.is_some_and(|boundary| time < boundary)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn read_ecmwf_product_grid_series(
     product: &ProductSnapshot,
@@ -6664,78 +6693,34 @@ fn read_ecmwf_product_grid_series(
     if !is_ecmwf_product(&product.product) {
         return Ok(None);
     }
-    let public_start_utc = product.manifest.public_start_utc;
-    let needs_historical = times
-        .iter()
-        .any(|time| ecmwf_uses_historical_series(public_start_utc, *time));
-    let needs_current = public_start_utc
-        .map(|boundary| times.iter().any(|time| *time >= boundary))
-        .unwrap_or(true);
-    let load_regular = |include_latest_source_run| {
-        let key = EcmwfRegularCacheKey {
-            coverage_id: product.manifest.coverage_id.clone(),
-            raw_variable: raw_variable.to_string(),
-            latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
-            longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
-            include_latest_source_run,
-        };
-        ecmwf_cached_regular_series(key, || {
-            build_ecmwf_regular_series(
-                product,
-                decoder,
-                raw_variable,
-                latitudes,
-                longitudes,
-                include_latest_source_run,
-            )
-        })
+    let key = EcmwfRegularCacheKey {
+        coverage_id: product.manifest.coverage_id.clone(),
+        raw_variable: raw_variable.to_string(),
+        latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
+        longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
     };
-    let current = if needs_current {
-        load_regular(true)?
-    } else {
-        None
-    };
-    let historical = if needs_historical {
-        load_regular(false)?
-    } else {
-        None
-    };
-    if current.is_none() && historical.is_none() {
+    let Some(regular) = ecmwf_cached_regular_series(key, || {
+        build_ecmwf_regular_series(product, decoder, raw_variable, latitudes, longitudes)
+    })?
+    else {
         return Ok(None);
-    }
+    };
+    let regular_times = &regular.times;
+    let regular_frames = &regular.frames;
     let kind = ecmwf_interpolation_kind(raw_variable);
     let output_dt_seconds = series_dt_seconds(times);
     let grid_len = latitudes.len() * longitudes.len();
     let width = longitudes.len();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
     for point in 0..grid_len {
-        let current_values = current.as_ref().map(|regular| {
-            regular
-                .frames
-                .iter()
-                .map(|frame| frame[point])
-                .collect::<Vec<_>>()
-        });
-        let historical_values = historical.as_ref().map(|regular| {
-            regular
-                .frames
-                .iter()
-                .map(|frame| frame[point])
-                .collect::<Vec<_>>()
-        });
+        let values = regular_frames
+            .iter()
+            .map(|frame| frame[point])
+            .collect::<Vec<_>>();
         for (output_frame, time) in output.iter_mut().zip(times) {
-            let use_historical = ecmwf_uses_historical_series(public_start_utc, *time);
-            let selected = if use_historical {
-                historical.as_ref().zip(historical_values.as_ref())
-            } else {
-                current.as_ref().zip(current_values.as_ref())
-            };
-            let Some((regular, values)) = selected else {
-                continue;
-            };
             output_frame[point] = ecmwf_second_stage_value_with_terminal_extension(
-                values,
-                &regular.times,
+                &values,
+                regular_times,
                 kind,
                 *time,
                 latitudes[point / width] as f32,
@@ -10917,6 +10902,8 @@ mod tests {
                 },
             ],
             1,
+            None,
+            None,
         )
         .unwrap();
 
@@ -10924,9 +10911,9 @@ mod tests {
     }
 
     #[test]
-    fn ecmwf_public_window_uses_latest_run_with_hidden_interpolation_support() {
+    fn ecmwf_public_window_keeps_latest_predecessor_interpolation_support() {
         let start = Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap();
-        let current = stitch_ecmwf_regular_runs(
+        let stitched = stitch_ecmwf_regular_runs(
             vec![
                 EcmwfRegularRun {
                     source_run: "2026073012".to_string(),
@@ -10940,28 +10927,31 @@ mod tests {
                 },
             ],
             1,
+            Some(start + Duration::hours(6)),
+            Some("2026073100"),
         )
         .unwrap();
-        let historical = stitch_ecmwf_regular_runs(
-            vec![EcmwfRegularRun {
-                source_run: "2026073012".to_string(),
-                start,
-                frames: vec![vec![29.1], vec![29.2], vec![29.4]],
-            }],
-            1,
-        )
-        .unwrap();
-        let public_start = start + Duration::hours(6);
 
-        assert_eq!(current.frames, vec![vec![29.3], vec![29.6], vec![29.5]]);
-        assert_eq!(historical.frames, vec![vec![29.1], vec![29.2], vec![29.4]]);
-        assert!(ecmwf_uses_historical_series(
-            Some(public_start),
-            public_start - Duration::hours(1)
+        assert_eq!(stitched.frames, vec![vec![29.1], vec![29.6], vec![29.5]]);
+        assert!(ecmwf_source_run_is_retained(
+            "2026073012",
+            Some("2026073100"),
+            Some(360)
         ));
-        assert!(!ecmwf_uses_historical_series(
-            Some(public_start),
-            public_start
+        assert!(ecmwf_source_run_is_retained(
+            "2026072800",
+            Some("2026073100"),
+            Some(186)
+        ));
+        assert!(!ecmwf_source_run_is_retained(
+            "2026073018",
+            Some("2026073100"),
+            Some(144)
+        ));
+        assert!(ecmwf_source_run_is_retained(
+            "2026073100",
+            Some("2026073100"),
+            Some(6)
         ));
     }
 
@@ -12834,7 +12824,6 @@ mod output_tests {
             raw_variable: "temperature_2m".to_string(),
             latitudes: vec![31.25_f64.to_bits()],
             longitudes: vec![121.5_f64.to_bits()],
-            include_latest_source_run: true,
         };
         with_ecmwf_request_cache(|| {
             let first = ecmwf_cached_regular_series(key.clone(), || {
