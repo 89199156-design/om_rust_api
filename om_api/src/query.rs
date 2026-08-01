@@ -8503,7 +8503,18 @@ fn read_hermite_value(
     bounds: Option<(f32, f32)>,
     round_values: bool,
 ) -> Result<f32> {
-    let native_times = native_times_for_variable(product, raw_variable);
+    // Singapore's Swift CAMS producer materializes the official three-hour
+    // Hermite interpolation onto a quantized hourly OM axis. Public raw
+    // concentrations should use those materialized values, but derived air
+    // quality indices require the unquantized reader value used by the
+    // official bucket API. Reconstruct that value from the unchanged
+    // three-hour source anchors already present in the same native file.
+    let native_times = if !round_values && product.product == "cams_global" {
+        cams_native_source_anchor_times(product, raw_variable)
+            .unwrap_or_else(|| native_times_for_variable(product, raw_variable))
+    } else {
+        native_times_for_variable(product, raw_variable)
+    };
     let Some((index, fraction)) = interpolation_index(&native_times, time) else {
         return Ok(f32::NAN);
     };
@@ -8567,6 +8578,33 @@ fn read_hermite_value(
         scaled = scaled.clamp(lower, upper);
     }
     Ok(scaled)
+}
+
+fn cams_native_source_anchor_times(
+    product: &ProductSnapshot,
+    raw_variable: &str,
+) -> Option<Vec<DateTime<Utc>>> {
+    let entries = product
+        .entries
+        .values()
+        .filter(|entry| entry.variable == raw_variable)
+        .collect::<Vec<_>>();
+    if !entries.iter().any(|entry| {
+        entry
+            .native_grid
+            .as_ref()
+            .is_some_and(|grid| grid.dt_seconds == 3600)
+    }) {
+        return None;
+    }
+    let mut times = entries
+        .into_iter()
+        .filter(|entry| entry.forecast_hour.rem_euclid(3) == 0)
+        .map(|entry| entry.valid_time_utc)
+        .collect::<Vec<_>>();
+    times.sort_unstable();
+    times.dedup();
+    (times.len() >= 2).then_some(times)
 }
 
 fn missing_second_lookahead_value(product: &ProductSnapshot, b: f32, c: f32) -> f32 {

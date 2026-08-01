@@ -176,6 +176,33 @@ fn write_group_ready(root: &Path, group: &str, products: &[(&str, &str)]) {
     .unwrap();
 }
 
+fn mark_coverage_entries_as_native_hourly(root: &Path, product: &str, coverage_id: &str) {
+    let coverage_manifest = root
+        .join(product)
+        .join("coverages")
+        .join(coverage_id)
+        .join("latest.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(&coverage_manifest).unwrap()).unwrap();
+    for file in manifest["files"].as_array_mut().unwrap() {
+        for entry in file["entries"].as_array_mut().unwrap() {
+            entry["native_grid"] = serde_json::json!({
+                "nx": 2,
+                "ny": 2,
+                "lon_min": -180.0,
+                "lat_min": -90.0,
+                "dx": 1.0,
+                "dy": 1.0,
+                "dt_seconds": 3600,
+                "om_file_length": 10
+            });
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    fs::write(&coverage_manifest, &bytes).unwrap();
+    fs::write(root.join(product).join("current/latest.json"), bytes).unwrap();
+}
+
 fn write_group_ready_with_product_runs(
     root: &Path,
     group: &str,
@@ -1309,6 +1336,47 @@ async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
         body["hourly"]["chinese_aqi_pm2_5"],
         serde_json::json!([100])
     );
+}
+
+#[tokio::test]
+async fn chinese_aqi_reconstructs_unquantized_cams_value_from_native_anchors() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "cams_global_native_hourly_aqi_boundary";
+    let values = [0.4_f32, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.4, 0.3];
+    let entries = values
+        .into_iter()
+        .enumerate()
+        .map(|(hour, value)| TimedTestEntry {
+            variable: "nitrogen_dioxide",
+            values: [value, value, value, value],
+            valid_time_utc: Box::leak(format!("2026-07-08T{hour:02}:00:00Z").into_boxed_str()),
+        })
+        .collect();
+    write_product_coverage_timed_with_source_run(
+        root.path(),
+        "cams_global",
+        current,
+        entries,
+        true,
+        "2026070800",
+        true,
+    );
+    mark_coverage_entries_as_native_hourly(root.path(), "cams_global", current);
+    write_group_ready(root.path(), "cams", &[("cams_global", current)]);
+
+    let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
+    let (status, body) = request_json(
+        app,
+        "/v1/cams?latitude=-90&longitude=-180&hourly=nitrogen_dioxide,chinese_aqi_no2&start_hour=2026-07-08T04:00&end_hour=2026-07-08T04:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Raw output remains the producer's public 0.1-quantized hourly value.
+    assert_eq!(body["hourly"]["nitrogen_dioxide"], serde_json::json!([0.5]));
+    // The derived index uses the unquantized Hermite value (> 0.5) rebuilt
+    // from the original 3-hour anchors, matching the official bucket reader.
+    assert_eq!(body["hourly"]["chinese_aqi_no2"], serde_json::json!([1]));
 }
 
 #[tokio::test]
