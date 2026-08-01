@@ -6079,6 +6079,12 @@ struct EcmwfRegularSeries {
     latest_source_run: Option<String>,
 }
 
+#[derive(Debug)]
+struct EcmwfStitchedRegularSeries {
+    times: Vec<DateTime<Utc>>,
+    frames: Vec<Vec<f32>>,
+}
+
 #[cfg(test)]
 static ECMWF_REGULAR_SERIES_BUILD_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -6617,6 +6623,56 @@ fn ecmwf_run_is_eligible(
         .unwrap_or(true)
 }
 
+fn stitch_ecmwf_fallback_runs(
+    regular: &EcmwfRegularSeries,
+    grid_len: usize,
+) -> Result<EcmwfStitchedRegularSeries> {
+    let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
+    for run in &regular.runs {
+        for (index, frame) in run.frames.iter().enumerate() {
+            let time = run.start + Duration::hours(index as i64 * 3);
+            if !ecmwf_run_is_eligible(
+                &run.source_run,
+                run.start,
+                regular.latest_source_run.as_deref(),
+                regular.public_start_utc,
+                time,
+            ) {
+                continue;
+            }
+            let target = stitched
+                .entry(time)
+                .or_insert_with(|| vec![f32::NAN; frame.len()]);
+            for (target_value, value) in target.iter_mut().zip(frame) {
+                if value.is_finite() {
+                    *target_value = *value;
+                }
+            }
+        }
+    }
+    let first = *stitched
+        .keys()
+        .next()
+        .context("ECMWF fallback series is empty")?;
+    let last = *stitched
+        .keys()
+        .next_back()
+        .context("ECMWF fallback series is empty")?;
+    let count = usize::try_from((last - first).num_hours() / 3 + 1)?;
+    let mut times = Vec::with_capacity(count);
+    let mut frames = Vec::with_capacity(count);
+    for index in 0..count {
+        let time = first + Duration::hours(index as i64 * 3);
+        times.push(time);
+        frames.push(
+            stitched
+                .remove(&time)
+                .unwrap_or_else(|| vec![f32::NAN; grid_len]),
+        );
+    }
+    Ok(EcmwfStitchedRegularSeries { times, frames })
+}
+
 fn ecmwf_cached_regular_series(
     key: EcmwfRegularCacheKey,
     build: impl FnOnce() -> Result<Option<EcmwfRegularSeries>>,
@@ -6672,7 +6728,32 @@ fn read_ecmwf_product_grid_series(
     let grid_len = latitudes.len() * longitudes.len();
     let width = longitudes.len();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
+    let stitched_fallback = if raw_variable == "wind_gusts_10m" {
+        Some(stitch_ecmwf_fallback_runs(&regular, grid_len)?)
+    } else {
+        None
+    };
     for point in 0..grid_len {
+        if let Some(stitched) = &stitched_fallback {
+            let values = stitched
+                .frames
+                .iter()
+                .map(|frame| frame[point])
+                .collect::<Vec<_>>();
+            for (output_frame, time) in output.iter_mut().zip(times) {
+                output_frame[point] = ecmwf_second_stage_value_with_terminal_extension(
+                    &values,
+                    &stitched.times,
+                    kind,
+                    *time,
+                    latitudes[point / width] as f32,
+                    longitudes[point % width] as f32,
+                    output_dt_seconds,
+                    false,
+                );
+            }
+            continue;
+        }
         // Interpolate every source run independently before choosing the
         // seamless rolling value. Mixing native control points from adjacent
         // runs changes Hermite extrema at the rollover boundary.
@@ -10936,6 +11017,33 @@ mod tests {
             Some("2026073100"),
             Some(6)
         ));
+    }
+
+    #[test]
+    fn ecmwf_gust_fallback_stitches_native_gaps_before_interpolation() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap();
+        let stitched = stitch_ecmwf_fallback_runs(
+            &EcmwfRegularSeries {
+                runs: vec![
+                    EcmwfRegularRun {
+                        source_run: "2026073012".to_string(),
+                        start,
+                        frames: vec![vec![19.2], vec![18.8], vec![18.4]],
+                    },
+                    EcmwfRegularRun {
+                        source_run: "2026073100".to_string(),
+                        start,
+                        frames: vec![vec![f32::NAN], vec![19.0], vec![f32::NAN]],
+                    },
+                ],
+                public_start_utc: None,
+                latest_source_run: Some("2026073100".to_string()),
+            },
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(stitched.frames, vec![vec![19.2], vec![19.0], vec![18.4]]);
     }
 
     #[test]
