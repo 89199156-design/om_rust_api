@@ -8584,6 +8584,17 @@ fn cams_native_source_anchor_times(
     product: &ProductSnapshot,
     raw_variable: &str,
 ) -> Option<Vec<DateTime<Utc>>> {
+    // The official CAMS bucket keeps gases and dust on their source 3-hour
+    // axis, while PM2.5, PM10 and aerosol optical depth are already published
+    // hourly. Only reconstruct variables that are sparse in that reference
+    // product; otherwise an authoritative hourly PM value could be replaced
+    // by a different interpolation through its surrounding anchors.
+    if !matches!(
+        raw_variable,
+        "carbon_monoxide" | "dust" | "nitrogen_dioxide" | "ozone" | "sulphur_dioxide"
+    ) {
+        return None;
+    }
     let entries = product
         .entries
         .values()

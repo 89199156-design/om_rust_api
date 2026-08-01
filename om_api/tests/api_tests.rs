@@ -1342,16 +1342,23 @@ async fn chinese_hourly_pm2_5_uses_hj633_2026_breakpoints() {
 async fn chinese_aqi_reconstructs_unquantized_cams_value_from_native_anchors() {
     let root = tempfile::tempdir().unwrap();
     let current = "cams_global_native_hourly_aqi_boundary";
-    let values = [0.4_f32, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.4, 0.3];
-    let entries = values
-        .into_iter()
-        .enumerate()
-        .map(|(hour, value)| TimedTestEntry {
+    let no2 = [0.4_f32, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.4, 0.3];
+    let pm10 = [8.9_f32, 9.1, 9.4, 9.7, 10.6, 11.1, 11.6, 11.7, 11.6, 11.4];
+    let mut entries = Vec::new();
+    for (hour, (no2, pm10)) in no2.into_iter().zip(pm10).enumerate() {
+        let valid_time_utc: &'static str =
+            Box::leak(format!("2026-07-08T{hour:02}:00:00Z").into_boxed_str());
+        entries.push(TimedTestEntry {
             variable: "nitrogen_dioxide",
-            values: [value, value, value, value],
-            valid_time_utc: Box::leak(format!("2026-07-08T{hour:02}:00:00Z").into_boxed_str()),
-        })
-        .collect();
+            values: [no2, no2, no2, no2],
+            valid_time_utc,
+        });
+        entries.push(TimedTestEntry {
+            variable: "pm10",
+            values: [pm10, pm10, pm10, pm10],
+            valid_time_utc,
+        });
+    }
     write_product_coverage_timed_with_source_run(
         root.path(),
         "cams_global",
@@ -1367,7 +1374,7 @@ async fn chinese_aqi_reconstructs_unquantized_cams_value_from_native_anchors() {
     let app = router(AppState::new(root.path().to_path_buf(), None).unwrap());
     let (status, body) = request_json(
         app,
-        "/v1/cams?latitude=-90&longitude=-180&hourly=nitrogen_dioxide,chinese_aqi_no2&start_hour=2026-07-08T04:00&end_hour=2026-07-08T04:00",
+        "/v1/cams?latitude=-90&longitude=-180&hourly=nitrogen_dioxide,pm10,chinese_aqi_no2,chinese_aqi_pm10&start_hour=2026-07-08T04:00&end_hour=2026-07-08T04:00",
     )
     .await;
 
@@ -1377,6 +1384,10 @@ async fn chinese_aqi_reconstructs_unquantized_cams_value_from_native_anchors() {
     // The derived index uses the unquantized Hermite value (> 0.5) rebuilt
     // from the original 3-hour anchors, matching the official bucket reader.
     assert_eq!(body["hourly"]["chinese_aqi_no2"], serde_json::json!([1]));
+    // PM10 is hourly in the official bucket and therefore keeps its exact
+    // materialized value instead of being reconstructed from 3-hour anchors.
+    assert_eq!(body["hourly"]["pm10"], serde_json::json!([10.6]));
+    assert_eq!(body["hourly"]["chinese_aqi_pm10"], serde_json::json!([11]));
 }
 
 #[tokio::test]
