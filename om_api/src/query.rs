@@ -6559,21 +6559,32 @@ fn build_ecmwf_regular_series(
     Ok(Some(stitch_ecmwf_regular_runs(
         runs,
         latitudes.len() * longitudes.len(),
+        product.manifest.public_start_utc,
+        product.manifest.latest_complete_run.as_deref(),
     )?))
 }
 
 fn stitch_ecmwf_regular_runs(
     mut runs: Vec<EcmwfRegularRun>,
     grid_len: usize,
+    public_start_utc: Option<DateTime<Utc>>,
+    latest_source_run: Option<&str>,
 ) -> Result<EcmwfRegularSeries> {
     // Oldest-to-newest insertion reproduces Open-Meteo's rolling database:
     // newer runs overwrite only finite frames they can actually reconstruct.
+    // The latest run is published only from `public_start_utc`; frames before
+    // that boundary remain the rolling history assembled from earlier runs.
     // A boundary NaN must retain the older run's fully supported interpolation.
     runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
     let mut stitched = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
     for run in runs {
         for (index, frame) in run.frames.into_iter().enumerate() {
             let time = run.start + Duration::hours(index as i64 * 3);
+            if latest_source_run == Some(run.source_run.as_str())
+                && public_start_utc.is_some_and(|boundary| time < boundary)
+            {
+                continue;
+            }
             let target = stitched
                 .entry(time)
                 .or_insert_with(|| vec![f32::NAN; frame.len()]);
@@ -10857,10 +10868,37 @@ mod tests {
                 },
             ],
             1,
+            None,
+            None,
         )
         .unwrap();
 
         assert_eq!(stitched.frames, vec![vec![7.1], vec![6.8], vec![6.6]]);
+    }
+
+    #[test]
+    fn ecmwf_latest_run_only_overwrites_from_public_boundary() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap();
+        let stitched = stitch_ecmwf_regular_runs(
+            vec![
+                EcmwfRegularRun {
+                    source_run: "2026073012".to_string(),
+                    start,
+                    frames: vec![vec![29.1], vec![29.2], vec![29.4]],
+                },
+                EcmwfRegularRun {
+                    source_run: "2026073100".to_string(),
+                    start,
+                    frames: vec![vec![29.3], vec![29.6], vec![29.5]],
+                },
+            ],
+            1,
+            Some(start + Duration::hours(6)),
+            Some("2026073100"),
+        )
+        .unwrap();
+
+        assert_eq!(stitched.frames, vec![vec![29.1], vec![29.2], vec![29.5]]);
     }
 
     #[test]
