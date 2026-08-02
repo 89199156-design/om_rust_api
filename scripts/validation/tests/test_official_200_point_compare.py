@@ -12,19 +12,19 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "official_100_point_compare", ROOT / "official_100_point_compare.py"
+    "official_200_point_compare", ROOT / "official_200_point_compare.py"
 )
 assert SPEC is not None and SPEC.loader is not None
 compare = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(compare)
 
 
-class Official100PointCompareTests(unittest.TestCase):
-    def test_plan_has_exactly_one_hundred_stable_points(self) -> None:
+class Official200PointCompareTests(unittest.TestCase):
+    def test_plan_has_exactly_two_hundred_stable_points(self) -> None:
         points = compare.sample_points()
-        self.assertEqual(len(points), 100)
+        self.assertEqual(len(points), 200)
         self.assertEqual(points, compare.sample_points())
-        self.assertEqual(len({point["id"] for point in points}), 100)
+        self.assertEqual(len({point["id"] for point in points}), 200)
         kinds = {point["kind"] for point in points}
         self.assertEqual(
             kinds,
@@ -36,11 +36,11 @@ class Official100PointCompareTests(unittest.TestCase):
         )
         self.assertEqual(
             sum(point["kind"] == "random_exact_common_native_grid" for point in points),
-            35,
+            70,
         )
         self.assertEqual(
             sum(point["kind"] != "random_exact_common_native_grid" for point in points),
-            65,
+            130,
         )
 
     def test_probability_daily_aggregations_are_in_both_weather_catalogs(self) -> None:
@@ -87,8 +87,10 @@ class Official100PointCompareTests(unittest.TestCase):
         finally:
             compare.MODEL_SPECS["cams"] = original
 
-    def test_official_payload_uses_one_multi_location_request(self) -> None:
-        payload = compare.official_payload("gfs", compare.sample_points())
+    def test_official_payload_uses_one_hundred_location_batch(self) -> None:
+        payload = compare.official_payload(
+            "gfs", compare.sample_points()[: compare.OFFICIAL_BATCH_SIZE]
+        )
         self.assertEqual(len(payload["latitude"]), 100)
         self.assertEqual(len(payload["longitude"]), 100)
         self.assertEqual(payload["cell_selection"], "nearest")
@@ -297,6 +299,9 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertNotIn("commercial-secret", json.dumps(persisted_metadata))
         self.assertFalse(metadata["api_key_persisted"])
         self.assertEqual(metadata["api_access_tier"], "customer_commercial")
+        self.assertEqual(metadata["official_request_count"], 2)
+        self.assertEqual(metadata["official_batch_size"], 100)
+        self.assertEqual(len(metadata["batches"]), 2)
 
     def test_capture_without_key_uses_public_noncommercial_endpoint(self) -> None:
         captured: dict[str, object] = {}
@@ -316,6 +321,7 @@ class Official100PointCompareTests(unittest.TestCase):
         self.assertNotIn("apikey", json.loads(captured["body"]))
         self.assertEqual(metadata["api_access_tier"], "public_noncommercial")
         self.assertEqual(metadata["api_key_transport"], "none")
+        self.assertEqual(metadata["official_request_count"], 2)
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
         original = compare.MODEL_SPECS["gfs"]

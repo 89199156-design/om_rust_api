@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot once, then compare 100 points against the official APIs.
+"""Snapshot once, then compare 200 points against the official APIs.
 
 The official response for each model is captured by one multi-location POST.
 Validation then requests the local API one point at a time and stops at the
@@ -44,9 +44,10 @@ except ImportError:
     from ecmwf_variable_catalog import HOURLY_VARIABLES as ECMWF_HOURLY
 
 
-SCHEMA_VERSION = 1
-POINT_COUNT = 100
-USER_AGENT = "om-weather-server-official-100-point-validation/1.0"
+SCHEMA_VERSION = 2
+POINT_COUNT = 200
+OFFICIAL_BATCH_SIZE = 100
+USER_AGENT = "om-weather-server-official-200-point-validation/1.0"
 # A single-point response with every public surface field is small, while each
 # HTTP round trip makes the API repeat model lookup and time-axis work.  Keep
 # hourly and daily requests separate, but normally fit each period into one
@@ -58,7 +59,7 @@ DEFAULT_MIN_AVAILABLE_MEMORY_MIB = 768.0
 DEFAULT_MAX_IO_FULL_PRESSURE_AVG10 = 10.0
 DEFAULT_RESOURCE_WAIT_TIMEOUT_SECONDS = 900.0
 DEFAULT_RESOURCE_POLL_SECONDS = 5.0
-DEFAULT_MAX_LOCAL_OM_API_PROCESSES = 2
+DEFAULT_MAX_LOCAL_OM_API_PROCESSES = 1
 GFS_SURFACE = (
     "temperature_2m",
     "apparent_temperature",
@@ -460,7 +461,7 @@ def wait_for_safe_local_resources(
 
 @contextlib.contextmanager
 def validation_lock(output: Path):
-    lock_path = output / ".official-100-validation.lock"
+    lock_path = output / ".official-200-validation.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     fcntl_module = None
@@ -630,14 +631,14 @@ def write_json(path: Path, value: Any, *, immutable: bool = False) -> None:
 def validation_manifest(models: list[str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_100_point_validation_manifest",
+        "type": "official_200_point_validation_manifest",
         "models": models,
         "point_count_per_model": POINT_COUNT,
         "random_seed": 20260729,
         "sampling_cohorts": {
-            "random_exact_common_native_grid": 35,
-            "random_offgrid_near_native_grid": 35,
-            "random_offgrid_uniform_crop": 30,
+            "random_exact_common_native_grid": 70,
+            "random_offgrid_near_native_grid": 70,
+            "random_offgrid_uniform_crop": 60,
         },
         "cell_selection": "nearest",
         "points": sample_points(),
@@ -697,7 +698,7 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
     ]
     randomizer.shuffle(common_grid)
     points: list[dict[str, Any]] = []
-    for latitude, longitude in common_grid[:35]:
+    for latitude, longitude in common_grid[:70]:
         points.append(
             {
                 "id": f"p{len(points):03d}",
@@ -707,7 +708,7 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
                 "kind": "random_exact_common_native_grid",
             }
         )
-    for latitude, longitude in common_grid[35:70]:
+    for latitude, longitude in common_grid[70:140]:
         latitude += randomizer.uniform(0.031, 0.179)
         longitude += randomizer.uniform(0.031, 0.179)
         points.append(
@@ -824,14 +825,48 @@ def capture_official(
         raw = response_path.read_bytes()
         if metadata.get("response_sha256") != sha256_bytes(raw):
             raise ValidationError(f"official snapshot hash mismatch: {response_path}")
+        batch_artifacts = metadata.get("batches")
+        if not isinstance(batch_artifacts, list) or len(batch_artifacts) != metadata.get(
+            "official_request_count"
+        ):
+            raise ValidationError(f"official batch metadata is invalid: {metadata_path}")
+        for batch_index, artifact in enumerate(batch_artifacts):
+            if not isinstance(artifact, dict):
+                raise ValidationError(f"official batch metadata is invalid: {metadata_path}")
+            request_batch_path = model_dir / f"request-{batch_index:03d}.json"
+            response_batch_path = model_dir / f"response-{batch_index:03d}.json"
+            if artifact.get("request_file") != request_batch_path.name or artifact.get(
+                "response_file"
+            ) != response_batch_path.name:
+                raise ValidationError(f"official batch filenames are invalid: {metadata_path}")
+            try:
+                persisted_request = json.loads(
+                    request_batch_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValidationError(
+                    f"official batch request is invalid: {request_batch_path}"
+                ) from exc
+            if artifact.get("request_sha256") != sha256_bytes(
+                canonical_bytes(persisted_request)
+            ):
+                raise ValidationError(
+                    f"official batch request hash mismatch: {request_batch_path}"
+                )
+            try:
+                persisted_response = response_batch_path.read_bytes()
+            except OSError as exc:
+                raise ValidationError(
+                    f"official batch response is unavailable: {response_batch_path}"
+                ) from exc
+            if artifact.get("response_sha256") != sha256_bytes(persisted_response):
+                raise ValidationError(
+                    f"official batch response hash mismatch: {response_batch_path}"
+                )
         return metadata
 
     points = sample_points()
-    payload = official_payload(model, points)
-    payload_raw = canonical_bytes(payload)
     api_key = (api_key or "").strip()
-    wire_payload = {**payload, **({"apikey": api_key} if api_key else {})}
-    wire_payload_raw = canonical_bytes(wire_payload)
     endpoint_key = "customer_endpoint" if api_key else "public_endpoint"
     endpoint = MODEL_SPECS[model][endpoint_key]
     headers = {
@@ -839,21 +874,64 @@ def capture_official(
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
     }
-    raw, response_headers, elapsed = request_json(
-        "POST",
-        endpoint,
-        body=wire_payload_raw,
-        headers=headers,
-        timeout=timeout,
-        retries=retries,
-        redact=(api_key,) if api_key else (),
-    )
-    try:
-        rows = normalize_rows(json.loads(raw), POINT_COUNT)
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValidationError(f"official {model} response is not valid JSON") from exc
-    write_once(request_path, pretty_bytes(payload))
-    write_once(response_path, raw)
+    payloads: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    batch_artifacts: list[dict[str, Any]] = []
+    total_elapsed = 0.0
+    for batch_index, start in enumerate(range(0, len(points), OFFICIAL_BATCH_SIZE)):
+        batch_points = points[start : start + OFFICIAL_BATCH_SIZE]
+        payload = official_payload(model, batch_points)
+        payloads.append(payload)
+        payload_raw = canonical_bytes(payload)
+        wire_payload = {**payload, **({"apikey": api_key} if api_key else {})}
+        raw, response_headers, elapsed = request_json(
+            "POST",
+            endpoint,
+            body=canonical_bytes(wire_payload),
+            headers=headers,
+            timeout=timeout,
+            retries=retries,
+            redact=(api_key,) if api_key else (),
+        )
+        try:
+            batch_rows = normalize_rows(json.loads(raw), len(batch_points))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValidationError(
+                f"official {model} batch {batch_index} response is not valid JSON"
+            ) from exc
+        batch_request_path = model_dir / f"request-{batch_index:03d}.json"
+        batch_response_path = model_dir / f"response-{batch_index:03d}.json"
+        write_once(batch_request_path, pretty_bytes(payload))
+        write_once(batch_response_path, raw)
+        rows.extend(batch_rows)
+        total_elapsed += elapsed
+        batch_artifacts.append(
+            {
+                "batch_index": batch_index,
+                "point_offset": start,
+                "point_count": len(batch_points),
+                "request_file": batch_request_path.name,
+                "request_sha256": sha256_bytes(payload_raw),
+                "response_file": batch_response_path.name,
+                "response_sha256": sha256_bytes(raw),
+                "response_bytes": len(raw),
+                "elapsed_seconds": round(elapsed, 6),
+                "response_headers": response_headers,
+            }
+        )
+    if len(rows) != POINT_COUNT:
+        raise ValidationError(
+            f"official {model} merged response row count mismatch: "
+            f"expected={POINT_COUNT}, actual={len(rows)}"
+        )
+    request_snapshot = {
+        "batch_size": OFFICIAL_BATCH_SIZE,
+        "batches": payloads,
+    }
+    request_snapshot_raw = canonical_bytes(request_snapshot)
+    response_snapshot_raw = canonical_bytes(rows)
+    write_once(request_path, pretty_bytes(request_snapshot))
+    write_once(response_path, response_snapshot_raw)
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "type": "official_multi_location_snapshot",
@@ -861,13 +939,14 @@ def capture_official(
         "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "endpoint": endpoint,
         "method": "POST",
-        "official_request_count": 1,
+        "official_request_count": len(batch_artifacts),
+        "official_batch_size": OFFICIAL_BATCH_SIZE,
         "point_count": len(rows),
-        "request_sha256": sha256_bytes(payload_raw),
-        "response_sha256": sha256_bytes(raw),
-        "response_bytes": len(raw),
-        "elapsed_seconds": round(elapsed, 6),
-        "response_headers": response_headers,
+        "request_sha256": sha256_bytes(request_snapshot_raw),
+        "response_sha256": sha256_bytes(response_snapshot_raw),
+        "response_bytes": len(response_snapshot_raw),
+        "elapsed_seconds": round(total_elapsed, 6),
+        "batches": batch_artifacts,
         "api_access_tier": "customer_commercial" if api_key else "public_noncommercial",
         "api_key_transport": (
             "POST JSON apikey field (excluded from request snapshot)"
@@ -1308,6 +1387,10 @@ def validate_model(
     attempt_id: str | None = None,
     point_limit: int = POINT_COUNT,
 ) -> dict[str, Any]:
+    if point_limit > POINT_COUNT:
+        raise ValidationError(
+            f"point limit exceeds immutable plan: {point_limit} > {POINT_COUNT}"
+        )
     official_path = output / model / "official" / "response.json"
     metadata_path = output / model / "official" / "metadata.json"
     if not official_path.exists() or not metadata_path.exists():
@@ -1322,7 +1405,7 @@ def validate_model(
     report_path = output / model / "report.json"
     report = {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_100_point_comparison",
+        "type": "official_200_point_comparison",
         "model": model,
         "status": "running",
         "official_snapshot_sha256": metadata["response_sha256"],
@@ -1717,7 +1800,7 @@ def parse_args() -> argparse.Namespace:
         "--point-limit",
         type=int,
         default=POINT_COUNT,
-        help="validate only the first N points for a partial smoke run (maximum 100)",
+        help="validate only the first N points for a partial smoke run (maximum 200)",
     )
     return parser.parse_args()
 
@@ -1751,6 +1834,10 @@ def main() -> int:
     invalid_positive = [name for name, value in positive.items() if value <= 0]
     if invalid_positive:
         raise ValidationError(f"{', '.join(invalid_positive)} must be positive")
+    if args.point_limit > POINT_COUNT:
+        raise ValidationError(
+            f"--point-limit must not exceed the {POINT_COUNT}-point immutable plan"
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
     ensure_validation_manifest(manifest_path, models)

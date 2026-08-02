@@ -20,7 +20,7 @@ if str(VALIDATION_ROOT) not in sys.path:
 
 from ecmwf_variable_catalog import DAILY_VARIABLES as ECMWF_DAILY
 from ecmwf_variable_catalog import HOURLY_VARIABLES as ECMWF_HOURLY
-from official_100_point_compare import (
+from official_200_point_compare import (
     CAMS_RAW,
     GFS_DAILY,
     GFS_HOURLY,
