@@ -102,8 +102,24 @@ impl WeatherModel {
 thread_local! {
     static REQUEST_WEATHER_MODEL: RefCell<WeatherModel> = const { RefCell::new(WeatherModel::Gfs) };
     static ECMWF_REQUEST_REGULAR_CACHE: RefCell<Option<HashMap<EcmwfRegularCacheKey, Arc<EcmwfRegularSeries>>>> = const { RefCell::new(None) };
+    static GFS_REQUEST_PROBABILITY_HISTORY_CACHE: RefCell<Option<HashMap<GfsProbabilityHistoryCacheKey, Arc<GfsProbabilityPointHistory>>>> = const { RefCell::new(None) };
     static GFS_REQUEST_PROBABILITY_SUPPORT_CACHE: RefCell<Option<HashMap<GfsProbabilitySupportCacheKey, Option<f32>>>> = const { RefCell::new(None) };
     static DAILY_REQUEST_SERIES_CACHE: RefCell<Option<HashMap<DailySeriesCacheKey, Arc<Vec<f32>>>>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GfsProbabilityHistoryCacheKey {
+    coverage_ids: Vec<String>,
+    raw_variable: String,
+    latitude_bits: u64,
+    longitude_bits: u64,
+}
+
+#[derive(Debug)]
+struct GfsProbabilityPointHistory {
+    regular_seconds: i64,
+    regular_times: Vec<DateTime<Utc>>,
+    values: Vec<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -168,8 +184,16 @@ fn with_gfs_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<T>
             true
         }
     });
+    if owns_cache {
+        GFS_REQUEST_PROBABILITY_HISTORY_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(HashMap::new());
+        });
+    }
     let result = operation();
     if owns_cache {
+        GFS_REQUEST_PROBABILITY_HISTORY_CACHE.with(|cache| {
+            cache.borrow_mut().take();
+        });
         GFS_REQUEST_PROBABILITY_SUPPORT_CACHE.with(|cache| {
             cache.borrow_mut().take();
         });
@@ -7440,16 +7464,13 @@ fn read_gfs_probability_history_value_with_rounding(
     .context("GFS probability point series is empty")
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_gfs_probability_history_point_series_with_rounding(
+fn build_gfs_probability_point_history(
     products: &[Arc<ProductSnapshot>],
     decoder: Option<&OfficialDecoder>,
     raw_variable: &str,
-    times: &[DateTime<Utc>],
     latitude: f64,
     longitude: f64,
-    round_values: bool,
-) -> Result<Vec<f32>> {
+) -> Result<GfsProbabilityPointHistory> {
     let regular_seconds = products
         .iter()
         .flat_map(|product| native_times_for_variable(product, raw_variable).into_iter())
@@ -7502,7 +7523,11 @@ fn read_gfs_probability_history_point_series_with_rounding(
         stitched.first_key_value().map(|(time, _)| *time),
         stitched.last_key_value().map(|(time, _)| *time),
     ) else {
-        return Ok(vec![f32::NAN; times.len()]);
+        return Ok(GfsProbabilityPointHistory {
+            regular_seconds,
+            regular_times: Vec::new(),
+            values: Vec::new(),
+        });
     };
     let span = (last - first).num_seconds();
     let regular_times = (0..=span / regular_seconds)
@@ -7512,6 +7537,63 @@ fn read_gfs_probability_history_point_series_with_rounding(
         .iter()
         .map(|time| stitched.get(time).copied().unwrap_or(f32::NAN))
         .collect::<Vec<_>>();
+    Ok(GfsProbabilityPointHistory {
+        regular_seconds,
+        regular_times,
+        values,
+    })
+}
+
+fn gfs_cached_probability_point_history(
+    key: GfsProbabilityHistoryCacheKey,
+    build: impl FnOnce() -> Result<GfsProbabilityPointHistory>,
+) -> Result<Arc<GfsProbabilityPointHistory>> {
+    let cached = GFS_REQUEST_PROBABILITY_HISTORY_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .and_then(|cache| cache.get(&key).cloned())
+    });
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+    let built = Arc::new(build()?);
+    GFS_REQUEST_PROBABILITY_HISTORY_CACHE.with(|cache| {
+        if let Some(cache) = cache.borrow_mut().as_mut() {
+            cache.insert(key, Arc::clone(&built));
+        }
+    });
+    Ok(built)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_history_point_series_with_rounding(
+    products: &[Arc<ProductSnapshot>],
+    decoder: Option<&OfficialDecoder>,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+    round_values: bool,
+) -> Result<Vec<f32>> {
+    let key = GfsProbabilityHistoryCacheKey {
+        coverage_ids: products
+            .iter()
+            .map(|product| product.manifest.coverage_id.clone())
+            .collect(),
+        raw_variable: raw_variable.to_string(),
+        latitude_bits: latitude.to_bits(),
+        longitude_bits: longitude.to_bits(),
+    };
+    let history = gfs_cached_probability_point_history(key, || {
+        build_gfs_probability_point_history(products, decoder, raw_variable, latitude, longitude)
+    })?;
+    if history.regular_times.is_empty() {
+        return Ok(vec![f32::NAN; times.len()]);
+    }
+    let regular_seconds = history.regular_seconds;
+    let regular_times = &history.regular_times;
+    let values = &history.values;
     times
         .iter()
         .map(|time| {
@@ -12933,6 +13015,41 @@ mod output_tests {
                 Ok(None)
             })?
             .unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn gfs_probability_cache_builds_each_point_history_once_per_request() {
+        use std::cell::Cell;
+
+        let builds = Cell::new(0usize);
+        let key = GfsProbabilityHistoryCacheKey {
+            coverage_ids: vec!["ncep_gefs025_2026073006".to_string()],
+            raw_variable: "precipitation_probability".to_string(),
+            latitude_bits: 31.25_f64.to_bits(),
+            longitude_bits: 121.5_f64.to_bits(),
+        };
+        with_gfs_request_cache(|| {
+            let first = gfs_cached_probability_point_history(key.clone(), || {
+                builds.set(builds.get() + 1);
+                Ok(GfsProbabilityPointHistory {
+                    regular_seconds: 10_800,
+                    regular_times: vec![Utc.with_ymd_and_hms(2026, 7, 30, 6, 0, 0).unwrap()],
+                    values: vec![42.0],
+                })
+            })?;
+            let second = gfs_cached_probability_point_history(key, || {
+                builds.set(builds.get() + 1);
+                Ok(GfsProbabilityPointHistory {
+                    regular_seconds: 0,
+                    regular_times: Vec::new(),
+                    values: Vec::new(),
+                })
+            })?;
             assert!(Arc::ptr_eq(&first, &second));
             Ok(())
         })
