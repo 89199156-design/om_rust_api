@@ -4078,16 +4078,6 @@ fn read_gfs_precipitation_probability_grid_series(
     longitudes: &[f64],
 ) -> Result<Vec<Vec<f32>>> {
     let grid_len = latitudes.len() * longitudes.len();
-    if grid_len == 1 {
-        return read_gfs_precipitation_probability_point_series(
-            snapshot,
-            Some(decoder),
-            times,
-            latitudes[0],
-            longitudes[0],
-        )
-        .map(|values| values.into_iter().map(|value| vec![value]).collect());
-    }
     let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
         if snapshot.product(product_name).is_none() {
             return Ok(None);
@@ -4140,6 +4130,29 @@ fn read_gfs_precipitation_probability_point_series(
     latitude: f64,
     longitude: f64,
 ) -> Result<Vec<f32>> {
+    // Use the grid history path whenever the official decoder is available.
+    // The legacy scalar path reconstructs and decodes every native probability
+    // frame once for each requested output hour. For a 120-hour point request
+    // against global GEFS files that turns one series into thousands of
+    // redundant reads. The grid path decodes only the interpolation neighbours
+    // for each hour and is bit-identical for a one-cell grid.
+    if let Some(decoder) = decoder {
+        return read_gfs_precipitation_probability_grid_series(
+            snapshot,
+            decoder,
+            times,
+            &[latitude],
+            &[longitude],
+        )?
+        .into_iter()
+        .map(|frame| {
+            frame
+                .into_iter()
+                .next()
+                .context("GFS precipitation probability point frame is empty")
+        })
+        .collect();
+    }
     let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
         if snapshot.product(product_name).is_none() {
             return Ok(None);
