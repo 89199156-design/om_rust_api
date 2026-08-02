@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gzip
 import importlib.util
 import io
 import json
@@ -20,6 +21,29 @@ SPEC.loader.exec_module(compare)
 
 
 class Official200PointCompareTests(unittest.TestCase):
+    def test_ssh_request_decompresses_the_remote_response(self) -> None:
+        expected = b'[{"ok":true}]'
+        completed = mock.Mock(
+            returncode=0,
+            stdout=gzip.compress(expected),
+            stderr=b"",
+        )
+        with mock.patch.object(compare.subprocess, "run", return_value=completed) as run:
+            raw, headers, elapsed = compare.request_json_via_ssh(
+                "server-alias",
+                "POST",
+                "https://api.open-meteo.com/v1/gfs",
+                body=b"{}",
+                headers={"Content-Type": "application/json"},
+                timeout=10.0,
+                retries=0,
+            )
+
+        self.assertEqual(raw, expected)
+        self.assertEqual(headers, {})
+        self.assertGreaterEqual(elapsed, 0)
+        self.assertIn("gzip -1 -c", run.call_args.args[0][-1])
+
     def test_plan_has_exactly_two_hundred_stable_points(self) -> None:
         points = compare.sample_points()
         self.assertEqual(len(points), 200)
@@ -322,6 +346,57 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(metadata["api_access_tier"], "public_noncommercial")
         self.assertEqual(metadata["api_key_transport"], "none")
         self.assertEqual(metadata["official_request_count"], 2)
+
+    def test_capture_resumes_a_complete_partial_batch_without_requesting_it(self) -> None:
+        response = json.dumps([{} for _ in range(100)]).encode()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+            official_dir = output / "gfs" / "official"
+            payload = compare.official_payload("gfs", compare.sample_points()[:100])
+            compare.write_once(
+                official_dir / "request-000.json", compare.pretty_bytes(payload)
+            )
+            compare.write_once(official_dir / "response-000.json", response)
+            with mock.patch.object(
+                compare,
+                "request_json",
+                return_value=(response, {}, 0.01),
+            ) as request:
+                metadata = compare.capture_official(
+                    "gfs", output, None, 10.0, 0
+                )
+
+        request.assert_called_once()
+        self.assertTrue(metadata["batches"][0]["resumed_from_disk"])
+        self.assertEqual(metadata["batches"][0]["request_exit"], "persisted")
+        self.assertFalse(metadata["batches"][1]["resumed_from_disk"])
+
+    def test_capture_routes_public_batches_through_distinct_ssh_hosts(self) -> None:
+        response = json.dumps([{} for _ in range(100)]).encode()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with (
+                mock.patch.object(
+                    compare,
+                    "request_json_via_ssh",
+                    return_value=(response, {}, 0.01),
+                ) as ssh_request,
+                mock.patch.object(compare, "request_json") as local_request,
+            ):
+                metadata = compare.capture_official(
+                    "gfs",
+                    Path(temporary_directory),
+                    None,
+                    10.0,
+                    0,
+                    ssh_hosts=("first-exit", "second-exit"),
+                )
+
+        self.assertEqual(ssh_request.call_count, 2)
+        local_request.assert_not_called()
+        self.assertEqual(
+            [batch["request_exit"] for batch in metadata["batches"]],
+            ["ssh:first-exit", "ssh:second-exit"],
+        )
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
         original = compare.MODEL_SPECS["gfs"]

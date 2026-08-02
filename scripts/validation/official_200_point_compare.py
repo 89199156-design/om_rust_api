@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Snapshot once, then compare 200 points against the official APIs.
 
-The official response for each model is captured by one multi-location POST.
+The official response for each model is captured by bounded multi-location POSTs.
 Validation then requests the local API one point at a time and stops at the
 first difference.  Successful point receipts are immutable and resumable, so
 diagnosis and fixes never consume the official API quota again.
@@ -19,12 +19,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import gzip
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import random
+import shlex
+import subprocess
 import sys
 import time
 from typing import Any
@@ -642,7 +645,7 @@ def validation_manifest(models: list[str]) -> dict[str, Any]:
         },
         "cell_selection": "nearest",
         "points": sample_points(),
-        "official_capture_policy": "one_multi_location_post_per_model_then_immutable_reuse",
+        "official_capture_policy": "bounded_multi_location_posts_per_model_then_immutable_reuse",
         "first_difference_stops": True,
         "gfs_precipitation_probability_daily": [
             "precipitation_probability_max",
@@ -788,6 +791,104 @@ def request_json(
         attempt += 1
 
 
+def request_json_via_ssh(
+    ssh_host: str,
+    method: str,
+    url: str,
+    *,
+    body: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+    retries: int,
+) -> tuple[bytes, dict[str, str], float]:
+    """Send a public API request through a configured SSH host.
+
+    This is intentionally limited to public, keyless capture. It lets one
+    synchronized 200-point snapshot use two independent free-tier source IPs
+    without copying the validation program or credentials to either server.
+    """
+    if method != "POST" or body is None:
+        raise ValidationError("SSH official capture only supports POST requests")
+    if not ssh_host or any(character.isspace() for character in ssh_host):
+        raise ValidationError(f"invalid SSH host alias: {ssh_host!r}")
+    curl_headers = " ".join(
+        f"-H {shlex.quote(f'{key}: {value}')}" for key, value in headers.items()
+    )
+    retry_delay = min(30, max(1, int(timeout // 30)))
+    curl_command = (
+        "curl --silent --show-error --fail-with-body "
+        f"--max-time {max(1, int(timeout))} --retry {max(0, retries)} "
+        f"--retry-delay {retry_delay} --retry-all-errors -X POST "
+        f"{curl_headers} --data-binary @- {shlex.quote(url)}"
+    )
+    # Compress before crossing the SSH link. Forecast JSON compresses very
+    # well, while sending it uncompressed can make a low-bandwidth server hit
+    # curl's transfer timeout even after the official endpoint has answered.
+    remote_command = "bash -o pipefail -c " + shlex.quote(
+        f"{curl_command} | gzip -1 -c"
+    )
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={min(30, max(5, int(timeout)))}",
+                ssh_host,
+                remote_command,
+            ],
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout * (retries + 1) + 60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationError(
+            f"POST {url} through SSH host {ssh_host} failed: {exc}"
+        ) from exc
+    elapsed = time.monotonic() - started
+    if completed.returncode != 0:
+        message = completed.stderr[:1000].decode("utf-8", errors="replace")
+        raise ValidationError(
+            f"POST {url} through SSH host {ssh_host} failed with exit "
+            f"{completed.returncode}: {message}"
+        )
+    try:
+        raw = gzip.decompress(completed.stdout)
+    except OSError as exc:
+        raise ValidationError(
+            f"POST {url} through SSH host {ssh_host} returned invalid gzip data"
+        ) from exc
+    return raw, {}, elapsed
+
+
+def response_time_axis_signature(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return and validate the common model time axes for one point batch."""
+    signature: dict[str, Any] | None = None
+    for row in rows:
+        current: dict[str, Any] = {}
+        for period in ("hourly", "daily"):
+            values = row.get(period, {}).get("time", [])
+            if not isinstance(values, list):
+                raise ValidationError(f"official {period} time axis is invalid")
+            current[period] = {
+                "count": len(values),
+                "first": values[0] if values else None,
+                "last": values[-1] if values else None,
+            }
+        if signature is None:
+            signature = current
+        elif signature != current:
+            raise ValidationError("official response contains mixed time axes")
+    return signature or {
+        "hourly": {"count": 0, "first": None, "last": None},
+        "daily": {"count": 0, "first": None, "last": None},
+    }
+
+
 def official_payload(model: str, points: list[dict[str, Any]]) -> dict[str, Any]:
     spec = MODEL_SPECS[model]
     payload: dict[str, Any] = {
@@ -815,6 +916,8 @@ def capture_official(
     api_key: str | None,
     timeout: float,
     retries: int,
+    request_delay_seconds: float = 0.0,
+    ssh_hosts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     model_dir = output / model / "official"
     response_path = model_dir / "response.json"
@@ -877,30 +980,90 @@ def capture_official(
     payloads: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     batch_artifacts: list[dict[str, Any]] = []
+    batch_time_axis: dict[str, Any] | None = None
     total_elapsed = 0.0
+    last_network_request_at: float | None = None
     for batch_index, start in enumerate(range(0, len(points), OFFICIAL_BATCH_SIZE)):
         batch_points = points[start : start + OFFICIAL_BATCH_SIZE]
         payload = official_payload(model, batch_points)
         payloads.append(payload)
         payload_raw = canonical_bytes(payload)
         wire_payload = {**payload, **({"apikey": api_key} if api_key else {})}
-        raw, response_headers, elapsed = request_json(
-            "POST",
-            endpoint,
-            body=canonical_bytes(wire_payload),
-            headers=headers,
-            timeout=timeout,
-            retries=retries,
-            redact=(api_key,) if api_key else (),
-        )
+        batch_request_path = model_dir / f"request-{batch_index:03d}.json"
+        batch_response_path = model_dir / f"response-{batch_index:03d}.json"
+        request_exists = batch_request_path.exists()
+        response_exists = batch_response_path.exists()
+        if request_exists != response_exists:
+            raise ValidationError(
+                "incomplete immutable official batch artifact pair: "
+                f"{batch_request_path}, {batch_response_path}"
+            )
+        resumed_from_disk = request_exists
+        request_exit = "persisted"
+        if resumed_from_disk:
+            try:
+                persisted_payload = json.loads(
+                    batch_request_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValidationError(
+                    f"official batch request is invalid: {batch_request_path}"
+                ) from exc
+            if canonical_bytes(persisted_payload) != payload_raw:
+                raise ValidationError(
+                    f"immutable official batch request differs: {batch_request_path}"
+                )
+            raw = batch_response_path.read_bytes()
+            response_headers: dict[str, str] = {}
+            elapsed = 0.0
+        else:
+            if last_network_request_at is not None and request_delay_seconds > 0:
+                remaining_delay = request_delay_seconds - (
+                    time.monotonic() - last_network_request_at
+                )
+                if remaining_delay > 0:
+                    time.sleep(remaining_delay)
+            ssh_host = ssh_hosts[batch_index % len(ssh_hosts)] if ssh_hosts else None
+            if ssh_host:
+                if api_key:
+                    raise ValidationError(
+                        "SSH-routed official capture is restricted to the keyless public API"
+                    )
+                raw, response_headers, elapsed = request_json_via_ssh(
+                    ssh_host,
+                    "POST",
+                    endpoint,
+                    body=canonical_bytes(wire_payload),
+                    headers=headers,
+                    timeout=timeout,
+                    retries=retries,
+                )
+                request_exit = f"ssh:{ssh_host}"
+            else:
+                raw, response_headers, elapsed = request_json(
+                    "POST",
+                    endpoint,
+                    body=canonical_bytes(wire_payload),
+                    headers=headers,
+                    timeout=timeout,
+                    retries=retries,
+                    redact=(api_key,) if api_key else (),
+                )
+                request_exit = "local"
+            last_network_request_at = time.monotonic()
         try:
             batch_rows = normalize_rows(json.loads(raw), len(batch_points))
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValidationError(
                 f"official {model} batch {batch_index} response is not valid JSON"
             ) from exc
-        batch_request_path = model_dir / f"request-{batch_index:03d}.json"
-        batch_response_path = model_dir / f"response-{batch_index:03d}.json"
+        current_time_axis = response_time_axis_signature(batch_rows)
+        if batch_time_axis is None:
+            batch_time_axis = current_time_axis
+        elif batch_time_axis != current_time_axis:
+            raise ValidationError(
+                f"official {model} batches do not belong to the same time axis"
+            )
         write_once(batch_request_path, pretty_bytes(payload))
         write_once(batch_response_path, raw)
         rows.extend(batch_rows)
@@ -917,6 +1080,9 @@ def capture_official(
                 "response_bytes": len(raw),
                 "elapsed_seconds": round(elapsed, 6),
                 "response_headers": response_headers,
+                "request_exit": request_exit,
+                "resumed_from_disk": resumed_from_disk,
+                "time_axis": current_time_axis,
             }
         )
     if len(rows) != POINT_COUNT:
@@ -946,6 +1112,7 @@ def capture_official(
         "response_sha256": sha256_bytes(response_snapshot_raw),
         "response_bytes": len(response_snapshot_raw),
         "elapsed_seconds": round(total_elapsed, 6),
+        "time_axis": batch_time_axis,
         "batches": batch_artifacts,
         "api_access_tier": "customer_commercial" if api_key else "public_noncommercial",
         "api_key_transport": (
@@ -1748,6 +1915,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument(
+        "--official-request-delay-seconds",
+        type=float,
+        default=0.0,
+        help="pause between new official snapshot batches from the same process",
+    )
+    parser.add_argument(
+        "--official-ssh-hosts",
+        default="",
+        help=(
+            "comma-separated configured SSH aliases used round-robin as "
+            "independent public API exits"
+        ),
+    )
+    parser.add_argument(
         "--point-delay-seconds",
         type=float,
         default=DEFAULT_POINT_DELAY_SECONDS,
@@ -1814,6 +1995,7 @@ def main() -> int:
     non_negative = {
         "--point-delay-seconds": args.point_delay_seconds,
         "--request-delay-seconds": args.request_delay_seconds,
+        "--official-request-delay-seconds": args.official_request_delay_seconds,
         "--min-available-memory-mib": args.min_available_memory_mib,
         "--max-io-full-pressure-avg10": args.max_io_full_pressure_avg10,
         "--resource-wait-timeout-seconds": args.resource_wait_timeout_seconds,
@@ -1843,9 +2025,27 @@ def main() -> int:
     ensure_validation_manifest(manifest_path, models)
     if args.command in {"capture", "run"}:
         api_key = os.environ.get(args.api_key_env, "").strip() or None
-        for model in models:
+        official_ssh_hosts = tuple(
+            value.strip()
+            for value in args.official_ssh_hosts.split(",")
+            if value.strip()
+        )
+        for model_index, model in enumerate(models):
+            if official_ssh_hosts:
+                rotation = (model_index * 2) % len(official_ssh_hosts)
+                model_ssh_hosts = (
+                    official_ssh_hosts[rotation:] + official_ssh_hosts[:rotation]
+                )
+            else:
+                model_ssh_hosts = ()
             metadata = capture_official(
-                model, args.output, api_key, args.timeout, args.retries
+                model,
+                args.output,
+                api_key,
+                args.timeout,
+                args.retries,
+                args.official_request_delay_seconds,
+                model_ssh_hosts,
             )
             print(
                 json.dumps(
