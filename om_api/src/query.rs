@@ -109,7 +109,7 @@ thread_local! {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GfsProbabilityHistoryCacheKey {
-    coverage_ids: Vec<String>,
+    product_coverages: Vec<(String, String)>,
     raw_variable: String,
     latitude_bits: u64,
     longitude_bits: u64,
@@ -124,7 +124,7 @@ struct GfsProbabilityPointHistory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GfsProbabilitySupportCacheKey {
-    coverage_ids: Vec<String>,
+    product_coverages: Vec<(String, String)>,
     raw_variable: String,
     unix_time: i64,
     latitude_bits: u64,
@@ -7316,9 +7316,14 @@ fn read_gfs_probability_support_value(
     longitude: f64,
 ) -> Result<Option<f32>> {
     let key = GfsProbabilitySupportCacheKey {
-        coverage_ids: products
+        product_coverages: products
             .iter()
-            .map(|product| product.manifest.coverage_id.clone())
+            .map(|product| {
+                (
+                    product.product.clone(),
+                    product.manifest.coverage_id.clone(),
+                )
+            })
             .collect(),
         raw_variable: raw_variable.to_string(),
         unix_time: time.timestamp(),
@@ -7577,9 +7582,14 @@ fn read_gfs_probability_history_point_series_with_rounding(
     round_values: bool,
 ) -> Result<Vec<f32>> {
     let key = GfsProbabilityHistoryCacheKey {
-        coverage_ids: products
+        product_coverages: products
             .iter()
-            .map(|product| product.manifest.coverage_id.clone())
+            .map(|product| {
+                (
+                    product.product.clone(),
+                    product.manifest.coverage_id.clone(),
+                )
+            })
             .collect(),
         raw_variable: raw_variable.to_string(),
         latitude_bits: latitude.to_bits(),
@@ -13028,7 +13038,10 @@ mod output_tests {
 
         let builds = Cell::new(0usize);
         let key = GfsProbabilityHistoryCacheKey {
-            coverage_ids: vec!["ncep_gefs025_2026073006".to_string()],
+            product_coverages: vec![(
+                "ncep_gefs025".to_string(),
+                "gfs_native_2026073006@2026073006".to_string(),
+            )],
             raw_variable: "precipitation_probability".to_string(),
             latitude_bits: 31.25_f64.to_bits(),
             longitude_bits: 121.5_f64.to_bits(),
@@ -13055,6 +13068,46 @@ mod output_tests {
         })
         .unwrap();
         assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn gfs_probability_cache_separates_domains_in_one_native_coverage() {
+        use std::cell::Cell;
+
+        let builds = Cell::new(0usize);
+        let make_key = |product: &str| GfsProbabilityHistoryCacheKey {
+            product_coverages: vec![(
+                product.to_string(),
+                "gfs_native_2026080112@2026080112".to_string(),
+            )],
+            raw_variable: "precipitation_probability".to_string(),
+            latitude_bits: 31.25_f64.to_bits(),
+            longitude_bits: 121.5_f64.to_bits(),
+        };
+        with_gfs_request_cache(|| {
+            let high = gfs_cached_probability_point_history(make_key("ncep_gefs025"), || {
+                builds.set(builds.get() + 1);
+                Ok(GfsProbabilityPointHistory {
+                    regular_seconds: 10_800,
+                    regular_times: vec![Utc.with_ymd_and_hms(2026, 8, 1, 15, 0, 0).unwrap()],
+                    values: vec![25.0],
+                })
+            })?;
+            let low = gfs_cached_probability_point_history(make_key("ncep_gefs05"), || {
+                builds.set(builds.get() + 1);
+                Ok(GfsProbabilityPointHistory {
+                    regular_seconds: 10_800,
+                    regular_times: vec![Utc.with_ymd_and_hms(2026, 8, 1, 15, 0, 0).unwrap()],
+                    values: vec![50.0],
+                })
+            })?;
+            assert!(!Arc::ptr_eq(&high, &low));
+            assert_eq!(high.values, vec![25.0]);
+            assert_eq!(low.values, vec![50.0]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(builds.get(), 2);
     }
 }
 
