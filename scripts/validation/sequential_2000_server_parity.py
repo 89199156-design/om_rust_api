@@ -199,28 +199,52 @@ def compare_request(
     singapore_url: str,
     model: str,
     point: dict[str, Any],
-    period: str,
-    variables: tuple[str, ...],
-    time_range: tuple[str, str],
+    hourly: tuple[str, ...],
+    daily: tuple[str, ...],
+    hourly_time_range: tuple[str, str],
+    daily_time_range: tuple[str, str],
     timeout: float,
     retries: int,
 ) -> tuple[dict[str, Any] | None, int]:
-    kwargs: dict[str, Any] = {
-        "hourly": variables if period == "hourly" else (),
-        "daily": variables if period == "daily" else (),
-        "hourly_time_range": time_range if period == "hourly" else None,
-        "daily_time_range": time_range if period == "daily" else None,
-    }
-    template = local_url("__BASE__", model, point, **kwargs)
+    template = local_url(
+        "__BASE__",
+        model,
+        point,
+        hourly=hourly,
+        daily=daily,
+        hourly_time_range=hourly_time_range if hourly else None,
+        daily_time_range=daily_time_range if daily else None,
+    )
     shanghai = fetch(shanghai_url, template, timeout, retries)
     singapore = fetch(singapore_url, template, timeout, retries)
-    difference, hourly_values, daily_values = first_period_difference(
-        period,
-        variables,
-        shanghai,
-        singapore,
-    )
-    return difference, hourly_values + daily_values
+    values_compared = 0
+    for period, variables in (("hourly", hourly), ("daily", daily)):
+        if not variables:
+            continue
+        difference, hourly_values, daily_values = first_period_difference(
+            period,
+            variables,
+            shanghai,
+            singapore,
+        )
+        values_compared += hourly_values + daily_values
+        if difference is not None:
+            return difference, values_compared
+    return None, values_compared
+
+
+def paired_variable_groups(
+    hourly: tuple[str, ...], daily: tuple[str, ...], size: int
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    hourly_groups = chunks(hourly, size)
+    daily_groups = chunks(daily, size)
+    return [
+        (
+            hourly_groups[index] if index < len(hourly_groups) else (),
+            daily_groups[index] if index < len(daily_groups) else (),
+        )
+        for index in range(max(len(hourly_groups), len(daily_groups)))
+    ]
 
 
 def checkpoint_contract(args: argparse.Namespace, points: list[dict[str, Any]]) -> dict[str, Any]:
@@ -388,44 +412,45 @@ def main() -> int:
         point = points[point_index]
         for model in ("gfs", "ec", "cams"):
             hourly_range, daily_range = comparison_ranges(model, runs[model])
-            for period, time_range in (
-                ("hourly", hourly_range),
-                ("daily", daily_range),
+            for hourly_group, daily_group in paired_variable_groups(
+                VARIABLES[model]["hourly"],
+                VARIABLES[model]["daily"],
+                args.field_chunk_size,
             ):
-                for variable_group in chunks(
-                    VARIABLES[model][period],
-                    args.field_chunk_size,
-                ):
-                    difference, value_count = compare_request(
-                        shanghai_url=args.shanghai_url,
-                        singapore_url=args.singapore_url,
-                        model=model,
-                        point=point,
-                        period=period,
-                        variables=variable_group,
-                        time_range=time_range,
-                        timeout=args.timeout,
-                        retries=args.retries,
+                difference, value_count = compare_request(
+                    shanghai_url=args.shanghai_url,
+                    singapore_url=args.singapore_url,
+                    model=model,
+                    point=point,
+                    hourly=hourly_group,
+                    daily=daily_group,
+                    hourly_time_range=hourly_range,
+                    daily_time_range=daily_range,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                )
+                checkpoint["values_compared"] += value_count
+                if difference is not None:
+                    checkpoint.update(
+                        {
+                            "status": "failed",
+                            "failed_point": point,
+                            "failed_model": model,
+                            "failed_period": difference.get("period"),
+                            "failed_variables": {
+                                "hourly": list(hourly_group),
+                                "daily": list(daily_group),
+                            },
+                            "difference": difference,
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                        }
                     )
-                    checkpoint["values_compared"] += value_count
-                    if difference is not None:
-                        checkpoint.update(
-                            {
-                                "status": "failed",
-                                "failed_point": point,
-                                "failed_model": model,
-                                "failed_period": period,
-                                "failed_variables": list(variable_group),
-                                "difference": difference,
-                                "failed_at": datetime.now(timezone.utc).isoformat(),
-                            }
-                        )
-                        atomic_write_json(checkpoint_path, checkpoint)
-                        atomic_write_json(output_path, checkpoint)
-                        print(json.dumps(checkpoint, ensure_ascii=False))
-                        return 1
-                    if args.request_pause:
-                        time.sleep(args.request_pause)
+                    atomic_write_json(checkpoint_path, checkpoint)
+                    atomic_write_json(output_path, checkpoint)
+                    print(json.dumps(checkpoint, ensure_ascii=False))
+                    return 1
+                if args.request_pause:
+                    time.sleep(args.request_pause)
         checkpoint["points_completed"] = point_index + 1
         checkpoint["last_completed_point"] = point
         atomic_write_json(checkpoint_path, checkpoint)

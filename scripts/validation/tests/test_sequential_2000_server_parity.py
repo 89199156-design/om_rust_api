@@ -42,6 +42,24 @@ def test_probability_is_in_hourly_and_daily_acceptance_contracts() -> None:
     assert "precipitation_probability_mean" in parity.VARIABLES["ec"]["daily"]
 
 
+def test_hourly_and_daily_variables_are_paired_into_the_fewest_requests() -> None:
+    assert parity.paired_variable_groups(
+        ("h1", "h2", "h3"), ("d1", "d2"), 2
+    ) == [
+        (("h1", "h2"), ("d1", "d2")),
+        (("h3",), ()),
+    ]
+    for model in ("gfs", "ec", "cams"):
+        groups = parity.paired_variable_groups(
+            parity.VARIABLES[model]["hourly"],
+            parity.VARIABLES[model]["daily"],
+            256,
+        )
+        assert len(groups) == 1
+        assert groups[0][0]
+        assert groups[0][1]
+
+
 def test_batch_identity_requires_equal_source_runs_and_horizons(tmp_path: Path) -> None:
     runs = {
         "gfs": "2026073000",
