@@ -639,14 +639,16 @@ def _rolling_time_series_object_records(
     plan: Any,
     *,
     bucket_url: str,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Plan immutable regional reads from Open-Meteo's rolling time-series.
 
     The GEFS 0.5° rolling database contains the delayed 00Z extension that is
     intentionally absent from ``data_spatial``.  Those hidden frames are
     required as right-side Hermite control points at the public 16-day tail.
-    Refuse to mix batches: the rolling metadata must identify the exact same
-    latest run selected by the spatial GFS group.
+    The rolling database is used only for its own latest run.  Older retained
+    GFS releases are immutable spatial runs and must fall back to their own
+    ``data_spatial`` objects instead of relabelling values from a newer rolling
+    batch.  A rolling database older than the selected run is still rejected.
     """
     meta_url = (
         f"{bucket_url.rstrip('/')}/data/{product.openmeteo_model}/static/meta.json"
@@ -664,13 +666,15 @@ def _rolling_time_series_object_records(
     latest_run_time = datetime.strptime(
         str(plan.latest_complete_run), "%Y%m%d%H"
     ).replace(tzinfo=timezone.utc)
-    if int(latest_run_time.timestamp()) != last_run_epoch:
-        actual = datetime.fromtimestamp(last_run_epoch, tz=timezone.utc)
+    actual = datetime.fromtimestamp(last_run_epoch, tz=timezone.utc)
+    if actual < latest_run_time:
         raise ValueError(
-            "rolling time-series batch does not match selected spatial run: "
+            "rolling time-series batch is older than selected spatial run: "
             f"{product.openmeteo_model} expected={plan.latest_complete_run} "
             f"actual={actual:%Y%m%d%H}"
         )
+    if actual > latest_run_time:
+        return None
 
     slots = sorted(plan.slots, key=lambda item: _as_utc(item.valid_time_utc))
     if not slots:
@@ -730,6 +734,37 @@ def _rolling_time_series_object_records(
             }
         )
     return records
+
+
+def _product_coverage_object_records(
+    product: ProductConfig,
+    plan: Any,
+    runs: list[Any],
+    *,
+    bucket_url: str,
+) -> list[dict[str, Any]]:
+    if product.source_mode == "rolling_time_series":
+        rolling_records = _rolling_time_series_object_records(
+            product,
+            plan,
+            bucket_url=bucket_url,
+        )
+        if rolling_records is not None:
+            return rolling_records
+
+    records = coverage_object_records(
+        plan,
+        runs,
+        bucket_url=bucket_url,
+        openmeteo_model=product.openmeteo_model,
+    )
+    return _with_interpolation_support_records(
+        product,
+        plan,
+        runs,
+        records,
+        bucket_url=bucket_url,
+    )
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -1224,26 +1259,12 @@ def _download_openmeteo_product(
         )
         return reused_manifest
 
-    if product.source_mode == "rolling_time_series":
-        object_records = _rolling_time_series_object_records(
-            product,
-            plan,
-            bucket_url=bucket_url,
-        )
-    else:
-        object_records = coverage_object_records(
-            plan,
-            runs,
-            bucket_url=bucket_url,
-            openmeteo_model=product.openmeteo_model,
-        )
-        object_records = _with_interpolation_support_records(
-            product,
-            plan,
-            runs,
-            object_records,
-            bucket_url=bucket_url,
-        )
+    object_records = _product_coverage_object_records(
+        product,
+        plan,
+        runs,
+        bucket_url=bucket_url,
+    )
     region_plan: dict[str, Any] | None = None
     missing_object_required_variables = []
     wanted_variables = tuple(
@@ -1704,7 +1725,11 @@ def _download_openmeteo_product(
                 object_range_max_bytes=object_range_max_bytes,
             )
         )
-    if product.source_mode == "rolling_time_series" and files:
+    if (
+        object_records
+        and object_records[0].get("rolling_time_series")
+        and files
+    ):
         base_entries = {
             str(entry.get("source_url")): entry
             for entry in files[0].get("entries") or []

@@ -90,7 +90,7 @@ class RollingTimeSeriesPlanTests(unittest.TestCase):
             )
         )
 
-    def test_refuses_rolling_database_from_a_different_batch(self):
+    def test_newer_rolling_database_defers_to_immutable_spatial_run(self):
         selected = datetime(2026, 7, 29, tzinfo=UTC)
         actual = selected + timedelta(hours=6)
         meta = {
@@ -101,12 +101,69 @@ class RollingTimeSeriesPlanTests(unittest.TestCase):
         }
 
         with patch.object(cli, "urlopen", return_value=_response(meta)):
-            with self.assertRaisesRegex(ValueError, "does not match selected"):
+            records = cli._rolling_time_series_object_records(
+                _product(),
+                _plan(selected, (3, 6)),
+                bucket_url="https://example.invalid",
+            )
+
+        self.assertIsNone(records)
+
+    def test_refuses_rolling_database_older_than_selected_run(self):
+        selected = datetime(2026, 7, 29, 6, tzinfo=UTC)
+        actual = selected - timedelta(hours=6)
+        meta = {
+            "chunk_time_length": 313,
+            "temporal_resolution_seconds": 3 * 3600,
+            "last_run_initialisation_time": int(actual.timestamp()),
+            "data_end_time": int((selected + timedelta(days=20)).timestamp()),
+        }
+
+        with patch.object(cli, "urlopen", return_value=_response(meta)):
+            with self.assertRaisesRegex(ValueError, "older than selected"):
                 cli._rolling_time_series_object_records(
                     _product(),
                     _plan(selected, (3, 6)),
                     bucket_url="https://example.invalid",
                 )
+
+    def test_historical_rolling_product_reads_its_spatial_objects(self):
+        product = _product()
+        plan = _plan(datetime(2026, 7, 29, tzinfo=UTC), (3, 6))
+        runs = [object()]
+        spatial = [{"url": "https://example.invalid/data_spatial/run.om"}]
+        supported = spatial + [{"interpolation_support": True}]
+
+        with (
+            patch.object(cli, "_rolling_time_series_object_records", return_value=None),
+            patch.object(cli, "coverage_object_records", return_value=spatial) as coverage,
+            patch.object(
+                cli,
+                "_with_interpolation_support_records",
+                return_value=supported,
+            ) as support,
+        ):
+            records = cli._product_coverage_object_records(
+                product,
+                plan,
+                runs,
+                bucket_url="https://example.invalid",
+            )
+
+        self.assertEqual(records, supported)
+        coverage.assert_called_once_with(
+            plan,
+            runs,
+            bucket_url="https://example.invalid",
+            openmeteo_model="ncep_gefs05",
+        )
+        support.assert_called_once_with(
+            product,
+            plan,
+            runs,
+            spatial,
+            bucket_url="https://example.invalid",
+        )
 
     def test_refuses_missing_tail_lookahead(self):
         run = datetime(2026, 7, 29, tzinfo=UTC)
