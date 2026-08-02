@@ -4130,51 +4130,22 @@ fn read_gfs_precipitation_probability_point_series(
     latitude: f64,
     longitude: f64,
 ) -> Result<Vec<f32>> {
-    // Use the grid history path whenever the official decoder is available.
-    // The legacy scalar path reconstructs and decodes every native probability
-    // frame once for each requested output hour. For a 120-hour point request
-    // against global GEFS files that turns one series into thousands of
-    // redundant reads. The grid path decodes only the interpolation neighbours
-    // for each hour and is bit-identical for a one-cell grid.
-    if let Some(decoder) = decoder {
-        return read_gfs_precipitation_probability_grid_series(
-            snapshot,
-            decoder,
-            times,
-            &[latitude],
-            &[longitude],
-        )?
-        .into_iter()
-        .map(|frame| {
-            frame
-                .into_iter()
-                .next()
-                .context("GFS precipitation probability point frame is empty")
-        })
-        .collect();
-    }
     let read_product = |product_name: &str| -> Result<Option<Vec<Vec<f32>>>> {
         if snapshot.product(product_name).is_none() {
             return Ok(None);
         }
-        times
-            .iter()
-            .map(|time| {
-                read_product_history_value_with_rounding(
-                    snapshot,
-                    decoder,
-                    product_name,
-                    "precipitation_probability",
-                    "precipitation_probability",
-                    *time,
-                    latitude,
-                    longitude,
-                    true,
-                )
-                .map(|value| vec![value])
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
+        let products = snapshot.product_snapshots(product_name);
+        read_gfs_probability_history_point_series_with_rounding(
+            &products,
+            decoder,
+            "precipitation_probability",
+            times,
+            latitude,
+            longitude,
+            true,
+        )
+        .map(|values| values.into_iter().map(|value| vec![value]).collect())
+        .map(Some)
     };
     let high_resolution = read_product("ncep_gefs025")?;
     let low_resolution = read_product("ncep_gefs05")?;
@@ -7456,6 +7427,29 @@ fn read_gfs_probability_history_value_with_rounding(
     longitude: f64,
     round_values: bool,
 ) -> Result<f32> {
+    read_gfs_probability_history_point_series_with_rounding(
+        products,
+        decoder,
+        raw_variable,
+        &[time],
+        latitude,
+        longitude,
+        round_values,
+    )?
+    .pop()
+    .context("GFS probability point series is empty")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_gfs_probability_history_point_series_with_rounding(
+    products: &[Arc<ProductSnapshot>],
+    decoder: Option<&OfficialDecoder>,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+    round_values: bool,
+) -> Result<Vec<f32>> {
     let regular_seconds = products
         .iter()
         .flat_map(|product| native_times_for_variable(product, raw_variable).into_iter())
@@ -7508,7 +7502,7 @@ fn read_gfs_probability_history_value_with_rounding(
         stitched.first_key_value().map(|(time, _)| *time),
         stitched.last_key_value().map(|(time, _)| *time),
     ) else {
-        return Ok(f32::NAN);
+        return Ok(vec![f32::NAN; times.len()]);
     };
     let span = (last - first).num_seconds();
     let regular_times = (0..=span / regular_seconds)
@@ -7518,51 +7512,57 @@ fn read_gfs_probability_history_value_with_rounding(
         .iter()
         .map(|time| stitched.get(time).copied().unwrap_or(f32::NAN))
         .collect::<Vec<_>>();
-    let Some((index, fraction, _)) = gfs_probability_interpolation_position(&regular_times, time)
-    else {
-        return Ok(f32::NAN);
-    };
-    let b = values[index];
-    if !b.is_finite() || (fraction == 0.0 && index + 1 >= regular_times.len()) {
-        return Ok(maybe_round_to_scalefactor(b, 1.0, round_values));
-    }
-    let a = index
-        .checked_sub(1)
-        .and_then(|previous| values.get(previous))
-        .copied()
-        .filter(|value| value.is_finite())
-        .unwrap_or(b);
-    let c = values
-        .get(index + 1)
-        .copied()
-        .filter(|value| value.is_finite())
-        .unwrap_or(b);
-    let d_time = regular_times[index] + Duration::seconds(regular_seconds * 2);
-    let direct_d = values
-        .get(index + 2)
-        .copied()
-        .filter(|value| value.is_finite());
-    let support_d = if direct_d.is_none() {
-        read_gfs_probability_support_value(
-            products,
-            decoder,
-            raw_variable,
-            d_time,
-            latitude,
-            longitude,
-        )?
-    } else {
-        None
-    };
-    let d = direct_d.or(support_d).unwrap_or(b);
-    let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
-    let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
-    let coeff_c = -a / 2.0 + c / 2.0;
-    let value = coeff_a * fraction * fraction * fraction
-        + coeff_b * fraction * fraction
-        + coeff_c * fraction
-        + b;
-    Ok(maybe_round_to_scalefactor(value, 1.0, round_values).clamp(0.0, 100.0))
+    times
+        .iter()
+        .map(|time| {
+            let Some((index, fraction, _)) =
+                gfs_probability_interpolation_position(&regular_times, *time)
+            else {
+                return Ok(f32::NAN);
+            };
+            let b = values[index];
+            if !b.is_finite() || (fraction == 0.0 && index + 1 >= regular_times.len()) {
+                return Ok(maybe_round_to_scalefactor(b, 1.0, round_values));
+            }
+            let a = index
+                .checked_sub(1)
+                .and_then(|previous| values.get(previous))
+                .copied()
+                .filter(|value| value.is_finite())
+                .unwrap_or(b);
+            let c = values
+                .get(index + 1)
+                .copied()
+                .filter(|value| value.is_finite())
+                .unwrap_or(b);
+            let d_time = regular_times[index] + Duration::seconds(regular_seconds * 2);
+            let direct_d = values
+                .get(index + 2)
+                .copied()
+                .filter(|value| value.is_finite());
+            let support_d = if direct_d.is_none() {
+                read_gfs_probability_support_value(
+                    products,
+                    decoder,
+                    raw_variable,
+                    d_time,
+                    latitude,
+                    longitude,
+                )?
+            } else {
+                None
+            };
+            let d = direct_d.or(support_d).unwrap_or(b);
+            let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+            let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+            let coeff_c = -a / 2.0 + c / 2.0;
+            let value = coeff_a * fraction * fraction * fraction
+                + coeff_b * fraction * fraction
+                + coeff_c * fraction
+                + b;
+            Ok(maybe_round_to_scalefactor(value, 1.0, round_values).clamp(0.0, 100.0))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
