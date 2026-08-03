@@ -7608,7 +7608,7 @@ fn read_gfs_probability_history_point_series_with_rounding(
         .iter()
         .map(|time| {
             let Some((index, fraction, _)) =
-                gfs_probability_interpolation_position(&regular_times, *time)
+                gfs_probability_interpolation_position(regular_times, *time)
             else {
                 return Ok(f32::NAN);
             };

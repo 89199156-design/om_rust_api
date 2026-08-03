@@ -685,13 +685,21 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     let ecmwf_rolling_gust = group == "ecmwf"
         && ready.gust_support_run_count == Some(5)
         && ready.gust_support_max_forecast_hour == Some(186);
+    let ecmwf_short_target =
+        ecmwf_rolling_gust && matches!(parse_run(&ready.latest_complete_run)?.hour(), 6 | 18);
     let (expected_runs, expected_cadence_hours): (usize, &[i64]) = match group {
         "gfs" => (5, &[6, 6, 6, 6]),
         "cams" => (3, &[12, 12]),
         "cams_greenhouse" => (3, &[24, 24]),
-        // ECMWF retains five bounded older gust runs, the previous complete
-        // run, the adjacent short cycle, and the target complete run. This is
-        // the source-run stack used by the official rolling gust database.
+        // A frozen official 06Z/18Z snapshot adds its 144h short target after
+        // the ordinary long-run stack. This preserves the complete 00Z/12Z
+        // history required for stitching while making the official target
+        // authoritative for its available horizon.
+        "ecmwf" if ecmwf_short_target => (9, &[12, 12, 12, 12, 12, 6, 6, 6]),
+        // Normal production retains five bounded older gust runs, the
+        // previous complete run, the adjacent short cycle, and the target
+        // complete run. This is the source-run stack used by the official
+        // rolling gust database.
         "ecmwf" if ecmwf_rolling_gust => (8, &[12, 12, 12, 12, 12, 6, 6]),
         // One production restart must remain possible while the previous
         // immutable five-run coverage is still current. After the producer
@@ -776,23 +784,43 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     {
         bail!("native ECMWF legacy production marker is invalid");
     }
+    let long_rolling_contract = ready.short_run_count == Some(1)
+        && ready.full_run_count == Some(2)
+        && ready.source_run_max_forecast_hours == [186, 186, 186, 186, 186, 360, 6, 360]
+        && ready.source_run_roles
+            == [
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "previous-complete",
+                "short-history",
+                "target",
+            ];
+    let short_rolling_contract = ready.short_run_count == Some(2)
+        && ready.full_run_count == Some(2)
+        && ready.source_run_max_forecast_hours == [186, 186, 186, 186, 186, 360, 6, 360, 144]
+        && ready.source_run_roles
+            == [
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "complete-history",
+                "short-history",
+                "previous-complete",
+                "target",
+            ];
     if ecmwf_rolling_gust
-        && (ready.short_run_count != Some(1)
-            || ready.full_run_count != Some(2)
-            || ready.gust_support_run_count != Some(5)
+        && (ready.gust_support_run_count != Some(5)
             || ready.gust_support_max_forecast_hour != Some(186)
-            || ready.source_run_max_forecast_hours != [186, 186, 186, 186, 186, 360, 6, 360]
-            || ready.source_run_roles
-                != [
-                    "gust-support",
-                    "gust-support",
-                    "gust-support",
-                    "gust-support",
-                    "gust-support",
-                    "previous-complete",
-                    "short-history",
-                    "target",
-                ])
+            || if ecmwf_short_target {
+                !short_rolling_contract
+            } else {
+                !long_rolling_contract
+            })
     {
         bail!("native ECMWF marker does not match the rolling gust support contract");
     }
@@ -1402,6 +1430,82 @@ mod tests {
             360
         );
         validate_ready(&ready, "ecmwf").unwrap();
+    }
+
+    #[test]
+    fn ecmwf_official_short_target_uses_strict_nine_run_contract() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "ecmwf",
+            "coverage_id": "ecmwf_native_2026080206",
+            "latest_complete_run": "2026080206",
+            "source_runs": [
+                "2026073000",
+                "2026073012",
+                "2026073100",
+                "2026073112",
+                "2026080100",
+                "2026080112",
+                "2026080118",
+                "2026080200",
+                "2026080206"
+            ],
+            "source_run_roles": [
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "gust-support",
+                "complete-history",
+                "short-history",
+                "previous-complete",
+                "target"
+            ],
+            "public_start_utc": "2026-08-01T16:00:00Z",
+            "generated_at": "2026-08-02T14:30:00Z",
+            "local_utc_offset_hours": 8,
+            "coverage_path": "coverages/ecmwf/ecmwf_native_2026080206",
+            "short_run_count": 2,
+            "full_run_count": 2,
+            "gust_support_run_count": 5,
+            "gust_support_max_forecast_hour": 186,
+            "products": {
+                "ecmwf_ifs025": {
+                    "runtime_domain": "ecmwf_ifs025",
+                    "grid": {
+                        "grid_type": "regional_regular_lat_lon",
+                        "nx": 297,
+                        "ny": 249,
+                        "lon_min": 68.0,
+                        "lat_min": -2.0,
+                        "dx": 0.25,
+                        "dy": 0.25,
+                        "dt_seconds": 10800,
+                        "om_file_length": 104
+                    }
+                }
+            },
+            "source_run_max_forecast_hours": [
+                186, 186, 186, 186, 186, 360, 6, 360, 144
+            ]
+        }))
+        .unwrap();
+        let product = ready.products.get("ecmwf_ifs025").unwrap();
+
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026080112").unwrap(),
+            360
+        );
+        assert_eq!(
+            run_horizon(&ready, "ecmwf_ifs025", product, "2026080206").unwrap(),
+            144
+        );
+        validate_ready(&ready, "ecmwf").unwrap();
+
+        let mut invalid = ready;
+        invalid.source_run_roles[5] = "previous-complete".to_string();
+        assert!(validate_ready(&invalid, "ecmwf").is_err());
     }
 
     #[test]
