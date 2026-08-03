@@ -715,6 +715,64 @@ class Official200PointCompareTests(unittest.TestCase):
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
+    def test_validate_model_reuses_a_separate_immutable_snapshot_root(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "local_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        response = {
+            "hourly": {
+                "time": ["2026-08-02T00:00"],
+                "temperature_2m": [25.0],
+            }
+        }
+        official_raw = compare.canonical_bytes([response] * compare.POINT_COUNT)
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                root = Path(temporary_directory)
+                snapshot_root = root / "official-capture"
+                output = root / "singapore-validation"
+                official_dir = snapshot_root / "gfs" / "official"
+                official_dir.mkdir(parents=True)
+                official_dir.joinpath("response.json").write_bytes(official_raw)
+                official_dir.joinpath("metadata.json").write_bytes(
+                    compare.pretty_bytes(
+                        {
+                            "response_sha256": compare.sha256_bytes(official_raw),
+                            "official_request_count": 2,
+                        }
+                    )
+                )
+                with (
+                    mock.patch.object(
+                        compare,
+                        "request_json",
+                        return_value=(compare.canonical_bytes(response), {}, 0.01),
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    report = compare.validate_model(
+                        "gfs",
+                        output,
+                        "http://127.0.0.1:8088",
+                        10.0,
+                        0,
+                        0,
+                        point_limit=1,
+                        official_snapshot_root=snapshot_root,
+                    )
+
+                self.assertTrue((output / "gfs" / "report.json").exists())
+                self.assertFalse((output / "gfs" / "official").exists())
+                self.assertEqual(
+                    report["official_snapshot_root"], str(snapshot_root.resolve())
+                )
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
 
 if __name__ == "__main__":
     unittest.main()

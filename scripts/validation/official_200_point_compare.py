@@ -1706,13 +1706,15 @@ def validate_model(
     attempt_id: str | None = None,
     point_limit: int = POINT_COUNT,
     local_ssh_client: ProductionSshApiClient | None = None,
+    official_snapshot_root: Path | None = None,
 ) -> dict[str, Any]:
     if point_limit > POINT_COUNT:
         raise ValidationError(
             f"point limit exceeds immutable plan: {point_limit} > {POINT_COUNT}"
         )
-    official_path = output / model / "official" / "response.json"
-    metadata_path = output / model / "official" / "metadata.json"
+    snapshot_root = official_snapshot_root or output
+    official_path = snapshot_root / model / "official" / "response.json"
+    metadata_path = snapshot_root / model / "official" / "metadata.json"
     if not official_path.exists() or not metadata_path.exists():
         raise ValidationError(f"official {model} snapshot is missing; run capture first")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1729,6 +1731,7 @@ def validate_model(
         "model": model,
         "status": "running",
         "official_snapshot_sha256": metadata["response_sha256"],
+        "official_snapshot_root": str(snapshot_root.resolve()),
         "official_requests": metadata["official_request_count"],
         "points_total": POINT_COUNT,
         "points_target": point_limit,
@@ -2079,6 +2082,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("command", choices=("capture", "validate", "run"))
     parser.add_argument("--models", default="gfs,ec,cams")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--official-snapshot-root",
+        type=Path,
+        help=(
+            "existing immutable official capture root used by validate; reports, "
+            "receipts and local responses are still written under --output"
+        ),
+    )
     parser.add_argument("--local-base", default="http://127.0.0.1:8088")
     parser.add_argument(
         "--local-ssh-host",
@@ -2200,9 +2211,18 @@ def main() -> int:
     local_ssh_host = args.local_ssh_host.strip() or None
     if local_ssh_host and not is_loopback_url(args.local_base):
         raise ValidationError("--local-ssh-host requires a loopback --local-base")
+    if args.official_snapshot_root and args.command != "validate":
+        raise ValidationError(
+            "--official-snapshot-root is only valid with the validate command"
+        )
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
     ensure_validation_manifest(manifest_path, models)
+    official_snapshot_root = args.official_snapshot_root or args.output
+    if args.official_snapshot_root:
+        ensure_validation_manifest(
+            official_snapshot_root / "manifest.json", models
+        )
     if args.command in {"capture", "run"}:
         api_key = os.environ.get(args.api_key_env, "").strip() or None
         official_ssh_hosts = tuple(
@@ -2265,6 +2285,7 @@ def main() -> int:
                         attempt_id,
                         args.point_limit,
                         local_ssh_client,
+                        official_snapshot_root,
                     )
                     print(json.dumps(report, ensure_ascii=False), flush=True)
     return 0
