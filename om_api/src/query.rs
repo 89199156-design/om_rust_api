@@ -1998,25 +1998,13 @@ fn read_daily_series_uncached(
         );
     }
     if let Some(decoder) = decoder {
-        match read_variable_grid_series(
-            snapshot,
-            decoder,
-            variable,
-            times,
-            &[latitude],
-            &[longitude],
-        ) {
-            Ok(frames) => {
-                return frames
-                    .into_iter()
-                    .map(|mut frame| {
-                        if frame.len() != 1 {
-                            bail!("daily point series returned {} grid values", frame.len());
-                        }
-                        Ok(frame.remove(0))
-                    })
-                    .collect()
-            }
+        // Use the same retained-run selection as the hourly point endpoint.
+        // In particular, GFS hours before the latest complete run must prefer
+        // the newest covering short run; decoding the whole grid series here
+        // would incorrectly force those hours onto an older complete run.
+        match read_variable_point_series(snapshot, decoder, variable, times, latitude, longitude) {
+            Ok(Some(values)) => return Ok(values),
+            Ok(None) => {}
             Err(error) if error.to_string().contains("variable/time is not available") => {}
             Err(error) => return Err(error),
         }
