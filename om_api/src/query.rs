@@ -6646,6 +6646,7 @@ fn ecmwf_structural_value(run: &EcmwfRegularRun, time: DateTime<Utc>, point: usi
         .copied()
 }
 
+#[cfg(test)]
 fn ecmwf_one_level_native_value(
     runs: &[&EcmwfRegularRun],
     latest_source_run: Option<&str>,
@@ -6690,6 +6691,91 @@ fn ecmwf_one_level_native_value(
                 // Match the update semantics with an explicit one-generation
                 // bound: only the immediately older structurally covering run
                 // may replace a NaN. A second NaN cannot promote a third run.
+                return if value.is_finite() { value } else { f32::NAN };
+            }
+        }
+        index = end;
+    }
+    f32::NAN
+}
+
+fn ecmwf_coverage_native_value(
+    series: &EcmwfRegularSeries,
+    latest_source_run: Option<&str>,
+    public_start_utc: Option<DateTime<Utc>>,
+    time: DateTime<Utc>,
+    point: usize,
+) -> Option<f32> {
+    let mut structural_value = None;
+    for run in series.runs.iter().rev() {
+        if !ecmwf_run_is_eligible(
+            &run.source_run,
+            run.start,
+            latest_source_run,
+            public_start_utc,
+            time,
+        ) {
+            continue;
+        }
+        let Some(value) = ecmwf_structural_value(run, time, point) else {
+            continue;
+        };
+        if value.is_finite() {
+            return Some(value);
+        }
+        structural_value = Some(value);
+    }
+    structural_value
+}
+
+fn ecmwf_one_level_generation_value(
+    regular_series: &[Arc<EcmwfRegularSeries>],
+    latest_source_run: Option<&str>,
+    public_start_utc: Option<DateTime<Utc>>,
+    time: DateTime<Utc>,
+    point: usize,
+) -> f32 {
+    let mut series = regular_series.iter().collect::<Vec<_>>();
+    series.sort_by(|left, right| right.latest_source_run.cmp(&left.latest_source_run));
+
+    let mut primary_value = None;
+    let mut index = 0;
+    while index < series.len() {
+        let generation = series[index].latest_source_run.as_deref();
+        let mut end = index + 1;
+        while end < series.len() && series[end].latest_source_run.as_deref() == generation {
+            end += 1;
+        }
+
+        // A published coverage may contain older source frames solely to
+        // bridge a variable's official sparse schedule. Resolve those frames
+        // inside the same generation before applying the one-generation NaN
+        // fallback to the preceding retained coverage.
+        let mut generation_value = None;
+        for coverage in &series[index..end] {
+            let Some(value) = ecmwf_coverage_native_value(
+                coverage,
+                latest_source_run,
+                public_start_utc,
+                time,
+                point,
+            ) else {
+                continue;
+            };
+            if value.is_finite() {
+                generation_value = Some(value);
+                break;
+            }
+            generation_value = Some(value);
+        }
+
+        if let Some(value) = generation_value {
+            if primary_value.is_none() {
+                if value.is_finite() {
+                    return value;
+                }
+                primary_value = Some(value);
+            } else {
                 return if value.is_finite() { value } else { f32::NAN };
             }
         }
@@ -6752,8 +6838,8 @@ fn read_ecmwf_regular_series_grid(
         let merged_values = regular_times
             .iter()
             .map(|time| {
-                ecmwf_one_level_native_value(
-                    &runs,
+                ecmwf_one_level_generation_value(
+                    regular_series,
                     latest_source_run,
                     public_start_utc,
                     *time,
@@ -11172,6 +11258,74 @@ mod tests {
                 0,
             ),
             22.0
+        );
+    }
+
+    #[test]
+    fn ecmwf_generation_resolves_packaged_support_before_nan_fallback() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 6, 3, 0, 0).unwrap();
+        let current = Arc::new(EcmwfRegularSeries {
+            runs: vec![
+                EcmwfRegularRun {
+                    source_run: "2026073000".to_string(),
+                    start,
+                    frames: vec![vec![12.0]],
+                },
+                EcmwfRegularRun {
+                    source_run: "2026080206".to_string(),
+                    start,
+                    frames: vec![vec![f32::NAN]],
+                },
+            ],
+            public_start_utc: None,
+            latest_source_run: Some("2026080206".to_string()),
+        });
+        let previous = Arc::new(EcmwfRegularSeries {
+            runs: vec![EcmwfRegularRun {
+                source_run: "2026080200".to_string(),
+                start,
+                frames: vec![vec![20.0]],
+            }],
+            public_start_utc: None,
+            latest_source_run: Some("2026080200".to_string()),
+        });
+
+        assert_eq!(
+            ecmwf_one_level_generation_value(
+                &[current, previous],
+                Some("2026080206"),
+                None,
+                start,
+                0,
+            ),
+            12.0
+        );
+    }
+
+    #[test]
+    fn ecmwf_generation_nan_fallback_stops_after_previous_coverage() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 6, 3, 0, 0).unwrap();
+        let series = [
+            ("2026080206", f32::NAN),
+            ("2026080200", f32::NAN),
+            ("2026080118", 18.0),
+        ]
+        .into_iter()
+        .map(|(source_run, value)| {
+            Arc::new(EcmwfRegularSeries {
+                runs: vec![EcmwfRegularRun {
+                    source_run: source_run.to_string(),
+                    start,
+                    frames: vec![vec![value]],
+                }],
+                public_start_utc: None,
+                latest_source_run: Some(source_run.to_string()),
+            })
+        })
+        .collect::<Vec<_>>();
+
+        assert!(
+            ecmwf_one_level_generation_value(&series, Some("2026080206"), None, start, 0,).is_nan()
         );
     }
 
