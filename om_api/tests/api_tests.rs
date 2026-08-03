@@ -419,6 +419,62 @@ async fn gfs_nan_fallback_does_not_continue_into_partial_runs() {
 }
 
 #[tokio::test]
+async fn gfs_full_run_hour_zero_uses_previous_short_run_hour_six_when_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let current = "gfs013_surface_2026070800_full";
+    let previous_short = "gfs013_surface_2026070718_6h";
+    write_product_coverage_timed_with_source_run(
+        root.path(),
+        "gfs013_surface",
+        current,
+        vec![
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [f32::NAN; 4],
+                valid_time_utc: "2026-07-08T00:00:00Z",
+            },
+            TimedTestEntry {
+                variable: "temperature_2m",
+                values: [40.0; 4],
+                valid_time_utc: "2026-07-24T00:00:00Z",
+            },
+        ],
+        false,
+        "2026070800",
+        true,
+    );
+    write_product_coverage_timed_with_source_run(
+        root.path(),
+        "gfs013_surface",
+        previous_short,
+        vec![TimedTestEntry {
+            variable: "temperature_2m",
+            values: [30.0; 4],
+            valid_time_utc: "2026-07-08T00:00:00Z",
+        }],
+        false,
+        "2026070718",
+        true,
+    );
+    write_group_release(
+        root.path(),
+        "gfs",
+        "2026070718",
+        &[("gfs013_surface", previous_short)],
+    );
+    write_group_ready(root.path(), "gfs", &[("gfs013_surface", current)]);
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/gfs?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T00:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["temperature_2m"], serde_json::json!([30.0]));
+}
+
+#[tokio::test]
 async fn gfs_newest_covering_short_run_overrides_previous_complete_run() {
     let root = tempfile::tempdir().unwrap();
     let current = "gfs013_surface_2026070800_full";
