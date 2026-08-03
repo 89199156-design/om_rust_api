@@ -21,6 +21,33 @@ SPEC.loader.exec_module(compare)
 
 
 class Official200PointCompareTests(unittest.TestCase):
+    def test_persistent_ssh_transport_decompresses_responses(self) -> None:
+        expected = b'{"hourly":{"time":["2026-08-02T00:00"]}}'
+        response = compare.canonical_bytes(
+            {
+                "ok": True,
+                "body": compare.base64.b64encode(
+                    gzip.compress(expected, compresslevel=1)
+                ).decode("ascii"),
+                "content_encoding": "gzip+base64",
+                "elapsed": 0.012,
+            }
+        )
+        process = mock.Mock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO(response + b"\n")
+        client = compare.ProductionSshApiClient("singapore", 10.0, 0)
+        client.process = process
+
+        raw, headers, elapsed = client.request(
+            "http://127.0.0.1:8088/v1/gfs?latitude=31.2",
+            {"Accept": "application/json"},
+        )
+
+        self.assertEqual(raw, expected)
+        self.assertEqual(headers, {})
+        self.assertEqual(elapsed, 0.012)
+
     def test_ssh_request_decompresses_the_remote_response(self) -> None:
         expected = b'[{"ok":true}]'
         completed = mock.Mock(

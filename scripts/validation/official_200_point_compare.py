@@ -870,6 +870,7 @@ def request_json_via_ssh(
 
 PRODUCTION_SSH_HELPER = r"""
 import base64
+import gzip
 import json
 import sys
 import time
@@ -902,7 +903,8 @@ for line in sys.stdin.buffer:
                 attempt += 1
         output = {
             "ok": True,
-            "body": base64.b64encode(raw).decode("ascii"),
+            "body": base64.b64encode(gzip.compress(raw, compresslevel=1)).decode("ascii"),
+            "content_encoding": "gzip+base64",
             "elapsed": time.monotonic() - started,
         }
     except Exception as exc:
@@ -995,9 +997,15 @@ class ProductionSshApiClient:
                 f"GET {url} through SSH host {self.ssh_host} failed: "
                 f"{response.get('error', 'unknown remote error')}"
             )
+        if response.get("content_encoding") != "gzip+base64":
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned "
+                "an unsupported body encoding"
+            )
         try:
-            raw = base64.b64decode(response["body"], validate=True)
-        except (KeyError, ValueError) as exc:
+            compressed = base64.b64decode(response["body"], validate=True)
+            raw = gzip.decompress(compressed)
+        except (KeyError, ValueError, OSError) as exc:
             raise ValidationError(
                 f"production SSH API transport to {self.ssh_host} returned invalid body"
             ) from exc
