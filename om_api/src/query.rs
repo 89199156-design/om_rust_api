@@ -6654,32 +6654,49 @@ fn ecmwf_one_level_native_value(
     time: DateTime<Utc>,
     point: usize,
 ) -> f32 {
-    let mut covering = runs.iter().filter_map(|run| {
-        if !ecmwf_run_is_eligible(
-            &run.source_run,
-            run.start,
-            latest_source_run,
-            public_start_utc,
-            time,
-        ) {
-            return None;
+    let mut primary_value = None;
+    let mut index = 0;
+    while index < runs.len() {
+        let source_run = runs[index].source_run.as_str();
+        let mut end = index + 1;
+        while end < runs.len() && runs[end].source_run == source_run {
+            end += 1;
         }
-        ecmwf_structural_value(run, time, point).map(|value| (*run, value))
-    });
-    let Some((_primary, primary_value)) = covering.next() else {
-        return f32::NAN;
-    };
-    if primary_value.is_finite() {
-        return primary_value;
+
+        // One source generation can occur in several immutable coverages: the
+        // newest coverage carries a short interpolation-support prefix, while
+        // its retained release carries the complete run and long tail. Treat
+        // those records as one generation. The newest coverage remains
+        // authoritative where it structurally covers the time; the complete
+        // retained record only extends missing structure.
+        let value = runs[index..end].iter().find_map(|run| {
+            if !ecmwf_run_is_eligible(
+                &run.source_run,
+                run.start,
+                latest_source_run,
+                public_start_utc,
+                time,
+            ) {
+                return None;
+            }
+            ecmwf_structural_value(run, time, point)
+        });
+        if let Some(value) = value {
+            if primary_value.is_none() {
+                if value.is_finite() {
+                    return value;
+                }
+                primary_value = Some(value);
+            } else {
+                // Match the update semantics with an explicit one-generation
+                // bound: only the immediately older structurally covering run
+                // may replace a NaN. A second NaN cannot promote a third run.
+                return if value.is_finite() { value } else { f32::NAN };
+            }
+        }
+        index = end;
     }
-    // Match the update semantics with an explicit one-generation bound: only
-    // the immediately older run that structurally covers this valid time may
-    // replace a NaN. A second NaN is not allowed to promote a third run.
-    covering
-        .next()
-        .map(|(_fallback, value)| value)
-        .filter(|value| value.is_finite())
-        .unwrap_or(f32::NAN)
+    f32::NAN
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6696,7 +6713,6 @@ fn read_ecmwf_regular_series_grid(
         .flat_map(|regular| regular.runs.iter())
         .collect::<Vec<_>>();
     runs.sort_by(|left, right| right.source_run.cmp(&left.source_run));
-    runs.dedup_by(|left, right| left.source_run == right.source_run);
     if runs.is_empty() {
         return Ok(vec![
             vec![f32::NAN; latitudes.len() * longitudes.len()];
@@ -11126,6 +11142,37 @@ mod tests {
                 0,
             ),
             13.0
+        );
+    }
+
+    #[test]
+    fn ecmwf_duplicate_support_run_extends_from_its_complete_retained_record() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 2, 0, 0, 0).unwrap();
+        let support = EcmwfRegularRun {
+            source_run: "2026080200".to_string(),
+            start,
+            frames: vec![vec![10.0], vec![11.0]],
+        };
+        let complete = EcmwfRegularRun {
+            source_run: "2026080200".to_string(),
+            start,
+            frames: vec![vec![20.0], vec![21.0], vec![22.0]],
+        };
+        let runs = vec![&support, &complete];
+
+        assert_eq!(
+            ecmwf_one_level_native_value(&runs, Some("2026080206"), None, start, 0),
+            10.0
+        );
+        assert_eq!(
+            ecmwf_one_level_native_value(
+                &runs,
+                Some("2026080206"),
+                None,
+                start + Duration::hours(6),
+                0,
+            ),
+            22.0
         );
     }
 
