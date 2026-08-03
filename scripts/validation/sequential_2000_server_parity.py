@@ -185,15 +185,17 @@ def fetch(
     timeout: float,
     retries: int,
     ssh_client: ProductionSshApiClient | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     resolved_url = url.replace("__BASE__", base.rstrip("/"), 1)
     headers = {
         "Accept": "application/json",
         "Cache-Control": "no-cache",
         "User-Agent": "weather-server-sequential-2000-parity/1.0",
     }
+    started = time.monotonic()
     if ssh_client:
         raw, _headers, _elapsed = ssh_client.request(resolved_url, headers)
+        transport = f"production_ssh:{ssh_client.ssh_host}"
     else:
         raw, _headers, _elapsed = request_json(
             "GET",
@@ -203,7 +205,14 @@ def fetch(
             timeout=timeout,
             retries=retries,
         )
-    return normalize_rows(json.loads(raw), 1)[0]
+        transport = "direct_http"
+    wall_elapsed = time.monotonic() - started
+    return normalize_rows(json.loads(raw), 1)[0], {
+        "transport": transport,
+        "response_bytes": len(raw),
+        "api_elapsed_seconds": float(_elapsed),
+        "wall_elapsed_seconds": wall_elapsed,
+    }
 
 
 def compare_request(
@@ -220,7 +229,7 @@ def compare_request(
     retries: int,
     shanghai_ssh_client: ProductionSshApiClient | None = None,
     singapore_ssh_client: ProductionSshApiClient | None = None,
-) -> tuple[dict[str, Any] | None, int]:
+) -> tuple[dict[str, Any] | None, int, dict[str, dict[str, Any]]]:
     template = local_url(
         "__BASE__",
         model,
@@ -230,8 +239,16 @@ def compare_request(
         hourly_time_range=hourly_time_range if hourly else None,
         daily_time_range=daily_time_range if daily else None,
     )
-    shanghai = fetch(shanghai_url, template, timeout, retries, shanghai_ssh_client)
-    singapore = fetch(singapore_url, template, timeout, retries, singapore_ssh_client)
+    shanghai, shanghai_performance = fetch(
+        shanghai_url, template, timeout, retries, shanghai_ssh_client
+    )
+    singapore, singapore_performance = fetch(
+        singapore_url, template, timeout, retries, singapore_ssh_client
+    )
+    performance = {
+        "shanghai": shanghai_performance,
+        "singapore": singapore_performance,
+    }
     values_compared = 0
     for period, variables in (("hourly", hourly), ("daily", daily)):
         if not variables:
@@ -244,8 +261,52 @@ def compare_request(
         )
         values_compared += hourly_values + daily_values
         if difference is not None:
-            return difference, values_compared
-    return None, values_compared
+            return difference, values_compared, performance
+    return None, values_compared, performance
+
+
+def record_request_performance(
+    checkpoint: dict[str, Any],
+    request_performance: dict[str, dict[str, Any]],
+) -> None:
+    aggregate = checkpoint.setdefault("performance", {})
+    for server in ("shanghai", "singapore"):
+        current = request_performance[server]
+        server_aggregate = aggregate.setdefault(
+            server,
+            {
+                "transport": current["transport"],
+                "requests": 0,
+                "response_bytes": 0,
+                "api_elapsed_seconds_total": 0.0,
+                "wall_elapsed_seconds_total": 0.0,
+                "api_elapsed_seconds_max": 0.0,
+                "wall_elapsed_seconds_max": 0.0,
+            },
+        )
+        if server_aggregate["transport"] != current["transport"]:
+            raise ValueError(f"{server} transport changed during parity validation")
+        server_aggregate["requests"] += 1
+        server_aggregate["response_bytes"] += current["response_bytes"]
+        for metric in ("api_elapsed_seconds", "wall_elapsed_seconds"):
+            value = float(current[metric])
+            server_aggregate[f"{metric}_total"] += value
+            server_aggregate[f"{metric}_max"] = max(
+                server_aggregate[f"{metric}_max"], value
+            )
+
+
+def summarized_performance(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    summary = json.loads(json.dumps(checkpoint.get("performance", {})))
+    for server_aggregate in summary.values():
+        requests = int(server_aggregate.get("requests", 0))
+        if requests <= 0:
+            continue
+        for metric in ("api_elapsed_seconds", "wall_elapsed_seconds"):
+            server_aggregate[f"{metric}_average"] = (
+                server_aggregate[f"{metric}_total"] / requests
+            )
+    return summary
 
 
 def paired_variable_groups(
@@ -264,7 +325,7 @@ def paired_variable_groups(
 
 def checkpoint_contract(args: argparse.Namespace, points: list[dict[str, Any]]) -> dict[str, Any]:
     contract = {
-        "version": 3,
+        "version": 4,
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "shanghai_url": args.shanghai_url.rstrip("/"),
         "singapore_url": args.singapore_url.rstrip("/"),
@@ -375,7 +436,7 @@ def run_comparison(
                 VARIABLES[model]["daily"],
                 args.field_chunk_size,
             ):
-                difference, value_count = compare_request(
+                difference, value_count, request_performance = compare_request(
                     shanghai_url=args.shanghai_url,
                     singapore_url=args.singapore_url,
                     model=model,
@@ -390,6 +451,7 @@ def run_comparison(
                     singapore_ssh_client=singapore_ssh_client,
                 )
                 checkpoint["values_compared"] += value_count
+                record_request_performance(checkpoint, request_performance)
                 if difference is not None:
                     checkpoint.update(
                         {
@@ -402,6 +464,7 @@ def run_comparison(
                                 "daily": list(daily_group),
                             },
                             "difference": difference,
+                            "performance_summary": summarized_performance(checkpoint),
                             "failed_at": datetime.now(timezone.utc).isoformat(),
                         }
                     )
@@ -422,6 +485,7 @@ def run_comparison(
                         "points_completed": checkpoint["points_completed"],
                         "points_total": len(points),
                         "values_compared": checkpoint["values_compared"],
+                        "performance_summary": summarized_performance(checkpoint),
                     },
                     ensure_ascii=False,
                 ),
@@ -434,6 +498,7 @@ def run_comparison(
             "passed": True,
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "points_completed": len(points),
+            "performance_summary": summarized_performance(checkpoint),
         }
     )
     atomic_write_json(checkpoint_path, checkpoint)
@@ -521,6 +586,7 @@ def main() -> int:
         "status": "running",
         "points_completed": 0,
         "values_compared": 0,
+        "performance": {},
         "started_at": datetime.now(timezone.utc).isoformat(),
         "batch_identity": identity,
     }

@@ -63,9 +63,10 @@ def test_hourly_and_daily_variables_are_paired_into_the_fewest_requests() -> Non
 
 def test_fetch_uses_a_persistent_production_ssh_client() -> None:
     client = mock.Mock()
+    client.ssh_host = "singapore"
     client.request.return_value = (b'{"hourly":{"time":["x"]}}', {}, 0.001)
 
-    response = parity.fetch(
+    response, performance = parity.fetch(
         "http://127.0.0.1:8088",
         "__BASE__/v1/gfs?latitude=31.2",
         10.0,
@@ -74,8 +75,59 @@ def test_fetch_uses_a_persistent_production_ssh_client() -> None:
     )
 
     assert response["hourly"]["time"] == ["x"]
+    assert performance["transport"] == "production_ssh:singapore"
+    assert performance["response_bytes"] > 0
+    assert performance["api_elapsed_seconds"] == 0.001
+    assert performance["wall_elapsed_seconds"] >= 0
     assert client.request.call_count == 1
     assert "127.0.0.1:8088" in client.request.call_args.args[0]
+
+
+def test_request_performance_is_aggregated_and_summarized() -> None:
+    checkpoint: dict[str, object] = {}
+    parity.record_request_performance(
+        checkpoint,
+        {
+            "shanghai": {
+                "transport": "production_ssh:sh-om-new",
+                "response_bytes": 100,
+                "api_elapsed_seconds": 0.04,
+                "wall_elapsed_seconds": 0.08,
+            },
+            "singapore": {
+                "transport": "production_ssh:singapore",
+                "response_bytes": 120,
+                "api_elapsed_seconds": 0.01,
+                "wall_elapsed_seconds": 0.22,
+            },
+        },
+    )
+    parity.record_request_performance(
+        checkpoint,
+        {
+            "shanghai": {
+                "transport": "production_ssh:sh-om-new",
+                "response_bytes": 110,
+                "api_elapsed_seconds": 0.02,
+                "wall_elapsed_seconds": 0.06,
+            },
+            "singapore": {
+                "transport": "production_ssh:singapore",
+                "response_bytes": 130,
+                "api_elapsed_seconds": 0.03,
+                "wall_elapsed_seconds": 0.18,
+            },
+        },
+    )
+
+    summary = parity.summarized_performance(checkpoint)
+
+    assert summary["shanghai"]["requests"] == 2
+    assert summary["shanghai"]["response_bytes"] == 210
+    assert summary["shanghai"]["api_elapsed_seconds_average"] == 0.03
+    assert summary["shanghai"]["wall_elapsed_seconds_max"] == 0.08
+    assert summary["singapore"]["api_elapsed_seconds_average"] == 0.02
+    assert summary["singapore"]["wall_elapsed_seconds_average"] == 0.2
 
 
 def test_batch_identity_requires_equal_source_runs_and_horizons(tmp_path: Path) -> None:
