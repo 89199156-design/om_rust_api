@@ -1,5 +1,5 @@
 use crate::dem::read_dem90;
-use crate::manifest::{ArrayMetadata, BundleEntry, CoveragePlanEntry, EntryKey, ProductSnapshot};
+use crate::manifest::{ArrayMetadata, BundleEntry, EntryKey, ProductSnapshot};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
 use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
@@ -6542,19 +6542,6 @@ fn ecmwf_second_stage_value_with_terminal_extension(
     }
 }
 
-fn ecmwf_source_run_is_retained(
-    source_run: &str,
-    latest_source_run: Option<&str>,
-    max_forecast_hour: Option<i64>,
-) -> bool {
-    // The seamless IFS025 database rolls between the 00Z/12Z long cycles.
-    // Intermediate 06Z/18Z cycles end at f144 (the compact Singapore
-    // deterministic history may end at f006) and must not overwrite that
-    // history. Older f186 gust-only cycles remain interpolation fallbacks.
-    latest_source_run == Some(source_run)
-        || max_forecast_hour.is_some_and(|max_forecast_hour| max_forecast_hour > 144)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_ecmwf_regular_series(
     product: &ProductSnapshot,
@@ -6571,19 +6558,6 @@ fn build_ecmwf_regular_series(
     let mut source_runs = product
         .entries_by_source_run
         .keys()
-        .filter(|source_run| {
-            ecmwf_source_run_is_retained(
-                source_run,
-                product.manifest.latest_complete_run.as_deref(),
-                product
-                    .entries_by_source_run
-                    .get(*source_run)
-                    .into_iter()
-                    .flatten()
-                    .map(|entry| entry.forecast_hour)
-                    .max(),
-            )
-        })
         .cloned()
         .collect::<Vec<_>>();
     source_runs.sort();
@@ -6604,9 +6578,6 @@ fn build_ecmwf_regular_series(
         return Ok(None);
     }
     runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
-    if raw_variable == "wind_gusts_10m" {
-        fill_ecmwf_gust_run_gaps(&mut runs);
-    }
     Ok(Some(EcmwfRegularSeries {
         runs,
         public_start_utc: product.manifest.public_start_utc,
@@ -6640,26 +6611,6 @@ fn ecmwf_run_is_eligible(
         .unwrap_or(true)
 }
 
-fn fill_ecmwf_gust_run_gaps(runs: &mut [EcmwfRegularRun]) {
-    let mut rolling = BTreeMap::<DateTime<Utc>, Vec<f32>>::new();
-    for run in runs {
-        for (index, frame) in run.frames.iter_mut().enumerate() {
-            let time = run.start + Duration::hours(index as i64 * 3);
-            if let Some(fallback) = rolling.get(&time) {
-                fill_nan_from_fallback(frame, fallback);
-            }
-            let target = rolling
-                .entry(time)
-                .or_insert_with(|| vec![f32::NAN; frame.len()]);
-            for (target_value, value) in target.iter_mut().zip(frame) {
-                if value.is_finite() {
-                    *target_value = *value;
-                }
-            }
-        }
-    }
-}
-
 fn ecmwf_cached_regular_series(
     key: EcmwfRegularCacheKey,
     build: impl FnOnce() -> Result<Option<EcmwfRegularSeries>>,
@@ -6685,118 +6636,132 @@ fn ecmwf_cached_regular_series(
     Ok(Some(built))
 }
 
+fn ecmwf_structural_value(run: &EcmwfRegularRun, time: DateTime<Utc>, point: usize) -> Option<f32> {
+    let elapsed = (time - run.start).num_seconds();
+    if elapsed < 0 || elapsed % (3 * 3600) != 0 {
+        return None;
+    }
+    let index = usize::try_from(elapsed / (3 * 3600)).ok()?;
+    run.frames
+        .get(index)
+        .and_then(|frame| frame.get(point))
+        .copied()
+}
+
+fn ecmwf_one_level_native_value(
+    runs: &[&EcmwfRegularRun],
+    latest_source_run: Option<&str>,
+    public_start_utc: Option<DateTime<Utc>>,
+    time: DateTime<Utc>,
+    point: usize,
+) -> f32 {
+    let mut covering = runs.iter().filter_map(|run| {
+        if !ecmwf_run_is_eligible(
+            &run.source_run,
+            run.start,
+            latest_source_run,
+            public_start_utc,
+            time,
+        ) {
+            return None;
+        }
+        ecmwf_structural_value(run, time, point).map(|value| (*run, value))
+    });
+    let Some((_primary, primary_value)) = covering.next() else {
+        return f32::NAN;
+    };
+    if primary_value.is_finite() {
+        return primary_value;
+    }
+    // Match the update semantics with an explicit one-generation bound: only
+    // the immediately older run that structurally covers this valid time may
+    // replace a NaN. A second NaN is not allowed to promote a third run.
+    covering
+        .next()
+        .map(|(_fallback, value)| value)
+        .filter(|value| value.is_finite())
+        .unwrap_or(f32::NAN)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn read_ecmwf_product_grid_series(
-    product: &ProductSnapshot,
-    decoder: &OfficialDecoder,
-    _variable: &str,
+fn read_ecmwf_regular_series_grid(
+    regular_series: &[Arc<EcmwfRegularSeries>],
+    product_name: &str,
     raw_variable: &str,
     times: &[DateTime<Utc>],
     latitudes: &[f64],
     longitudes: &[f64],
-) -> Result<Option<Vec<Vec<f32>>>> {
-    if !is_ecmwf_product(&product.product) {
-        return Ok(None);
+) -> Result<Vec<Vec<f32>>> {
+    let mut runs = regular_series
+        .iter()
+        .flat_map(|regular| regular.runs.iter())
+        .collect::<Vec<_>>();
+    runs.sort_by(|left, right| right.source_run.cmp(&left.source_run));
+    runs.dedup_by(|left, right| left.source_run == right.source_run);
+    if runs.is_empty() {
+        return Ok(vec![
+            vec![f32::NAN; latitudes.len() * longitudes.len()];
+            times.len()
+        ]);
     }
-    let key = EcmwfRegularCacheKey {
-        coverage_id: product.manifest.coverage_id.clone(),
-        raw_variable: raw_variable.to_string(),
-        latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
-        longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
-    };
-    let Some(regular) = ecmwf_cached_regular_series(key, || {
-        build_ecmwf_regular_series(product, decoder, raw_variable, latitudes, longitudes)
-    })?
-    else {
-        return Ok(None);
-    };
+    let latest_source_run = regular_series
+        .iter()
+        .filter_map(|regular| regular.latest_source_run.as_deref())
+        .max();
+    let public_start_utc = latest_source_run
+        .and_then(|latest| {
+            regular_series
+                .iter()
+                .find(|regular| regular.latest_source_run.as_deref() == Some(latest))
+        })
+        .and_then(|regular| regular.public_start_utc);
+    let regular_start = runs.iter().map(|run| run.start).min().unwrap();
+    let regular_end = runs
+        .iter()
+        .filter_map(|run| {
+            run.frames
+                .len()
+                .checked_sub(1)
+                .map(|last| run.start + Duration::hours(last as i64 * 3))
+        })
+        .max()
+        .unwrap();
+    let regular_times = (0..=((regular_end - regular_start).num_hours() / 3))
+        .map(|index| regular_start + Duration::hours(index * 3))
+        .collect::<Vec<_>>();
     let kind = ecmwf_interpolation_kind(raw_variable);
     let output_dt_seconds = series_dt_seconds(times);
     let grid_len = latitudes.len() * longitudes.len();
     let width = longitudes.len();
     let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
     for point in 0..grid_len {
-        // Interpolate every source run independently before choosing the
-        // seamless rolling value. Mixing native control points from adjacent
-        // runs changes Hermite extrema at the rollover boundary.
-        let point_runs = regular
-            .runs
+        let merged_values = regular_times
             .iter()
-            .rev()
-            .map(|run| {
-                let regular_times = (0..run.frames.len())
-                    .map(|index| run.start + Duration::hours(index as i64 * 3))
-                    .collect::<Vec<_>>();
-                let values = run
-                    .frames
-                    .iter()
-                    .map(|frame| frame[point])
-                    .collect::<Vec<_>>();
-                (run, regular_times, values)
+            .map(|time| {
+                ecmwf_one_level_native_value(
+                    &runs,
+                    latest_source_run,
+                    public_start_utc,
+                    *time,
+                    point,
+                )
             })
             .collect::<Vec<_>>();
         for (output_frame, time) in output.iter_mut().zip(times) {
-            for (run, regular_times, values) in &point_runs {
-                if !ecmwf_run_is_eligible(
-                    &run.source_run,
-                    run.start,
-                    regular.latest_source_run.as_deref(),
-                    regular.public_start_utc,
-                    *time,
-                ) {
-                    continue;
-                }
-                let value = ecmwf_second_stage_value_with_terminal_extension(
-                    values,
-                    regular_times,
-                    kind,
-                    *time,
-                    latitudes[point / width] as f32,
-                    longitudes[point % width] as f32,
-                    output_dt_seconds,
-                    product.product == "ecmwf_ifs025_ensemble"
-                        && raw_variable == "precipitation_probability",
-                );
-                if value.is_finite() {
-                    output_frame[point] = value;
-                    break;
-                }
-            }
+            output_frame[point] = ecmwf_second_stage_value_with_terminal_extension(
+                &merged_values,
+                &regular_times,
+                kind,
+                *time,
+                latitudes[point / width] as f32,
+                longitudes[point % width] as f32,
+                output_dt_seconds,
+                product_name == "ecmwf_ifs025_ensemble"
+                    && raw_variable == "precipitation_probability",
+            );
         }
     }
-    Ok(Some(output))
-}
-
-fn ecmwf_coverage_bounds(
-    coverage_plan: &[CoveragePlanEntry],
-) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let first = coverage_plan.iter().map(|entry| entry.valid_time_utc).min();
-    let last = coverage_plan.iter().map(|entry| entry.valid_time_utc).max();
-    first.zip(last)
-}
-
-fn ecmwf_snapshot_is_full(product: &ProductSnapshot) -> bool {
-    ecmwf_coverage_is_full(&product.manifest.coverage_plan)
-}
-
-fn ecmwf_coverage_is_full(coverage_plan: &[CoveragePlanEntry]) -> bool {
-    ecmwf_coverage_bounds(coverage_plan)
-        .is_some_and(|(first, last)| last - first > Duration::hours(6))
-}
-
-fn ecmwf_snapshot_covers_time(
-    product: &ProductSnapshot,
-    raw_variable: &str,
-    time: DateTime<Utc>,
-) -> bool {
-    ecmwf_coverage_bounds(&product.manifest.coverage_plan).is_some_and(|(first, last)| {
-        if product.product == "ecmwf_ifs025_ensemble" && raw_variable == "precipitation_probability"
-        {
-            time >= first && time < last + Duration::hours(3)
-        } else {
-            time >= first && time <= last
-        }
-    })
+    Ok(output)
 }
 
 fn fill_nan_from_fallback(values: &mut [f32], fallback: &[f32]) {
@@ -6820,99 +6785,31 @@ fn read_ecmwf_window_grid_series(
     if products.is_empty() {
         bail!("ECMWF IFS025 product snapshot is not available");
     }
-    let grid_len = latitudes.len() * longitudes.len();
-    let primary = times
-        .iter()
-        .map(|time| {
-            products
-                .iter()
-                .position(|product| ecmwf_snapshot_covers_time(product, raw_variable, *time))
-        })
-        .collect::<Vec<_>>();
-    let mut output = vec![vec![f32::NAN; grid_len]; times.len()];
-
-    for (product_index, product) in products.iter().enumerate() {
-        let requested = primary
-            .iter()
-            .enumerate()
-            .filter_map(|(index, selected)| (*selected == Some(product_index)).then_some(index))
-            .collect::<Vec<_>>();
-        if requested.is_empty() {
-            continue;
-        }
-        let requested_times = requested
-            .iter()
-            .map(|index| times[*index])
-            .collect::<Vec<_>>();
-        let frames = read_ecmwf_product_grid_series(
-            product,
-            decoder,
-            variable,
-            raw_variable,
-            &requested_times,
-            latitudes,
-            longitudes,
-        )?
-        .with_context(|| format!("variable/time is not available: {raw_variable}"))?;
-        for (index, frame) in requested.into_iter().zip(frames) {
-            output[index] = frame;
-        }
-    }
-
-    let full_products = products
-        .iter()
-        .enumerate()
-        .filter(|(_, product)| ecmwf_snapshot_is_full(product))
-        .take(2)
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let fallback_product = primary
-        .iter()
-        .enumerate()
-        .map(|(time_index, selected)| {
-            if !output[time_index].iter().any(|value| value.is_nan()) {
-                return None;
-            }
-            full_products.iter().copied().find(|candidate| {
-                Some(*candidate) != *selected
-                    && ecmwf_snapshot_covers_time(
-                        &products[*candidate],
-                        raw_variable,
-                        times[time_index],
-                    )
-            })
-        })
-        .collect::<Vec<_>>();
-    for product_index in full_products {
-        let requested = fallback_product
-            .iter()
-            .enumerate()
-            .filter_map(|(index, selected)| (*selected == Some(product_index)).then_some(index))
-            .collect::<Vec<_>>();
-        if requested.is_empty() {
-            continue;
-        }
-        let requested_times = requested
-            .iter()
-            .map(|index| times[*index])
-            .collect::<Vec<_>>();
-        let Some(frames) = read_ecmwf_product_grid_series(
-            &products[product_index],
-            decoder,
-            variable,
-            raw_variable,
-            &requested_times,
-            latitudes,
-            longitudes,
-        )?
-        else {
-            continue;
+    let mut regular_series = Vec::new();
+    for product in products {
+        let key = EcmwfRegularCacheKey {
+            coverage_id: product.manifest.coverage_id.clone(),
+            raw_variable: raw_variable.to_string(),
+            latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
+            longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
         };
-        for (index, fallback_frame) in requested.into_iter().zip(frames) {
-            fill_nan_from_fallback(&mut output[index], &fallback_frame);
+        if let Some(regular) = ecmwf_cached_regular_series(key, || {
+            build_ecmwf_regular_series(product, decoder, raw_variable, latitudes, longitudes)
+        })? {
+            regular_series.push(regular);
         }
     }
-    Ok(output)
+    if regular_series.is_empty() {
+        bail!("variable/time is not available: {variable}");
+    }
+    read_ecmwf_regular_series_grid(
+        &regular_series,
+        &products[0].product,
+        raw_variable,
+        times,
+        latitudes,
+        longitudes,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11114,7 +11011,7 @@ mod tests {
     }
 
     #[test]
-    fn ecmwf_rollover_interpolates_each_source_run_before_selection() {
+    fn ecmwf_rollover_respects_the_public_start_support_boundary() {
         let start = Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap();
         let public_start = start + Duration::hours(16);
         assert_eq!(
@@ -11153,48 +11050,84 @@ mod tests {
             3600,
         );
         assert_eq!(probability, 95.0);
-
-        assert!(ecmwf_source_run_is_retained(
-            "2026073012",
-            Some("2026073100"),
-            Some(360)
-        ));
-        assert!(ecmwf_source_run_is_retained(
-            "2026072800",
-            Some("2026073100"),
-            Some(186)
-        ));
-        assert!(!ecmwf_source_run_is_retained(
-            "2026073018",
-            Some("2026073100"),
-            Some(144)
-        ));
-        assert!(ecmwf_source_run_is_retained(
-            "2026073100",
-            Some("2026073100"),
-            Some(6)
-        ));
     }
 
     #[test]
-    fn ecmwf_gust_fallback_fills_each_run_before_interpolation() {
+    fn ecmwf_native_fallback_uses_only_the_immediately_older_covering_run() {
         let start = Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap();
-        let mut runs = vec![
+        let runs = [
             EcmwfRegularRun {
-                source_run: "2026073012".to_string(),
+                source_run: "2026080312".to_string(),
                 start,
-                frames: vec![vec![19.2], vec![18.8], vec![18.4]],
+                frames: vec![vec![f32::NAN]],
             },
             EcmwfRegularRun {
-                source_run: "2026073100".to_string(),
+                source_run: "2026080306".to_string(),
                 start,
-                frames: vec![vec![f32::NAN], vec![19.0], vec![f32::NAN]],
+                frames: vec![vec![f32::NAN]],
+            },
+            EcmwfRegularRun {
+                source_run: "2026080300".to_string(),
+                start,
+                frames: vec![vec![18.4]],
             },
         ];
+        let newest_first = runs.iter().collect::<Vec<_>>();
 
-        fill_ecmwf_gust_run_gaps(&mut runs);
+        assert!(
+            ecmwf_one_level_native_value(&newest_first, Some("2026080312"), None, start, 0,)
+                .is_nan()
+        );
 
-        assert_eq!(runs[1].frames, vec![vec![19.2], vec![19.0], vec![18.4]]);
+        let runs = [
+            EcmwfRegularRun {
+                source_run: "2026080312".to_string(),
+                start,
+                frames: vec![vec![f32::NAN]],
+            },
+            EcmwfRegularRun {
+                source_run: "2026080306".to_string(),
+                start,
+                frames: vec![vec![19.0]],
+            },
+        ];
+        let newest_first = runs.iter().collect::<Vec<_>>();
+        assert_eq!(
+            ecmwf_one_level_native_value(&newest_first, Some("2026080312"), None, start, 0,),
+            19.0
+        );
+    }
+
+    #[test]
+    fn ecmwf_tail_skips_non_covering_short_run_without_spending_nan_fallback() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 3, 0, 0, 0).unwrap();
+        let current = EcmwfRegularRun {
+            source_run: "2026080312".to_string(),
+            start,
+            frames: vec![vec![f32::NAN]],
+        };
+        let short = EcmwfRegularRun {
+            source_run: "2026080306".to_string(),
+            start,
+            frames: vec![vec![f32::NAN]],
+        };
+        let older_long = EcmwfRegularRun {
+            source_run: "2026080300".to_string(),
+            start,
+            frames: vec![vec![12.0], vec![13.0]],
+        };
+        let runs = vec![&current, &short, &older_long];
+
+        assert_eq!(
+            ecmwf_one_level_native_value(
+                &runs,
+                Some("2026080312"),
+                None,
+                start + Duration::hours(3),
+                0,
+            ),
+            13.0
+        );
     }
 
     #[test]
@@ -13008,23 +12941,58 @@ mod output_tests {
     }
 
     #[test]
-    fn ecmwf_short_window_covers_one_six_hour_run_interval() {
-        let start = Utc.with_ymd_and_hms(2026, 7, 27, 6, 0, 0).unwrap();
-        let coverage = [0, 3, 6]
-            .into_iter()
-            .map(|forecast_hour| CoveragePlanEntry {
-                valid_time_utc: start + Duration::hours(forecast_hour),
-                source_run: "2026072706".to_string(),
-                forecast_hour,
-            })
-            .collect::<Vec<_>>();
+    fn ecmwf_interpolates_after_merging_adjacent_run_control_points() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 3, 0, 0, 0).unwrap();
+        let regular = Arc::new(EcmwfRegularSeries {
+            runs: vec![
+                EcmwfRegularRun {
+                    source_run: "2026080300".to_string(),
+                    start,
+                    frames: vec![vec![10.0], vec![20.0], vec![60.0]],
+                },
+                EcmwfRegularRun {
+                    source_run: "2026080306".to_string(),
+                    start: start + Duration::hours(3),
+                    frames: vec![vec![30.0]],
+                },
+            ],
+            public_start_utc: None,
+            latest_source_run: Some("2026080306".to_string()),
+        });
+        let values = read_ecmwf_regular_series_grid(
+            &[regular],
+            "ecmwf_ifs025",
+            "temperature_2m",
+            &[start + Duration::hours(4)],
+            &[31.25],
+            &[121.5],
+        )
+        .unwrap();
 
-        assert_eq!(
-            ecmwf_coverage_bounds(&coverage),
-            Some((start, start + Duration::hours(6)))
+        let regular_times = [0, 3, 6]
+            .into_iter()
+            .map(|hour| start + Duration::hours(hour))
+            .collect::<Vec<_>>();
+        let expected = ecmwf_second_stage_value(
+            &[10.0, 30.0, 60.0],
+            &regular_times,
+            ecmwf_interpolation_kind("temperature_2m"),
+            start + Duration::hours(4),
+            31.25,
+            121.5,
+            3600,
         );
-        assert!(!ecmwf_coverage_is_full(&coverage));
-        assert!(start + Duration::hours(5) >= coverage[0].valid_time_utc);
+        let older_run_only = ecmwf_second_stage_value(
+            &[10.0, 20.0, 60.0],
+            &regular_times,
+            ecmwf_interpolation_kind("temperature_2m"),
+            start + Duration::hours(4),
+            31.25,
+            121.5,
+            3600,
+        );
+        assert_eq!(values, vec![vec![expected]]);
+        assert_ne!(expected, older_run_only);
     }
 
     #[test]
