@@ -9687,7 +9687,7 @@ fn grid_latitude_for_index(
         }
         return Ok((grid.lat_min + y as f64 * grid.dy) as f32);
     }
-    if array.dimensions.len() != 2 || y >= array.dimensions[0] {
+    if !matches!(array.dimensions.len(), 2 | 3) || y >= array.dimensions[0] {
         bail!("invalid latitude grid index");
     }
     let ny = array.dimensions[0] as f32;
@@ -9715,7 +9715,7 @@ fn grid_longitude_for_index(
         }
         return Ok((grid.lon_min + x as f64 * grid.dx) as f32);
     }
-    if array.dimensions.len() != 2 || x >= array.dimensions[1] {
+    if !matches!(array.dimensions.len(), 2 | 3) || x >= array.dimensions[1] {
         bail!("invalid longitude grid index");
     }
     Ok(-180.0_f32 + x as f32 * (360.0_f32 / array.dimensions[1] as f32))
@@ -10667,6 +10667,26 @@ mod tests {
         let (y, x) = grid_index_for_lat_lon(&array, None, 4.2, 75.3).unwrap();
 
         assert_eq!((y, x), (235, 638));
+    }
+
+    #[test]
+    fn global_spatial_time_archive_uses_its_leading_grid_dimensions() {
+        let array = ArrayMetadata {
+            data_type: 20,
+            compression: 0,
+            dimensions: vec![361, 720, 313],
+            chunks: vec![1, 9, 313],
+            lut_offset: None,
+            lut_size: None,
+            scale_factor: None,
+            add_offset: None,
+        };
+
+        let (y, x) = grid_index_for_lat_lon(&array, None, 30.6722, 104.0597).unwrap();
+
+        assert_eq!((y, x), (241, 568));
+        assert_eq!(grid_latitude_for_index(&array, None, y).unwrap(), 30.5);
+        assert_eq!(grid_longitude_for_index(&array, None, x).unwrap(), 104.0);
     }
 
     #[test]
