@@ -17,6 +17,7 @@ outputs are intentionally outside this official parity run.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
 import gzip
@@ -801,25 +802,29 @@ def request_json_via_ssh(
     timeout: float,
     retries: int,
 ) -> tuple[bytes, dict[str, str], float]:
-    """Send a public API request through a configured SSH host.
+    """Send one API request through a configured production SSH host.
 
-    This is intentionally limited to public, keyless capture. It lets one
-    synchronized 200-point snapshot use two independent free-tier source IPs
-    without copying the validation program or credentials to either server.
+    Official POST capture can use independent free-tier source IPs, while
+    local GET validation can reach the real loopback-only production service.
+    Neither mode copies the validation program, snapshot, or credentials to
+    the server.
     """
-    if method != "POST" or body is None:
-        raise ValidationError("SSH official capture only supports POST requests")
+    if method not in {"GET", "POST"}:
+        raise ValidationError(f"SSH API request does not support {method}")
+    if (method == "POST") != (body is not None):
+        raise ValidationError("SSH POST requires a body and SSH GET forbids one")
     if not ssh_host or any(character.isspace() for character in ssh_host):
         raise ValidationError(f"invalid SSH host alias: {ssh_host!r}")
     curl_headers = " ".join(
         f"-H {shlex.quote(f'{key}: {value}')}" for key, value in headers.items()
     )
     retry_delay = min(30, max(1, int(timeout // 30)))
+    body_argument = "--data-binary @- " if body is not None else ""
     curl_command = (
         "curl --silent --show-error --fail-with-body "
         f"--max-time {max(1, int(timeout))} --retry {max(0, retries)} "
-        f"--retry-delay {retry_delay} --retry-all-errors -X POST "
-        f"{curl_headers} --data-binary @- {shlex.quote(url)}"
+        f"--retry-delay {retry_delay} --retry-all-errors -X {method} "
+        f"{curl_headers} {body_argument}{shlex.quote(url)}"
     )
     # Compress before crossing the SSH link. Forecast JSON compresses very
     # well, while sending it uncompressed can make a low-bandwidth server hit
@@ -846,23 +851,170 @@ def request_json_via_ssh(
             timeout=timeout * (retries + 1) + 60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ValidationError(
-            f"POST {url} through SSH host {ssh_host} failed: {exc}"
-        ) from exc
+        raise ValidationError(f"{method} {url} through SSH host {ssh_host} failed: {exc}") from exc
     elapsed = time.monotonic() - started
     if completed.returncode != 0:
         message = completed.stderr[:1000].decode("utf-8", errors="replace")
         raise ValidationError(
-            f"POST {url} through SSH host {ssh_host} failed with exit "
+            f"{method} {url} through SSH host {ssh_host} failed with exit "
             f"{completed.returncode}: {message}"
         )
     try:
         raw = gzip.decompress(completed.stdout)
     except OSError as exc:
         raise ValidationError(
-            f"POST {url} through SSH host {ssh_host} returned invalid gzip data"
+            f"{method} {url} through SSH host {ssh_host} returned invalid gzip data"
         ) from exc
     return raw, {}, elapsed
+
+
+PRODUCTION_SSH_HELPER = r"""
+import base64
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+for line in sys.stdin.buffer:
+    started = time.monotonic()
+    try:
+        request_spec = json.loads(line)
+        retries = int(request_spec["retries"])
+        attempt = 0
+        while True:
+            try:
+                request = urllib.request.Request(
+                    request_spec["url"],
+                    headers=request_spec["headers"],
+                    method="GET",
+                )
+                with urllib.request.urlopen(
+                    request,
+                    timeout=float(request_spec["timeout"]),
+                ) as response:
+                    raw = response.read()
+                break
+            except (urllib.error.URLError, TimeoutError):
+                if attempt >= retries:
+                    raise
+                time.sleep(min(5.0, 2.0**attempt))
+                attempt += 1
+        output = {
+            "ok": True,
+            "body": base64.b64encode(raw).decode("ascii"),
+            "elapsed": time.monotonic() - started,
+        }
+    except Exception as exc:
+        output = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed": time.monotonic() - started,
+        }
+    sys.stdout.write(json.dumps(output, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+"""
+
+
+class ProductionSshApiClient:
+    """Keep one SSH session open while querying a loopback production API."""
+
+    def __init__(self, ssh_host: str, timeout: float, retries: int) -> None:
+        if not ssh_host or any(character.isspace() for character in ssh_host):
+            raise ValidationError(f"invalid SSH host alias: {ssh_host!r}")
+        self.ssh_host = ssh_host
+        self.timeout = timeout
+        self.retries = retries
+        self.process: subprocess.Popen[bytes] | None = None
+
+    def __enter__(self) -> "ProductionSshApiClient":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def start(self) -> None:
+        if self.process is not None:
+            return
+        command = "python3 -u -c " + shlex.quote(PRODUCTION_SSH_HELPER)
+        self.process = subprocess.Popen(
+            [
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                f"ConnectTimeout={min(30, max(5, int(self.timeout)))}",
+                self.ssh_host,
+                command,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def request(
+        self,
+        url: str,
+        headers: dict[str, str],
+    ) -> tuple[bytes, dict[str, str], float]:
+        self.start()
+        assert self.process is not None
+        if self.process.stdin is None or self.process.stdout is None:
+            raise ValidationError("production SSH API process has no pipes")
+        request_spec = canonical_bytes(
+            {
+                "url": url,
+                "headers": headers,
+                "timeout": self.timeout,
+                "retries": self.retries,
+            }
+        )
+        try:
+            self.process.stdin.write(request_spec + b"\n")
+            self.process.stdin.flush()
+            response_line = self.process.stdout.readline()
+        except (BrokenPipeError, OSError) as exc:
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} failed: {exc}"
+            ) from exc
+        if not response_line:
+            return_code = self.process.poll()
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} ended "
+                f"unexpectedly with exit {return_code}"
+            )
+        try:
+            response = json.loads(response_line)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned invalid JSON"
+            ) from exc
+        if not response.get("ok"):
+            raise ValidationError(
+                f"GET {url} through SSH host {self.ssh_host} failed: "
+                f"{response.get('error', 'unknown remote error')}"
+            )
+        try:
+            raw = base64.b64decode(response["body"], validate=True)
+        except (KeyError, ValueError) as exc:
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned invalid body"
+            ) from exc
+        return raw, {}, float(response["elapsed"])
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            process.wait(timeout=10)
 
 
 def response_time_axis_signature(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1553,6 +1705,7 @@ def validate_model(
     max_local_om_api_processes: int = DEFAULT_MAX_LOCAL_OM_API_PROCESSES,
     attempt_id: str | None = None,
     point_limit: int = POINT_COUNT,
+    local_ssh_client: ProductionSshApiClient | None = None,
 ) -> dict[str, Any]:
     if point_limit > POINT_COUNT:
         raise ValidationError(
@@ -1586,6 +1739,11 @@ def validate_model(
         "daily_values_compared": 0,
         "comparison": "strict_official_json_values_for_field_intersection",
         "local_request_mode": "paired_hourly_daily_chunks",
+        "local_request_transport": (
+            f"production_ssh:{local_ssh_client.ssh_host}"
+            if local_ssh_client
+            else "direct_http"
+        ),
         "concurrency": 1,
         "first_difference_order": "point_then_period_then_field_then_time",
         "field_chunk_size": field_chunk_size,
@@ -1694,14 +1852,21 @@ def validate_model(
                     str(official_times[0]),
                     str(official_times[-1]),
                 )
-            resource_snapshot = wait_for_safe_local_resources(
-                local_base=local_base,
-                min_available_memory_mib=min_available_memory_mib,
-                max_io_full_pressure_avg10=max_io_full_pressure_avg10,
-                max_local_om_api_processes=max_local_om_api_processes,
-                wait_timeout_seconds=resource_wait_timeout_seconds,
-                poll_seconds=resource_poll_seconds,
-            )
+            if local_ssh_client:
+                resource_snapshot = {
+                    "transport": "production_ssh",
+                    "ssh_host": local_ssh_client.ssh_host,
+                    "remote_loopback": local_base,
+                }
+            else:
+                resource_snapshot = wait_for_safe_local_resources(
+                    local_base=local_base,
+                    min_available_memory_mib=min_available_memory_mib,
+                    max_io_full_pressure_avg10=max_io_full_pressure_avg10,
+                    max_local_om_api_processes=max_local_om_api_processes,
+                    wait_timeout_seconds=resource_wait_timeout_seconds,
+                    poll_seconds=resource_poll_seconds,
+                )
             url = local_url(
                 local_base,
                 model,
@@ -1746,14 +1911,18 @@ def validate_model(
                 ),
                 flush=True,
             )
-            raw, headers, elapsed = request_json(
-                "GET",
-                url,
-                body=None,
-                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-                timeout=timeout,
-                retries=retries,
-            )
+            request_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+            if local_ssh_client:
+                raw, headers, elapsed = local_ssh_client.request(url, request_headers)
+            else:
+                raw, headers, elapsed = request_json(
+                    "GET",
+                    url,
+                    body=None,
+                    headers=request_headers,
+                    timeout=timeout,
+                    retries=retries,
+                )
             local_path = (
                 output
                 / model
@@ -1911,6 +2080,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default="gfs,ec,cams")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--local-base", default="http://127.0.0.1:8088")
+    parser.add_argument(
+        "--local-ssh-host",
+        default="",
+        help=(
+            "configured SSH alias that executes local API GETs against "
+            "--local-base on the real production server"
+        ),
+    )
     parser.add_argument("--api-key-env", default="OPEN_METEO_API_KEY")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--retries", type=int, default=2)
@@ -2020,6 +2197,9 @@ def main() -> int:
         raise ValidationError(
             f"--point-limit must not exceed the {POINT_COUNT}-point immutable plan"
         )
+    local_ssh_host = args.local_ssh_host.strip() or None
+    if local_ssh_host and not is_loopback_url(args.local_base):
+        raise ValidationError("--local-ssh-host requires a loopback --local-base")
     args.output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output / "manifest.json"
     ensure_validation_manifest(manifest_path, models)
@@ -2060,26 +2240,33 @@ def main() -> int:
             )
     if args.command in {"validate", "run"}:
         attempt_id = attempt_id_now()
-        with validation_lock(args.output):
-            for model in models:
-                report = validate_model(
-                    model,
-                    args.output,
-                    args.local_base,
-                    args.timeout,
-                    args.retries,
-                    args.point_delay_seconds,
-                    args.field_chunk_size,
-                    args.request_delay_seconds,
-                    args.min_available_memory_mib,
-                    args.max_io_full_pressure_avg10,
-                    args.resource_wait_timeout_seconds,
-                    args.resource_poll_seconds,
-                    args.max_local_om_api_processes,
-                    attempt_id,
-                    args.point_limit,
-                )
-                print(json.dumps(report, ensure_ascii=False), flush=True)
+        transport_context = (
+            ProductionSshApiClient(local_ssh_host, args.timeout, args.retries)
+            if local_ssh_host
+            else contextlib.nullcontext(None)
+        )
+        with transport_context as local_ssh_client:
+            with validation_lock(args.output):
+                for model in models:
+                    report = validate_model(
+                        model,
+                        args.output,
+                        args.local_base,
+                        args.timeout,
+                        args.retries,
+                        args.point_delay_seconds,
+                        args.field_chunk_size,
+                        args.request_delay_seconds,
+                        args.min_available_memory_mib,
+                        args.max_io_full_pressure_avg10,
+                        args.resource_wait_timeout_seconds,
+                        args.resource_poll_seconds,
+                        args.max_local_om_api_processes,
+                        attempt_id,
+                        args.point_limit,
+                        local_ssh_client,
+                    )
+                    print(json.dumps(report, ensure_ascii=False), flush=True)
     return 0
 
 

@@ -44,6 +44,30 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0)
         self.assertIn("gzip -1 -c", run.call_args.args[0][-1])
 
+    def test_ssh_get_targets_the_real_loopback_api_without_a_body(self) -> None:
+        expected = b'{"hourly":{"time":["2026-08-02T00:00"]}}'
+        completed = mock.Mock(
+            returncode=0,
+            stdout=gzip.compress(expected),
+            stderr=b"",
+        )
+        with mock.patch.object(compare.subprocess, "run", return_value=completed) as run:
+            raw, _headers, _elapsed = compare.request_json_via_ssh(
+                "singapore",
+                "GET",
+                "http://127.0.0.1:8088/v1/gfs?latitude=31.2",
+                body=None,
+                headers={"Accept": "application/json"},
+                timeout=10.0,
+                retries=0,
+            )
+
+        self.assertEqual(raw, expected)
+        command = run.call_args.args[0][-1]
+        self.assertIn("-X GET", command)
+        self.assertNotIn("--data-binary", command)
+        self.assertIn("127.0.0.1:8088", command)
+
     def test_plan_has_exactly_two_hundred_stable_points(self) -> None:
         points = compare.sample_points()
         self.assertEqual(len(points), 200)
@@ -631,6 +655,63 @@ class Official200PointCompareTests(unittest.TestCase):
             self.assertEqual(receipt["local_request_count"], 2)
             self.assertEqual(len(receipt["local_response_parts"]), 2)
             self.assertEqual(len(local_parts), 2)
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_validate_model_can_query_the_production_api_through_ssh(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "local_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        response = {
+            "hourly": {
+                "time": ["2026-08-02T00:00"],
+                "temperature_2m": [25.0],
+            }
+        }
+        official_raw = compare.canonical_bytes([response] * compare.POINT_COUNT)
+        local_raw = compare.canonical_bytes(response)
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                output = Path(temporary_directory)
+                official_dir = output / "gfs" / "official"
+                official_dir.mkdir(parents=True)
+                official_dir.joinpath("response.json").write_bytes(official_raw)
+                official_dir.joinpath("metadata.json").write_bytes(
+                    compare.pretty_bytes(
+                        {
+                            "response_sha256": compare.sha256_bytes(official_raw),
+                            "official_request_count": 2,
+                        }
+                    )
+                )
+                ssh_client = mock.Mock(ssh_host="singapore")
+                ssh_client.request.return_value = (local_raw, {}, 0.01)
+                with (
+                    mock.patch.object(compare, "request_json") as direct_request,
+                    mock.patch.object(compare, "wait_for_safe_local_resources") as guard,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    report = compare.validate_model(
+                        "gfs",
+                        output,
+                        "http://127.0.0.1:8088",
+                        10.0,
+                        0,
+                        0,
+                        point_limit=1,
+                        attempt_id="production-ssh",
+                        local_ssh_client=ssh_client,
+                    )
+
+            self.assertEqual(ssh_client.request.call_count, 1)
+            self.assertIn("127.0.0.1:8088", ssh_client.request.call_args.args[0])
+            direct_request.assert_not_called()
+            guard.assert_not_called()
+            self.assertEqual(report["local_request_transport"], "production_ssh:singapore")
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
