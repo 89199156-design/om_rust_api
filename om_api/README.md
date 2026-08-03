@@ -11,10 +11,11 @@ Public release metadata:
 - `scripts/install_om_api.sh` refuses a dirty Git tree, archives the exact
   revision, and supplies `OM_BUILD_REVISION` at compile time.
 
-This Rust server is the client-facing point API. It reads published
-Open-Meteo `.omranges` bundles from `/data/om_raw` and returns point JSON
-directly. Clients do not fetch `latest.json` or any manifest before requesting
-point data.
+This Rust server is the client-facing point API. It reads published native OM
+releases from the deployment's `OM_DATA_ROOT` and returns point JSON directly.
+Clients do not fetch `latest.json` or any manifest before requesting point
+data. Shanghai supplies `/data/om_raw` through `om_data_om`; Singapore supplies
+its Swift-produced OM root through `om_data_raw`.
 
 Point weather responses include `model_run` (for example `2026072800`). The
 value is the active OM group batch loaded atomically with the point snapshot;
@@ -51,7 +52,7 @@ rejected so the build and install phases cannot resolve different artifacts.
 Build that decoder on Ubuntu:
 
 ```bash
-cd /opt/1panel/apps/weather_om_downloader
+cd /path/to/om_rust_api
 bash scripts/build_omfileformat_decoder.sh /opt/1panel/apps/weather_om_api/native
 ```
 
@@ -90,7 +91,7 @@ OM_DATA_ROOT=/data/om_raw \
 OM_DEM_ROOT=/opt/1panel/apps/weather_om_api/static \
 OM_MODEL_STATIC_ROOT=/opt/1panel/apps/weather_om_api \
 OM_OMFILE_LIB=/opt/1panel/apps/weather_om_api/native/libomfileformat.so \
-/opt/1panel/apps/weather_om_api/om-api --bind 127.0.0.1:8088
+/opt/1panel/apps/weather_om_api/bin/om-api --bind 127.0.0.1:8088
 ```
 
 Client examples:
@@ -161,7 +162,7 @@ DEM and grid-cell selection:
 - The installer also accepts `OM_API_MODEL_STATIC_ROOT` (default
   `/opt/1panel/apps/weather_om_api`) and writes it as
   `OM_MODEL_STATIC_ROOT`. Pinned GFS/ECMWF `HSURF.om` grids live below its
-  `static/` directory on the system filesystem; downloader/mirror releases
+  `static/` directory on the system filesystem; producer/downloader manifests
   carry only their immutable identity and external-storage contract.
 - Before downloading assets, building, or changing the service, the installer
   verifies the product-region contract: non-empty
@@ -174,8 +175,6 @@ DEM and grid-cell selection:
   when the official decoder or required static grid-selection data is
   unavailable. An explicit `elevation` skips the DEM90 lookup, but it does not
   remove the decoder/static-grid requirement for those selection modes.
-- When DEM is needed, first copy the Singapore production DEM/static grid data
-  that belongs to the recorded Open-Meteo baseline.
-- If that DEM package is not suitable for the Rust service format, resolution,
-  projection, or baseline version, fetch a new compatible DEM package through
-  the Silicon Valley download server, then deploy the verified copy to Shanghai.
+- DEM/static assets must come from an audited, checksum-recorded deployment
+  source compatible with the pinned Open-Meteo baseline. They must not be
+  copied between production servers as an implicit fallback.

@@ -1,6 +1,6 @@
 # Project notice
 
-`om_weather_server` is a separately maintained weather-data service whose
+`om_rust_api` is a separately maintained weather-data service whose
 API behavior and OM-format handling are based in part on published Open-Meteo
 software and data conventions. Open-Meteo has not endorsed this service.
 

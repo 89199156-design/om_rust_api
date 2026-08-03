@@ -33,7 +33,7 @@ model_static_root="${OM_MODEL_STATIC_ROOT:-/opt/1panel/apps/weather_om_api}"
 workers="${OM_WEBP_WORKERS:-$default_workers}"
 frames="${OM_WEBP_FRAMES:-121}"
 minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"
-reporter="${OM_TASK_PROGRESS_REPORTER:-/opt/1panel/apps/weather_om_downloader/scripts/task_progress_reporter.py}"
+reporter="${OM_TASK_PROGRESS_REPORTER:-$app_dir/scripts/task_progress_reporter.py}"
 log_dir="${OM_WEBP_LOG_DIR:-$app_dir/logs}"
 ready_marker="$data_root/groups/$ready_group/current/ready_for_processing.json"
 

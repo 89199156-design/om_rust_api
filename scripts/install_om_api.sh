@@ -142,7 +142,7 @@ resolve_source_revision() {
 
 SOURCE_REVISION="$(resolve_source_revision)"
 BUILD_REVISION="$SOURCE_REVISION"
-archive_name="om_weather_server-${SOURCE_REVISION}.tar.gz"
+archive_name="om_rust_api-${SOURCE_REVISION}.tar.gz"
 
 validate_required_dem_chunks() {
   if [ ! -d "$DEM_STATIC_DIR" ]; then
@@ -258,7 +258,7 @@ install_corresponding_source_archive() (
     fi
     git -C "$APP_ROOT" archive \
       --format=tar \
-      --prefix="om_weather_server-${SOURCE_REVISION}/" \
+      --prefix="om_rust_api-${SOURCE_REVISION}/" \
       "$SOURCE_REVISION" \
       | gzip -n -9 > "$archive_tmp"
   else

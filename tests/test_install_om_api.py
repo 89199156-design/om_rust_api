@@ -110,7 +110,7 @@ class InstallOmApiTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(
             'location ~ "^/source/(?<source_archive>'
-            'om_weather_server-[0-9a-f]{40}\\.tar\\.gz(?:\\.sha256)?)$"',
+            'om_rust_api-[0-9a-f]{40}\\.tar\\.gz(?:\\.sha256)?)$"',
             nginx_content,
         )
 
@@ -389,7 +389,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             installed_source_archive = (
                 install_root
                 / "source-archives"
-                / f"om_weather_server-{TEST_SOURCE_REVISION}.tar.gz"
+                / f"om_rust_api-{TEST_SOURCE_REVISION}.tar.gz"
             )
             self.assertEqual(installed_source_archive.read_bytes(), source_archive.read_bytes())
             self.assertEqual(

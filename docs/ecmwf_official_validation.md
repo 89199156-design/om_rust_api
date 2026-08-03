@@ -135,7 +135,7 @@ Linux CLI 会硬拒绝把 plan、freeze、官方 cache 或本地 validation 输�
 1. 确认新盘已按 UUID 挂载且重启后仍生效。
 2. 完成 18Z → 00Z 回放、裁剪、派生、OM 和 WebP。
 3. 原子发布目标 00Z。
-4. 在 1Panel 停止 ECMWF 定时更新任务，并确认没有 downloader/processor 在运行。
+4. 在 1Panel 停止 ECMWF 定时更新任务，并确认 `om_data_om` 下载发布任务和 API/WebP 处理均未运行。
 5. 保存 1Panel 任务状态、挂载信息和发布清单快照。
 6. 再创建 freeze attestation。
 

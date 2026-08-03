@@ -35,14 +35,6 @@ dynamic loading do not themselves resolve it. Project policy therefore limits
 the library to server-internal use and forbids client or third-party native
 distribution pending upstream clarification or qualified legal review.
 
-## TurboPFor decoder subset
-
-`downloader/scripts/build_turbopfor_decoder.sh` builds a small decoder from
-TurboPFor files included in the same pinned `om-file-format` source revision.
-The selected upstream source headers state GPL version 2 or later. The build is
-also treated as server-internal-only; its upstream source and notices must
-accompany any permitted distribution.
-
 ## Direct Rust dependencies
 
 The two Rust crates directly depend on packages including `anyhow`, `axum`,

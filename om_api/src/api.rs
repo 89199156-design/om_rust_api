@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tower_http::trace::TraceLayer;
 
-const SOURCE_REPOSITORY: &str = "https://github.com/89199156-design/om_weather_server";
+const SOURCE_REPOSITORY: &str = "https://github.com/89199156-design/om_rust_api";
 const SOURCE_LICENSE: &str = "AGPL-3.0-or-later";
 const BUILD_REVISION: &str = match option_env!("OM_BUILD_REVISION") {
     Some(revision) => revision,
@@ -256,13 +256,13 @@ pub fn router(state: AppState) -> Router {
 async fn source_offer() -> Json<serde_json::Value> {
     Json(json!({
         "schema_version": 1,
-        "component": "om_weather_server",
+        "component": "om_rust_api",
         "build_revision": BUILD_REVISION,
         "license": SOURCE_LICENSE,
         "license_url": AGPL_LICENSE_URL,
         "source_code": SOURCE_REPOSITORY,
-        "source_archive_url": format!("/source/om_weather_server-{BUILD_REVISION}.tar.gz"),
-        "source_archive_sha256_url": format!("/source/om_weather_server-{BUILD_REVISION}.tar.gz.sha256"),
+        "source_archive_url": format!("/source/om_rust_api-{BUILD_REVISION}.tar.gz"),
+        "source_archive_sha256_url": format!("/source/om_rust_api-{BUILD_REVISION}.tar.gz.sha256"),
         "weather_attribution_url": "/.well-known/weather-attribution.json",
         "notice": "Corresponding Source for this network service is available at source_code."
     }))
@@ -275,7 +275,7 @@ async fn data_identity(State(state): State<AppState>) -> Result<Json<serde_json:
 fn weather_attribution_payload() -> serde_json::Value {
     json!({
         "schema_version": 1,
-        "generated_by": "om_weather_server",
+        "generated_by": "om_rust_api",
         "build_revision": BUILD_REVISION,
         "source_software": {
             "name": "Open-Meteo",

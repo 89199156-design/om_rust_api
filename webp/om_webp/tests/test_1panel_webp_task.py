@@ -37,6 +37,11 @@ class WebpTaskGateTests(unittest.TestCase):
             'OM_DATA_ROOT must be an absolute read-only source path',
             content,
         )
+        self.assertIn(
+            'reporter="${OM_TASK_PROGRESS_REPORTER:-$app_dir/scripts/task_progress_reporter.py}"',
+            content,
+        )
+        self.assertNotIn("weather_om_downloader", content)
 
     def test_installer_accepts_verified_bind_mount_on_output_device(self):
         content = (
