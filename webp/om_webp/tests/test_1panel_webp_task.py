@@ -41,6 +41,8 @@ class WebpTaskGateTests(unittest.TestCase):
             'reporter="${OM_TASK_PROGRESS_REPORTER:-$app_dir/scripts/task_progress_reporter.py}"',
             content,
         )
+        self.assertIn('payload.get("latest_complete_run")', content)
+        self.assertIn("WEATHER_TASK_TARGET_RUN", content)
         self.assertNotIn("weather_om_downloader", content)
 
     def test_installer_accepts_verified_bind_mount_on_output_device(self):

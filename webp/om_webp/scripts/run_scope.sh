@@ -70,6 +70,21 @@ if [[ ! -f "$ready_marker" ]]; then
   exit 0
 fi
 
+target_run="$(
+  /usr/bin/python3 - "$ready_marker" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(payload.get("latest_complete_run") or "")
+PY
+)"
+if [[ ! "$target_run" =~ ^20[0-9]{8}$ ]]; then
+  echo "WebP ready marker has no canonical latest_complete_run: $ready_marker" >&2
+  exit 1
+fi
+
 run_renderer() {
   "$app_dir/bin/om-webp" \
     --scope "$scope" \
@@ -90,6 +105,7 @@ fi
 
 (
   trap 'task_rc=$?; trap - EXIT; printf "\036WEATHER_TASK_RC=%s\n" "$task_rc"; exit "$task_rc"' EXIT
+  printf '\036WEATHER_TASK_TARGET_RUN=%s\n' "$target_run"
   run_renderer
 ) 2>&1 | /usr/bin/python3 "$reporter" \
   --task "${scope^^} WebP 构建" \
