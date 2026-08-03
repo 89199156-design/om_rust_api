@@ -126,6 +126,13 @@ class InstallScriptTests(unittest.TestCase):
                 "weather_om_webp/scripts/run_scope.sh gfs"
             ),
         )
+        for script in publisher_scripts.values():
+            self.assertIn('pgrep -u "$(id -u)" -x om-api', script)
+            self.assertIn('kill -HUP "${api_pids[0]}"', script)
+            self.assertLess(
+                script.index('kill -HUP "${api_pids[0]}"'),
+                script.index("weather_om_webp/scripts/run_scope.sh"),
+            )
         self.assertIn(
             '--now "$(date -u +%Y-%m-%dT%H:00:00Z)" || return $?',
             publisher_scripts["OM_GFS_DOWNLOAD"],
@@ -217,6 +224,8 @@ class InstallScriptTests(unittest.TestCase):
         self.assertIn('if [ "$payload_status" -eq 23 ]', sync_content)
         self.assertIn("--defer-openmeteo-gfs-activation", sync_content)
         self.assertIn("materialize_openmeteo_gfs.sh", sync_content)
+        self.assertIn('pgrep -u "$(id -u)" -x om-api', sync_content)
+        self.assertIn('kill -HUP "${api_pids[0]}"', sync_content)
 
         materializer_content = Path("scripts/materialize_openmeteo_gfs.sh").read_text(
             encoding="utf-8"

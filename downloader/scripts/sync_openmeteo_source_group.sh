@@ -395,4 +395,11 @@ if [ "$DEFER_GFS_ACTIVATION" -eq 1 ]; then
   /usr/bin/env bash "$APP_DIR/scripts/materialize_openmeteo_gfs.sh" --raw-root "$RAW"
 fi
 
+mapfile -t api_pids < <(pgrep -u "$(id -u)" -x om-api)
+if [ "${#api_pids[@]}" -ne 1 ]; then
+  printf '%s\n' "failed to identify the single production om-api process: ${#api_pids[@]} found" >&2
+  exit 1
+fi
+kill -HUP "${api_pids[0]}"
+
 rm -rf -- "$STAGE_ROOT"

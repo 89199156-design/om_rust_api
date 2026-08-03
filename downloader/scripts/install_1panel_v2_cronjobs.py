@@ -204,6 +204,18 @@ def download_group_script(
             ),
             *(
                 [
+                    '  mapfile -t api_pids < <(pgrep -u "$(id -u)" -x om-api)',
+                    '  if [ "${#api_pids[@]}" -ne 1 ]; then',
+                    '    printf \'%s\\n\' "failed to identify the single production om-api process: ${#api_pids[@]} found" >&2',
+                    "    return 1",
+                    "  fi",
+                    '  kill -HUP "${api_pids[0]}"',
+                ]
+                if publish_root is not None
+                else []
+            ),
+            *(
+                [
                     f"  /usr/bin/env bash {shell_path(WEBP_RUNNER)} "
                     f"{WEBP_SCOPE_BY_GROUP[group]}"
                 ]
