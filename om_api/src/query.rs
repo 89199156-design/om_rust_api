@@ -6326,7 +6326,6 @@ fn ecmwf_regularize_source_run(
     let kind = ecmwf_interpolation_kind(raw_variable);
     let is_gust = raw_variable == "wind_gusts_10m";
     let allow_missing_terminal_hermite_d = is_gust
-        && product.manifest.latest_complete_run.as_deref() == Some(source_run)
         && product
             .manifest
             .coverage_plan
