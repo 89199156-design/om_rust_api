@@ -791,6 +791,88 @@ async fn forecast_endpoint_hides_interpolation_history_before_public_start() {
 }
 
 #[tokio::test]
+async fn ecmwf_explicit_start_uses_retained_run_before_current_public_start() {
+    let root = tempfile::tempdir().unwrap();
+    let current_id = "ecmwf_ifs025_2026070806";
+    let history_id = "ecmwf_ifs025_2026070800";
+    const TIMES: [&str; 10] = [
+        "2026-07-08T00:00:00Z",
+        "2026-07-08T01:00:00Z",
+        "2026-07-08T02:00:00Z",
+        "2026-07-08T03:00:00Z",
+        "2026-07-08T04:00:00Z",
+        "2026-07-08T05:00:00Z",
+        "2026-07-08T06:00:00Z",
+        "2026-07-08T07:00:00Z",
+        "2026-07-08T08:00:00Z",
+        "2026-07-08T09:00:00Z",
+    ];
+
+    let timed_entries = |start_hour: usize, end_hour: usize| {
+        (start_hour..=end_hour)
+            .map(|hour| TimedTestEntry {
+                variable: "temperature_2m",
+                values: [hour as f32, 0.0, 0.0, 0.0],
+                valid_time_utc: TIMES[hour],
+            })
+            .collect::<Vec<_>>()
+    };
+    write_product_coverage_timed_with_source_run(
+        root.path(),
+        "ecmwf_ifs025",
+        history_id,
+        timed_entries(0, 5),
+        false,
+        "2026070800",
+        true,
+    );
+    set_coverage_public_start(
+        root.path(),
+        "ecmwf_ifs025",
+        history_id,
+        "2026-07-08T00:00:00Z",
+    );
+    write_product_coverage_timed_with_source_run(
+        root.path(),
+        "ecmwf_ifs025",
+        current_id,
+        timed_entries(6, 9),
+        true,
+        "2026070806",
+        true,
+    );
+    set_coverage_public_start(
+        root.path(),
+        "ecmwf_ifs025",
+        current_id,
+        "2026-07-08T06:00:00Z",
+    );
+    write_group_release(
+        root.path(),
+        "ecmwf",
+        "2026070800",
+        &[("ecmwf_ifs025", history_id)],
+    );
+    write_group_ready_with_product_runs(
+        root.path(),
+        "ecmwf",
+        "2026070806",
+        &[("ecmwf_ifs025", current_id, "2026070806")],
+    );
+
+    let (status, body) = request_json(
+        router(AppState::new(root.path().to_path_buf(), None).unwrap()),
+        "/v1/ecmwf?latitude=-90&longitude=-180&hourly=temperature_2m&start_hour=2026-07-08T00:00&end_hour=2026-07-08T09:00",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hourly"]["time"].as_array().unwrap().len(), 10);
+    assert_eq!(body["hourly"]["time"][0], "2026-07-08T00:00");
+    assert_eq!(body["hourly"]["time"][9], "2026-07-08T09:00");
+}
+
+#[tokio::test]
 async fn cams_hermite_uses_b_when_second_lookahead_is_missing() {
     let root = tempfile::tempdir().unwrap();
     let coverage_id = "cams_global_greenhouse_gases_hermite_edge";

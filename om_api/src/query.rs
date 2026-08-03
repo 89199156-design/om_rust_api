@@ -2202,7 +2202,18 @@ fn select_times(
         .public_start_utc
         .unwrap_or(first)
         .max(first);
-    let selected_start = start.unwrap_or(public_start).max(public_start);
+    let selected_start = match start {
+        // ECMWF retains complete source cycles specifically so an explicit
+        // request can read the hours before the newest cycle and apply the
+        // same one-generation fallback as the upstream API. Keep the normal
+        // default window at public_start, but do not hide retained history
+        // from an explicitly bounded request.
+        Some(requested) if current_weather_model() == WeatherModel::EcmwfIfs025 => {
+            requested.max(first)
+        }
+        Some(requested) => requested.max(public_start),
+        None => public_start,
+    };
     let selected_end = end.unwrap_or(last).min(last);
     times.clear();
     let mut time = selected_start;

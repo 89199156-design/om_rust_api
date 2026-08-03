@@ -35,8 +35,6 @@ struct NativeReady {
     greenhouse_source_runs: Vec<String>,
     public_start_utc: DateTime<Utc>,
     #[serde(default)]
-    generated_at: Option<DateTime<Utc>>,
-    #[serde(default)]
     local_utc_offset_hours: Option<i64>,
     coverage_path: String,
     products: HashMap<String, NativeProductReady>,
@@ -704,19 +702,22 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         bail!("native CAMS greenhouse runs must use the daily 00 UTC cycle");
     }
     let expected_public_start = if group == "ecmwf" {
-        match (ready.generated_at, ready.local_utc_offset_hours) {
-            (Some(generated_at), Some(offset_hours)) => {
+        match ready.local_utc_offset_hours {
+            Some(offset_hours) => {
                 if !(-23..=23).contains(&offset_hours) {
                     bail!("native ECMWF local UTC offset is invalid");
                 }
+                // The public window belongs to the selected model cycle. A
+                // delayed download must not advance it to the download day and
+                // hide valid retained-run data from the same immutable release.
                 let offset = Duration::hours(offset_hours);
-                let local_midnight = (generated_at + offset)
+                let local_midnight = (target + offset)
                     .date_naive()
                     .and_hms_opt(0, 0, 0)
                     .context("native ECMWF local midnight is invalid")?;
                 DateTime::<Utc>::from_naive_utc_and_offset(local_midnight, Utc) - offset
             }
-            _ => bail!("native ECMWF local-day metadata is incomplete"),
+            None => bail!("native ECMWF local-day metadata is incomplete"),
         }
     } else {
         parsed[0]
@@ -1399,7 +1400,7 @@ mod tests {
             ],
             "nan_fallback_depth": 1,
             "public_start_utc": "2026-08-01T16:00:00Z",
-            "generated_at": "2026-08-02T14:30:00Z",
+            "generated_at": "2026-08-03T14:30:00Z",
             "local_utc_offset_hours": 8,
             "coverage_path": "coverages/ecmwf/ecmwf_native_2026080206",
             "short_run_count": 3,
@@ -1713,7 +1714,7 @@ mod tests {
             "short_run_count": 2,
             "full_run_count": 3,
             "source_run_max_forecast_hours": horizons,
-            "public_start_utc": "2026-07-30T16:00:00Z",
+            "public_start_utc": "2026-07-29T16:00:00Z",
             "generated_at": "2026-07-30T20:00:00Z",
             "local_utc_offset_hours": 8,
             "coverage_path": format!("coverages/ecmwf/{coverage_id}"),
