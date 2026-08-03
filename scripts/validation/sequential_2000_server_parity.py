@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -24,6 +25,7 @@ from official_200_point_compare import (
     CAMS_RAW,
     GFS_DAILY,
     GFS_HOURLY,
+    ProductionSshApiClient,
     ValidationError,
     first_period_difference,
     local_url,
@@ -177,19 +179,30 @@ def chunks(values: tuple[str, ...], size: int) -> list[tuple[str, ...]]:
     ]
 
 
-def fetch(base: str, url: str, timeout: float, retries: int) -> dict[str, Any]:
-    raw, _headers, _elapsed = request_json(
-        "GET",
-        url.replace("__BASE__", base.rstrip("/"), 1),
-        body=None,
-        headers={
-            "Accept": "application/json",
-            "Cache-Control": "no-cache",
-            "User-Agent": "weather-server-sequential-2000-parity/1.0",
-        },
-        timeout=timeout,
-        retries=retries,
-    )
+def fetch(
+    base: str,
+    url: str,
+    timeout: float,
+    retries: int,
+    ssh_client: ProductionSshApiClient | None = None,
+) -> dict[str, Any]:
+    resolved_url = url.replace("__BASE__", base.rstrip("/"), 1)
+    headers = {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "User-Agent": "weather-server-sequential-2000-parity/1.0",
+    }
+    if ssh_client:
+        raw, _headers, _elapsed = ssh_client.request(resolved_url, headers)
+    else:
+        raw, _headers, _elapsed = request_json(
+            "GET",
+            resolved_url,
+            body=None,
+            headers=headers,
+            timeout=timeout,
+            retries=retries,
+        )
     return normalize_rows(json.loads(raw), 1)[0]
 
 
@@ -205,6 +218,8 @@ def compare_request(
     daily_time_range: tuple[str, str],
     timeout: float,
     retries: int,
+    shanghai_ssh_client: ProductionSshApiClient | None = None,
+    singapore_ssh_client: ProductionSshApiClient | None = None,
 ) -> tuple[dict[str, Any] | None, int]:
     template = local_url(
         "__BASE__",
@@ -215,8 +230,8 @@ def compare_request(
         hourly_time_range=hourly_time_range if hourly else None,
         daily_time_range=daily_time_range if daily else None,
     )
-    shanghai = fetch(shanghai_url, template, timeout, retries)
-    singapore = fetch(singapore_url, template, timeout, retries)
+    shanghai = fetch(shanghai_url, template, timeout, retries, shanghai_ssh_client)
+    singapore = fetch(singapore_url, template, timeout, retries, singapore_ssh_client)
     values_compared = 0
     for period, variables in (("hourly", hourly), ("daily", daily)):
         if not variables:
@@ -249,10 +264,12 @@ def paired_variable_groups(
 
 def checkpoint_contract(args: argparse.Namespace, points: list[dict[str, Any]]) -> dict[str, Any]:
     contract = {
-        "version": 2,
+        "version": 3,
         "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "shanghai_url": args.shanghai_url.rstrip("/"),
         "singapore_url": args.singapore_url.rstrip("/"),
+        "shanghai_ssh_host": args.shanghai_ssh_host.strip() or None,
+        "singapore_ssh_host": args.singapore_ssh_host.strip() or None,
         "runs": {
             "gfs": args.gfs_run,
             "ec": args.ecmwf_run,
@@ -337,76 +354,17 @@ def validate_identity_report(
     return payload
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shanghai-url", required=True)
-    parser.add_argument("--singapore-url", required=True)
-    parser.add_argument("--gfs-run", required=True)
-    parser.add_argument("--ecmwf-run", required=True)
-    parser.add_argument("--cams-run", required=True)
-    parser.add_argument("--output-report", required=True)
-    parser.add_argument("--checkpoint-report")
-    parser.add_argument(
-        "--identity-report",
-        help=(
-            "normalized, independently collected server marker identity report; "
-            "required for the full 2,000-point acceptance gate"
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=20260730)
-    parser.add_argument("--field-chunk-size", type=int, default=256)
-    parser.add_argument("--timeout", type=float, default=180.0)
-    parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--request-pause", type=float, default=0.0)
-    parser.add_argument("--progress-every", type=int, default=10)
-    parser.add_argument("--allow-reduced-points", type=int)
-    args = parser.parse_args()
-    if args.field_chunk_size <= 0 or args.progress_every <= 0:
-        parser.error("chunk and progress sizes must be positive")
-    if args.request_pause < 0:
-        parser.error("request pause must not be negative")
-    for value in (args.gfs_run, args.ecmwf_run, args.cams_run):
-        parse_run(value)
-
-    points = sample_points(args.seed)
-    if args.allow_reduced_points is not None:
-        if not 1 <= args.allow_reduced_points <= POINT_COUNT:
-            parser.error("--allow-reduced-points must be between 1 and 2000")
-        points = points[: args.allow_reduced_points]
-    elif len(points) != POINT_COUNT:
-        parser.error("acceptance mode requires exactly 2,000 points")
-    if len(points) == POINT_COUNT and not args.identity_report:
-        parser.error("acceptance mode requires --identity-report")
-
-    output_path = Path(args.output_report)
-    checkpoint_path = (
-        Path(args.checkpoint_report)
-        if args.checkpoint_report
-        else Path(str(output_path) + ".checkpoint.json")
-    )
-    runs = {"gfs": args.gfs_run, "ec": args.ecmwf_run, "cams": args.cams_run}
-    identity = (
-        validate_identity_report(Path(args.identity_report), runs)
-        if args.identity_report
-        else None
-    )
-    contract = checkpoint_contract(args, points)
-    contract_sha256 = hashlib.sha256(canonical_bytes(contract)).hexdigest()
-    checkpoint: dict[str, Any] = {
-        "contract": contract,
-        "contract_sha256": contract_sha256,
-        "status": "running",
-        "points_completed": 0,
-        "values_compared": 0,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "batch_identity": identity,
-    }
-    if checkpoint_path.exists():
-        saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
-        if saved.get("contract_sha256") != contract_sha256:
-            parser.error("checkpoint does not match this exact comparison contract")
-        checkpoint.update(saved)
-
+def run_comparison(
+    *,
+    args: argparse.Namespace,
+    points: list[dict[str, Any]],
+    runs: dict[str, str],
+    checkpoint: dict[str, Any],
+    checkpoint_path: Path,
+    output_path: Path,
+    shanghai_ssh_client: ProductionSshApiClient | None,
+    singapore_ssh_client: ProductionSshApiClient | None,
+) -> int:
     start_index = int(checkpoint.get("points_completed", 0))
     for point_index in range(start_index, len(points)):
         point = points[point_index]
@@ -428,6 +386,8 @@ def main() -> int:
                     daily_time_range=daily_range,
                     timeout=args.timeout,
                     retries=args.retries,
+                    shanghai_ssh_client=shanghai_ssh_client,
+                    singapore_ssh_client=singapore_ssh_client,
                 )
                 checkpoint["values_compared"] += value_count
                 if difference is not None:
@@ -480,6 +440,125 @@ def main() -> int:
     atomic_write_json(output_path, checkpoint)
     print(json.dumps(checkpoint, ensure_ascii=False))
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--shanghai-url", required=True)
+    parser.add_argument("--singapore-url", required=True)
+    parser.add_argument(
+        "--shanghai-ssh-host",
+        default="",
+        help="configured SSH alias for the real Shanghai loopback production API",
+    )
+    parser.add_argument(
+        "--singapore-ssh-host",
+        default="",
+        help="configured SSH alias for the real Singapore loopback production API",
+    )
+    parser.add_argument("--gfs-run", required=True)
+    parser.add_argument("--ecmwf-run", required=True)
+    parser.add_argument("--cams-run", required=True)
+    parser.add_argument("--output-report", required=True)
+    parser.add_argument("--checkpoint-report")
+    parser.add_argument(
+        "--identity-report",
+        help=(
+            "normalized, independently collected server marker identity report; "
+            "required for the full 2,000-point acceptance gate"
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=20260730)
+    parser.add_argument("--field-chunk-size", type=int, default=256)
+    parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--request-pause", type=float, default=0.0)
+    parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--allow-reduced-points", type=int)
+    args = parser.parse_args()
+    if args.field_chunk_size <= 0 or args.progress_every <= 0:
+        parser.error("chunk and progress sizes must be positive")
+    if args.request_pause < 0:
+        parser.error("request pause must not be negative")
+    for value in (args.gfs_run, args.ecmwf_run, args.cams_run):
+        parse_run(value)
+    if args.shanghai_ssh_host and not args.shanghai_url.startswith(
+        ("http://127.0.0.1", "http://localhost")
+    ):
+        parser.error("--shanghai-ssh-host requires a loopback --shanghai-url")
+    if args.singapore_ssh_host and not args.singapore_url.startswith(
+        ("http://127.0.0.1", "http://localhost")
+    ):
+        parser.error("--singapore-ssh-host requires a loopback --singapore-url")
+
+    points = sample_points(args.seed)
+    if args.allow_reduced_points is not None:
+        if not 1 <= args.allow_reduced_points <= POINT_COUNT:
+            parser.error("--allow-reduced-points must be between 1 and 2000")
+        points = points[: args.allow_reduced_points]
+    elif len(points) != POINT_COUNT:
+        parser.error("acceptance mode requires exactly 2,000 points")
+    if len(points) == POINT_COUNT and not args.identity_report:
+        parser.error("acceptance mode requires --identity-report")
+
+    output_path = Path(args.output_report)
+    checkpoint_path = (
+        Path(args.checkpoint_report)
+        if args.checkpoint_report
+        else Path(str(output_path) + ".checkpoint.json")
+    )
+    runs = {"gfs": args.gfs_run, "ec": args.ecmwf_run, "cams": args.cams_run}
+    identity = (
+        validate_identity_report(Path(args.identity_report), runs)
+        if args.identity_report
+        else None
+    )
+    contract = checkpoint_contract(args, points)
+    contract_sha256 = hashlib.sha256(canonical_bytes(contract)).hexdigest()
+    checkpoint: dict[str, Any] = {
+        "contract": contract,
+        "contract_sha256": contract_sha256,
+        "status": "running",
+        "points_completed": 0,
+        "values_compared": 0,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "batch_identity": identity,
+    }
+    if checkpoint_path.exists():
+        saved = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if saved.get("contract_sha256") != contract_sha256:
+            parser.error("checkpoint does not match this exact comparison contract")
+        checkpoint.update(saved)
+
+    with contextlib.ExitStack() as transports:
+        shanghai_ssh_client = (
+            transports.enter_context(
+                ProductionSshApiClient(
+                    args.shanghai_ssh_host.strip(), args.timeout, args.retries
+                )
+            )
+            if args.shanghai_ssh_host.strip()
+            else None
+        )
+        singapore_ssh_client = (
+            transports.enter_context(
+                ProductionSshApiClient(
+                    args.singapore_ssh_host.strip(), args.timeout, args.retries
+                )
+            )
+            if args.singapore_ssh_host.strip()
+            else None
+        )
+        return run_comparison(
+            args=args,
+            points=points,
+            runs=runs,
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            output_path=output_path,
+            shanghai_ssh_client=shanghai_ssh_client,
+            singapore_ssh_client=singapore_ssh_client,
+        )
 
 
 if __name__ == "__main__":

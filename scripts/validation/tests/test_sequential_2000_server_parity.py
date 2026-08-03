@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import sys
+from unittest import mock
 
 
 VALIDATION_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,23 @@ def test_hourly_and_daily_variables_are_paired_into_the_fewest_requests() -> Non
         assert len(groups) == 1
         assert groups[0][0]
         assert groups[0][1]
+
+
+def test_fetch_uses_a_persistent_production_ssh_client() -> None:
+    client = mock.Mock()
+    client.request.return_value = (b'{"hourly":{"time":["x"]}}', {}, 0.001)
+
+    response = parity.fetch(
+        "http://127.0.0.1:8088",
+        "__BASE__/v1/gfs?latitude=31.2",
+        10.0,
+        0,
+        client,
+    )
+
+    assert response["hourly"]["time"] == ["x"]
+    assert client.request.call_count == 1
+    assert "127.0.0.1:8088" in client.request.call_args.args[0]
 
 
 def test_batch_identity_requires_equal_source_runs_and_horizons(tmp_path: Path) -> None:
