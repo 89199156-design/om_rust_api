@@ -692,7 +692,7 @@ fn expected_source_runs(latest_run: &str) -> Result<Vec<(String, DateTime<Utc>, 
     Ok((0..5)
         .map(|index| {
             let time = latest - Duration::hours((4 - index) * 6);
-            let horizon = if index < 3 { 5 } else { 384 };
+            let horizon = if index < 3 { 6 } else { 384 };
             (time.format("%Y%m%d%H").to_string(), time, horizon)
         })
         .collect())
@@ -1808,10 +1808,10 @@ fn build_coverage_marker(
     set("coverage_reused", json!(false));
     set("latest_complete_run", json!(options.latest_run));
     set("source_runs", json!(source_runs));
-    set("source_run_max_forecast_hours", json!([5, 5, 5, 384, 384]));
+    set("source_run_max_forecast_hours", json!([6, 6, 6, 384, 384]));
     set("short_run_count", json!(3));
     set("full_run_count", json!(2));
-    set("historical_max_forecast_hour", json!(5));
+    set("historical_max_forecast_hour", json!(6));
     set("latest_max_forecast_hour", json!(384));
     set(
         "public_start_utc",
@@ -2190,7 +2190,7 @@ pub fn validate_gfs_coverage(
         || marker.source_run_max_forecast_hours != expected_horizons
         || marker.short_run_count != 3
         || marker.full_run_count != 2
-        || marker.historical_max_forecast_hour != 5
+        || marker.historical_max_forecast_hour != 6
         || marker.latest_max_forecast_hour != 384
     {
         bail!("native GFS coverage does not contain three short and two complete runs");
@@ -3082,7 +3082,7 @@ mod tests {
         );
         assert_eq!(
             runs.iter().map(|value| value.2).collect::<Vec<_>>(),
-            [5, 5, 5, 384, 384]
+            [6, 6, 6, 384, 384]
         );
     }
 

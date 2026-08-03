@@ -769,7 +769,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if group == "gfs"
         && (ready.short_run_count != Some(3)
             || ready.full_run_count != Some(2)
-            || ready.source_run_max_forecast_hours != [5, 5, 5, 384, 384])
+            || ready.source_run_max_forecast_hours != [6, 6, 6, 384, 384])
     {
         bail!("native GFS marker must declare three short and two complete runs");
     }
@@ -1343,7 +1343,7 @@ mod tests {
                     "source_run_max_forecast_hours": [240]
                 }
             },
-            "source_run_max_forecast_hours": [5, 5, 5, 384, 384]
+            "source_run_max_forecast_hours": [6, 6, 6, 384, 384]
         }))
         .unwrap();
         let product = ready.products.get("ncep_gefs025").unwrap();
@@ -1610,7 +1610,7 @@ mod tests {
             "2026071218",
             "2026071300",
         ];
-        let horizons = [5_i64, 5, 5, 384, 384];
+        let horizons = [6_i64, 6, 6, 384, 384];
         for (run, horizon) in source_runs.iter().zip(horizons) {
             let reference = parse_run(run).unwrap();
             let forecast_hours = expected_forecast_hours("ncep_gfs013", horizon);
@@ -1721,7 +1721,7 @@ mod tests {
                         .unwrap()
                 })
                 .collect::<Vec<_>>(),
-            [384, 5, 5, 5]
+            [384, 6, 6, 6]
         );
     }
 

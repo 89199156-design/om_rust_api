@@ -5463,9 +5463,7 @@ fn read_gfs_product_history_grid_with_rounding(
         )?;
         if values.iter().any(|value| value.is_nan()) {
             let fallback = products.iter().find(|product| {
-                !Arc::ptr_eq(primary, product)
-                    && gfs_snapshot_is_full(product)
-                    && product_covers_time(product, raw_variable, time)
+                !Arc::ptr_eq(primary, product) && product_covers_time(product, raw_variable, time)
             });
             if let Some(product) = fallback {
                 let fallback = read_product_grid_with_rounding(
@@ -5566,9 +5564,14 @@ fn read_direct_grid_series(
                     .iter()
                     .any(|frame| frame.iter().any(|value| value.is_nan()))
                 {
-                    if let Some(previous) = full_products.get(1) {
+                    for fallback_product in products.iter().filter(|product| {
+                        !Arc::ptr_eq(first, product)
+                            && times
+                                .iter()
+                                .any(|time| product_covers_time(product, &raw_variable, *time))
+                    }) {
                         if let Some(fallback_frames) = read_gfs_product_grid_series(
-                            previous,
+                            fallback_product,
                             decoder,
                             variable,
                             &raw_variable,
@@ -5586,20 +5589,23 @@ fn read_direct_grid_series(
                                 }
                             }
                         } else {
-                            // The previous complete run crosses the official
-                            // GFS f120 hourly-to-three-hour boundary at a
-                            // different output index, so it may not be
+                            // A fallback run can cross an official output-step
+                            // boundary at a different index, so it may not be
                             // decodable as one contiguous slab. Only anomaly
                             // frames take this slower path; healthy WebP runs
                             // remain one-slab decodes.
                             for (index, frame) in values.iter_mut().enumerate() {
                                 if !frame.iter().any(|value| value.is_nan())
-                                    || !product_covers_time(previous, &raw_variable, times[index])
+                                    || !product_covers_time(
+                                        fallback_product,
+                                        &raw_variable,
+                                        times[index],
+                                    )
                                 {
                                     continue;
                                 }
                                 let fallback_frame = read_product_grid_with_rounding(
-                                    previous,
+                                    fallback_product,
                                     decoder,
                                     variable,
                                     &raw_variable,
@@ -5615,6 +5621,12 @@ fn read_direct_grid_series(
                                     }
                                 }
                             }
+                        }
+                        if !values
+                            .iter()
+                            .any(|frame| frame.iter().any(|value| value.is_nan()))
+                        {
+                            break;
                         }
                     }
                 }
@@ -5678,7 +5690,7 @@ fn gfs_snapshot_is_full(product: &ProductSnapshot) -> bool {
         .values()
         .map(|entry| entry.forecast_hour)
         .max()
-        .is_some_and(|forecast_hour| forecast_hour > 5)
+        .is_some_and(|forecast_hour| forecast_hour > 6)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7086,7 +7098,6 @@ fn read_product_history_value_with_rounding(
             if value.is_nan() {
                 if let Some(fallback) = products.iter().find(|product| {
                     !Arc::ptr_eq(primary, product)
-                        && gfs_snapshot_is_full(product)
                         && product_covers_time(product, raw_variable, time)
                 }) {
                     value = read_product_value_with_rounding(
