@@ -31,6 +31,9 @@ impl OmDataSnapshot {
         let data_root = data_root.as_ref().to_path_buf();
         let mut products = HashMap::new();
         let mut historical_products = HashMap::new();
+        let gfs_source_runs = selected_group_source_runs(&data_root, "gfs")?;
+        let cams_source_runs = selected_group_source_runs(&data_root, "cams")?;
+        let ecmwf_source_runs = selected_group_source_runs(&data_root, "ecmwf")?;
         let gfs_native = load_native_group_products(
             &data_root,
             "gfs",
@@ -52,6 +55,7 @@ impl OmDataSnapshot {
                 "gfs",
                 GFS_PRODUCTS,
                 &products,
+                &gfs_source_runs,
                 &mut historical_products,
             )?;
         } else {
@@ -71,6 +75,7 @@ impl OmDataSnapshot {
                 "gfs",
                 GFS_SIDECAR_PRODUCTS,
                 &products,
+                &gfs_source_runs,
                 &mut historical_products,
             )?;
         }
@@ -81,6 +86,7 @@ impl OmDataSnapshot {
                 "cams",
                 CAMS_PRODUCTS,
                 &products,
+                &cams_source_runs,
                 &mut historical_products,
             )?;
         }
@@ -116,6 +122,7 @@ impl OmDataSnapshot {
                 "ecmwf",
                 ECMWF_PRODUCTS,
                 &products,
+                &ecmwf_source_runs,
                 &mut historical_products,
             )?;
         }
@@ -157,6 +164,8 @@ struct GroupReady {
     #[serde(default)]
     latest_complete_run: String,
     #[serde(default)]
+    source_runs: Vec<String>,
+    #[serde(default)]
     product_manifests: HashMap<String, ProductReady>,
 }
 
@@ -176,6 +185,28 @@ fn retained_product_run_is_not_newer(
         (Some(current), Some(retained)) => retained <= current,
         _ => true,
     }
+}
+
+fn retained_product_run_is_selected(
+    selected_source_runs: &[String],
+    retained_run: Option<&str>,
+) -> bool {
+    selected_source_runs.is_empty()
+        || retained_run
+            .is_some_and(|run| selected_source_runs.iter().any(|selected| selected == run))
+}
+
+fn selected_group_source_runs(data_root: &Path, group: &str) -> Result<Vec<String>> {
+    let current_path = data_root
+        .join("groups")
+        .join(group)
+        .join("current")
+        .join("ready_for_processing.json");
+    if !current_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let current: GroupReady = load_manifest_like(&current_path)?;
+    Ok(current.source_runs)
 }
 
 fn load_group_products(
@@ -281,6 +312,7 @@ fn load_group_release_history(
     group: &str,
     group_products: &[&str],
     current_products: &HashMap<String, Arc<ProductSnapshot>>,
+    selected_source_runs: &[String],
     historical_products: &mut HashMap<String, Vec<Arc<ProductSnapshot>>>,
 ) -> Result<()> {
     let releases_root = data_root.join("groups").join(group).join("releases");
@@ -350,6 +382,16 @@ fn load_group_release_history(
                 // must never extend the frozen public horizon.
                 continue;
             }
+            if !retained_product_run_is_selected(
+                selected_source_runs,
+                snapshot.manifest.latest_complete_run.as_deref(),
+            ) {
+                // Native group markers are the authoritative retained-run
+                // contract. An older rollback release may stay on disk, but
+                // it must not silently become interpolation support outside
+                // the declared production window.
+                continue;
+            }
             historical_products
                 .entry((*product).to_string())
                 .or_default()
@@ -366,7 +408,7 @@ fn load_manifest_like<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::retained_product_run_is_not_newer;
+    use super::{retained_product_run_is_not_newer, retained_product_run_is_selected};
 
     #[test]
     fn frozen_product_history_never_loads_a_newer_independent_run() {
@@ -382,6 +424,27 @@ mod tests {
             Some("2026072818"),
             Some("2026072818")
         ));
+    }
+
+    #[test]
+    fn native_marker_source_runs_exclude_older_rollback_support() {
+        let selected = vec![
+            "2026080106".to_string(),
+            "2026080112".to_string(),
+            "2026080118".to_string(),
+            "2026080200".to_string(),
+            "2026080206".to_string(),
+        ];
+        assert!(retained_product_run_is_selected(
+            &selected,
+            Some("2026080200")
+        ));
+        assert!(!retained_product_run_is_selected(
+            &selected,
+            Some("2026073006")
+        ));
+        assert!(!retained_product_run_is_selected(&selected, None));
+        assert!(retained_product_run_is_selected(&[], Some("2026073006")));
     }
 
     #[test]
