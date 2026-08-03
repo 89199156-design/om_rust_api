@@ -18,12 +18,15 @@ CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQ
 
 ## 访问与快照
 
-商业 API key 只允许通过 `OPEN_METEO_API_KEY` 环境变量注入，并通过
-`X-Api-Key` 请求头传输。key 不会写入请求、响应、元数据或报告。
+默认使用 Open-Meteo 无 key 的公开 API 免费额度；只有明确使用商业额度时，才允许
+通过 `OPEN_METEO_API_KEY` 环境变量注入，并通过 `X-Api-Key` 请求头传输。key 不会
+写入请求、响应、元数据或报告。公开出口额度不足时可用
+`--official-ssh-hosts <SSH别名列表>` 轮换已有服务器的公网出口，但快照和验证程序始终
+留在本机，不复制到服务器。
 
 ```bash
-python3 scripts/validation/official_200_point_compare.py capture \
-  --output /data/validation/official-200/<批次标识>
+python scripts/validation/official_200_point_compare.py capture \
+  --output D:/Projects/weather_validation_artifacts/official-200/<批次标识>
 ```
 
 每个模型按 100 个坐标一组，仅发出 2 次多点 POST；每次请求同时包含完整小时字段
@@ -32,10 +35,16 @@ python3 scripts/validation/official_200_point_compare.py capture \
 `validate`，不得删除或重新抓取官方快照：
 
 ```bash
-python3 scripts/validation/official_200_point_compare.py validate \
-  --output /data/validation/official-200/<批次标识> \
-  --local-base http://127.0.0.1:8088
+python scripts/validation/official_200_point_compare.py validate \
+  --official-snapshot-root D:/Projects/weather_validation_artifacts/official-200/<批次标识> \
+  --output D:/Projects/weather_validation_artifacts/singapore/<批次标识> \
+  --local-base http://127.0.0.1:8088 \
+  --local-ssh-host singapore
 ```
+
+`--local-ssh-host` 复用一条持久 SSH 会话，并在真实生产服务器上请求回环地址；不会复制
+数据、端口转发或启动影子实例。上海验证使用独立 `--output` 和对应 SSH 别名，二者
+共同只读复用同一个 `--official-snapshot-root`，因此官方约 100 MB 样本只保存一份。
 
 本地 API 严格按点串行访问，并在 URL 长度允许时把该模型的全部小时和日字段合并为
 同一请求。
@@ -57,6 +66,7 @@ python3 scripts/validation/official_200_point_compare.py validate \
 `OM_GFS_DOWNLOAD`、`OM_ECMWF_DOWNLOAD` 和 `OM_CAMS_DOWNLOAD`，并确认没有任务
 正在执行。不得用批次锁文件冻结生产现场。
 
-若差异来自 API 计算，部署修正后的同一 Git 修订后复验。若差异来自下载或数据
-处理，可临时把下载器配置固定到目标批次并重下载；下载和发布完成后必须恢复自动
-选择最新批次的生产配置，再通过 1Panel 任务开关保持验证现场不变。
+若差异来自 API 计算，部署修正后的同一 Git 修订后复验。若差异来自下载或数据处理，
+必须先校验并复用服务器已保留的目标批次；只有文件缺失、校验失败或覆盖范围不完整时
+才允许重新下载。发布完成后必须恢复自动选择最新批次的生产配置，再通过 1Panel 任务
+开关保持验证现场不变。
