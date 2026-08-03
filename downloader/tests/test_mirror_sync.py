@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import json
 import subprocess
@@ -5,10 +6,13 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from om_downloader.mirror_sync import (
+    _copy_file,
+    _ensure_stage_capacity,
     group_release_id,
     prune_expired_group_releases,
     sync_from_manifest_path,
@@ -92,6 +96,58 @@ class _SyncHandler(BaseHTTPRequestHandler):
 
 
 class MirrorSyncTests(unittest.TestCase):
+    def test_same_filesystem_hardlink_stage_does_not_reserve_payload_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root = root / "source"
+            output_root = root / "output"
+            source_root.mkdir()
+            manifest = {"files": [{"bytes": 10 * 1024 * 1024 * 1024}]}
+            with (
+                mock.patch(
+                    "om_downloader.mirror_sync.enforce_environment_storage_guard"
+                ) as guard,
+                mock.patch(
+                    "om_downloader.mirror_sync.shutil.disk_usage",
+                    return_value=mock.Mock(free=0),
+                ),
+            ):
+                _ensure_stage_capacity(
+                    output_root,
+                    [manifest],
+                    source_root=source_root,
+                )
+
+            self.assertEqual(guard.call_args.kwargs["additional_bytes"], 0)
+
+    def test_local_same_filesystem_copy_uses_one_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.omranges"
+            destination = root / "published" / "target.omranges"
+            source.write_bytes(b"immutable-range-data")
+
+            _copy_file(source, destination)
+
+            self.assertTrue(source.samefile(destination))
+            self.assertEqual(destination.read_bytes(), b"immutable-range-data")
+
+    def test_cross_filesystem_copy_falls_back_to_a_real_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.omranges"
+            destination = root / "published" / "target.omranges"
+            source.write_bytes(b"immutable-range-data")
+
+            with mock.patch(
+                "om_downloader.mirror_sync.os.link",
+                side_effect=OSError(errno.EXDEV, "cross-device link"),
+            ):
+                _copy_file(source, destination)
+
+            self.assertFalse(source.samefile(destination))
+            self.assertEqual(destination.read_bytes(), b"immutable-range-data")
+
     def setUp(self):
         _SyncHandler.manifest_status = "complete"
         _SyncHandler.requests = []

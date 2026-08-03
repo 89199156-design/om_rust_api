@@ -99,7 +99,20 @@ def _download_file(url: str, path: Path, *, timeout: int) -> None:
 def _copy_file(source: Path, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.name + ".tmp")
-    shutil.copy2(source, temp_path)
+    temp_path.unlink(missing_ok=True)
+    try:
+        os.link(source, temp_path)
+    except OSError as exc:
+        if exc.errno not in {
+            errno.EACCES,
+            errno.EMLINK,
+            errno.ENOSYS,
+            errno.EOPNOTSUPP,
+            errno.EPERM,
+            errno.EXDEV,
+        }:
+            raise
+        shutil.copy2(source, temp_path)
     os.replace(temp_path, path)
 
 
@@ -422,9 +435,20 @@ def _manifest_stage_bytes(manifest: dict[str, Any]) -> int:
     return total
 
 
-def _ensure_stage_capacity(output_root: Path, manifests: list[dict[str, Any]]) -> None:
+def _ensure_stage_capacity(
+    output_root: Path,
+    manifests: list[dict[str, Any]],
+    *,
+    source_root: Path | None = None,
+) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
-    required_bytes = sum(_manifest_stage_bytes(manifest) for manifest in manifests)
+    shares_filesystem = (
+        source_root is not None
+        and source_root.stat().st_dev == output_root.stat().st_dev
+    )
+    required_bytes = 0 if shares_filesystem else sum(
+        _manifest_stage_bytes(manifest) for manifest in manifests
+    )
     enforce_environment_storage_guard(
         output_root,
         additional_bytes=required_bytes,
@@ -927,7 +951,11 @@ def retain_group_release_from_mirror(
         if not _local_coverage_matches_manifest(output_root, product, manifest):
             manifests_to_stage.append((product, manifest))
 
-    _ensure_stage_capacity(output_root, [manifest for _product, manifest in manifests_to_stage])
+    _ensure_stage_capacity(
+        output_root,
+        [manifest for _product, manifest in manifests_to_stage],
+        source_root=mirror_root,
+    )
     staged: list[dict[str, Any]] = []
     try:
         for product, manifest in manifests_to_stage:
@@ -1010,7 +1038,11 @@ def sync_retained_group_releases_from_mirror(
                 manifests_to_stage.append((product, manifest))
         release_manifests.append((release, manifests))
 
-    _ensure_stage_capacity(output_root, [manifest for _product, manifest in manifests_to_stage])
+    _ensure_stage_capacity(
+        output_root,
+        [manifest for _product, manifest in manifests_to_stage],
+        source_root=mirror_root,
+    )
     staged: list[dict[str, Any]] = []
     try:
         for product, manifest in manifests_to_stage:
@@ -1333,7 +1365,11 @@ def sync_group_from_mirror(
             manifests_to_stage.append(
                 _load_product_manifest_for_group(mirror_root, group_manifest, product)
             )
-    _ensure_stage_capacity(output_root, manifests_to_stage)
+    _ensure_stage_capacity(
+        output_root,
+        manifests_to_stage,
+        source_root=mirror_root,
+    )
 
     staged = []
     static_stages: list[dict[str, Any]] = []
