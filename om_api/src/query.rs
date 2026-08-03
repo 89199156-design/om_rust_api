@@ -9952,7 +9952,9 @@ fn resolve_model_sampling(
         .find(|entry| entry.variable == "temperature_2m")
         .or_else(|| product.entries.values().next())
         .with_context(|| format!("{product_name} has no grid entries"))?;
-    if entry.native_grid.is_none() && entry.array.dimensions.as_slice() != spec.dimensions {
+    if entry.native_grid.is_none()
+        && !static_elevation_spatial_dimensions_match(&entry.array.dimensions, spec.dimensions)
+    {
         bail!("static elevation grid does not match {product_name} dimensions");
     }
     let (center_y, center_x) = grid_index_for_lat_lon(
@@ -10093,6 +10095,14 @@ fn resolve_model_sampling(
         model_elevation,
         target_elevation,
     })
+}
+
+fn static_elevation_spatial_dimensions_match(
+    forecast_dimensions: &[u64],
+    static_dimensions: &[u64],
+) -> bool {
+    matches!(forecast_dimensions.len(), 2 | 3)
+        && forecast_dimensions.get(..2) == Some(static_dimensions)
 }
 
 fn read_static_elevation_grid(
@@ -10406,6 +10416,26 @@ fn model_latitude_for_variable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_elevation_accepts_spatial_and_spatial_time_archives() {
+        assert!(static_elevation_spatial_dimensions_match(
+            &[361, 720],
+            GEFS05_STATIC_DIMENSIONS,
+        ));
+        assert!(static_elevation_spatial_dimensions_match(
+            &[361, 720, 313],
+            GEFS05_STATIC_DIMENSIONS,
+        ));
+        assert!(!static_elevation_spatial_dimensions_match(
+            &[720, 361, 313],
+            GEFS05_STATIC_DIMENSIONS,
+        ));
+        assert!(!static_elevation_spatial_dimensions_match(
+            &[361, 720, 313, 2],
+            GEFS05_STATIC_DIMENSIONS,
+        ));
+    }
 
     #[test]
     fn gfs_probability_mixer_matches_official_three_step_transition() {
