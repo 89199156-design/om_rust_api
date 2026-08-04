@@ -62,6 +62,8 @@ struct NativeProductReady {
     source_run_max_forecast_hours: Vec<i64>,
     #[serde(default)]
     right_interpolation_support: Option<NativeRightInterpolationSupportReady>,
+    #[serde(default)]
+    gust_interpolation_support: Option<NativeEcmwfGustInterpolationSupportReady>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +71,20 @@ struct NativeRightInterpolationSupportReady {
     source_run: String,
     target_valid_time_utc: DateTime<Utc>,
     source_forecast_hours: Vec<i64>,
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeEcmwfGustInterpolationSupportReady {
+    variable: String,
+    source_runs: Vec<String>,
+    source_forecast_hours: Vec<i64>,
+    files: Vec<NativeEcmwfGustInterpolationSupportFileReady>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeEcmwfGustInterpolationSupportFileReady {
+    source_run: String,
     file_path: String,
 }
 
@@ -268,12 +284,49 @@ fn native_time_indices(
     variable: &str,
     meta: &NativeRunMeta,
     stored_time_count: usize,
-) -> Result<Vec<usize>> {
+) -> Result<Vec<(usize, usize)>> {
     if stored_time_count == 0 || meta.valid_times.is_empty() {
         bail!("native OM time axis must not be empty");
     }
+    if runtime_domain == "ecmwf_ifs025" && variable == "wind_gusts_10m" {
+        let allowed_meta_indices = meta
+            .valid_times
+            .iter()
+            .enumerate()
+            .filter_map(|(index, valid_time)| {
+                let forecast_hour = (*valid_time - meta.reference_time).num_hours();
+                (forecast_hour > 0 && (forecast_hour <= 90 || forecast_hour >= 150))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if stored_time_count == allowed_meta_indices.len() {
+            return Ok(allowed_meta_indices.into_iter().enumerate().collect());
+        }
+        if stored_time_count + 1 == meta.valid_times.len()
+            && meta.valid_times.first() == Some(&meta.reference_time)
+        {
+            // Contract 4 accidentally stored 10fg3 in f093...f144. During the
+            // frozen in-place migration, retain the physical array offsets but
+            // omit those semantically different three-hour maxima.
+            return Ok(allowed_meta_indices
+                .into_iter()
+                .map(|meta_index| (meta_index - 1, meta_index))
+                .collect());
+        }
+        if stored_time_count == meta.valid_times.len() {
+            return Ok(allowed_meta_indices
+                .into_iter()
+                .map(|meta_index| (meta_index, meta_index))
+                .collect());
+        }
+        bail!(
+            "native ECMWF gust stored time count {} does not match sparse {} or dense source schedule",
+            stored_time_count,
+            allowed_meta_indices.len()
+        );
+    }
     if stored_time_count == meta.valid_times.len() {
-        return Ok((0..stored_time_count).collect());
+        return Ok((0..stored_time_count).map(|index| (index, index)).collect());
     }
     let ecmwf_omits_hour_zero = runtime_domain == "ecmwf_ifs025"
         && matches!(
@@ -290,7 +343,7 @@ fn native_time_indices(
         && meta.valid_times.first() == Some(&meta.reference_time)
         && (!runtime_domain.starts_with("ecmwf_ifs025") || ecmwf_omits_hour_zero)
     {
-        return Ok((1..meta.valid_times.len()).collect());
+        return Ok((1..meta.valid_times.len()).enumerate().collect());
     }
     for (index, valid_time) in meta.valid_times.iter().enumerate() {
         if *valid_time - meta.reference_time != Duration::hours(index as i64) {
@@ -316,7 +369,7 @@ fn native_time_indices(
             indices.len()
         );
     }
-    Ok(indices)
+    Ok(indices.into_iter().enumerate().collect())
 }
 
 fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<i64> {
@@ -489,6 +542,31 @@ fn expected_gfs_right_support_source(latest_reference: DateTime<Utc>) -> DateTim
     latest_reference - Duration::hours(i64::from(latest_reference.hour())) - Duration::hours(24)
 }
 
+fn expected_ecmwf_gust_support_runs(
+    latest_reference: DateTime<Utc>,
+    public_runs: &[String],
+) -> Vec<String> {
+    let latest_long = if matches!(latest_reference.hour(), 0 | 12) {
+        latest_reference
+    } else {
+        latest_reference - Duration::hours(6)
+    };
+    let offsets: &[i64] = if matches!(latest_reference.hour(), 0 | 12) {
+        &[72, 60, 48, 36, 24]
+    } else {
+        &[60, 48, 36, 24, 12]
+    };
+    offsets
+        .iter()
+        .map(|offset| {
+            (latest_long - Duration::hours(*offset))
+                .format("%Y%m%d%H")
+                .to_string()
+        })
+        .filter(|run| !public_runs.contains(run))
+        .collect()
+}
+
 fn attach_native_right_interpolation_support(
     coverage_root: &Path,
     ready: &NativeReady,
@@ -608,6 +686,103 @@ fn attach_native_right_interpolation_support(
     Ok(())
 }
 
+fn attach_native_ecmwf_gust_interpolation_support(
+    coverage_root: &Path,
+    ready: &NativeReady,
+    product: &str,
+    product_ready: &NativeProductReady,
+    source_run: &str,
+    entries_by_source_run: &mut HashMap<String, Vec<BundleEntry>>,
+    native_handles: &mut HashMap<String, Arc<File>>,
+) -> Result<()> {
+    let Some(support) = &product_ready.gust_interpolation_support else {
+        return Ok(());
+    };
+    if source_run != ready.latest_complete_run {
+        return Ok(());
+    }
+    if product != "ecmwf_ifs025" || product_ready.runtime_domain != "ecmwf_ifs025" {
+        bail!("native ECMWF gust interpolation support is declared on the wrong product");
+    }
+
+    for support_file in &support.files {
+        let coverage_reference = parse_run(&support_file.source_run)?;
+        let file_path = safe_relative_path(coverage_root, &support_file.file_path)?;
+        let meta_path = file_path.with_file_name("meta.json");
+        let meta: NativeRunMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).with_context(|| {
+                format!(
+                    "read native ECMWF gust-support metadata {}",
+                    meta_path.display()
+                )
+            })?)?;
+        if meta.reference_time != coverage_reference
+            || meta.variables != ["wind_gusts_10m"]
+            || meta.valid_times
+                != support
+                    .source_forecast_hours
+                    .iter()
+                    .map(|hour| coverage_reference + Duration::hours(*hour))
+                    .collect::<Vec<_>>()
+        {
+            bail!("native ECMWF gust interpolation support metadata is invalid");
+        }
+
+        let handle = Arc::new(File::open(&file_path).with_context(|| {
+            format!("open native ECMWF gust-support OM {}", file_path.display())
+        })?);
+        let array = read_native_array_metadata(&handle).with_context(|| {
+            format!("parse native ECMWF gust-support OM {}", file_path.display())
+        })?;
+        if array.dimensions
+            != [
+                product_ready.grid.ny,
+                product_ready.grid.nx,
+                support.source_forecast_hours.len() as u64,
+            ]
+            || array.chunks.len() != 3
+        {
+            bail!("native ECMWF gust interpolation support dimensions do not match the grid");
+        }
+
+        native_handles.insert(support_file.file_path.clone(), handle);
+        let mut support_entries = Vec::with_capacity(support.source_forecast_hours.len());
+        for (native_time_index, forecast_hour) in
+            support.source_forecast_hours.iter().copied().enumerate()
+        {
+            support_entries.push(BundleEntry {
+                variable: "wind_gusts_10m".to_string(),
+                variable_path: Some("wind_gusts_10m".to_string()),
+                valid_time_utc: coverage_reference + Duration::hours(forecast_hour),
+                source_run: support_file.source_run.clone(),
+                forecast_hour,
+                coverage_source_run: Some(support_file.source_run.clone()),
+                coverage_forecast_hour: Some(forecast_hour),
+                interpolation_support: true,
+                source_url: None,
+                selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
+                array: array.clone(),
+                lut_byte_ranges: Vec::new(),
+                data_byte_ranges: Vec::new(),
+                lut_bytes_read: 0,
+                byte_ranges: Vec::new(),
+                bundle_offset: 0,
+                bundle_bytes: file_path.metadata()?.len(),
+                native_file_path: Some(support_file.file_path.clone()),
+                native_time_index: Some(native_time_index as u64),
+                native_grid: Some(product_ready.grid.clone()),
+            });
+        }
+        if entries_by_source_run
+            .insert(support_file.source_run.clone(), support_entries)
+            .is_some()
+        {
+            bail!("native ECMWF gust interpolation support collides with a public source run");
+        }
+    }
+    Ok(())
+}
+
 fn product_uses_static_elevation(product: &str) -> bool {
     matches!(
         product,
@@ -682,7 +857,7 @@ fn load_native_product_run(
             .to_string_lossy()
             .replace('\\', "/");
         native_handles.insert(relative.clone(), handle);
-        for (time_index, valid_time_index) in time_indices.into_iter().enumerate() {
+        for (native_time_index, valid_time_index) in time_indices {
             let valid_time = meta.valid_times[valid_time_index];
             let entry = BundleEntry {
                 variable: variable.clone(),
@@ -703,7 +878,7 @@ fn load_native_product_run(
                 bundle_offset: 0,
                 bundle_bytes: file_path.metadata()?.len(),
                 native_file_path: Some(relative.clone()),
-                native_time_index: Some(time_index as u64),
+                native_time_index: Some(native_time_index as u64),
                 native_grid: Some(product_ready.grid.clone()),
             };
             run_entries.push(entry.clone());
@@ -730,6 +905,15 @@ fn load_native_product_run(
     }
     let mut entries_by_source_run = HashMap::from([(source_run.to_string(), run_entries)]);
     attach_native_right_interpolation_support(
+        coverage_root,
+        ready,
+        product,
+        product_ready,
+        source_run,
+        &mut entries_by_source_run,
+        &mut native_handles,
+    )?;
+    attach_native_ecmwf_gust_interpolation_support(
         coverage_root,
         ready,
         product,
@@ -858,6 +1042,52 @@ fn validate_native_right_interpolation_support_contract(
     Ok(())
 }
 
+fn validate_native_ecmwf_gust_interpolation_support_contract(
+    ready: &NativeReady,
+    group: &str,
+    product: &str,
+    product_ready: &NativeProductReady,
+    latest_reference: DateTime<Utc>,
+) -> Result<()> {
+    let Some(support) = &product_ready.gust_interpolation_support else {
+        if group == "ecmwf" && product == "ecmwf_ifs025" {
+            bail!("native ECMWF deterministic product has no gust interpolation support");
+        }
+        return Ok(());
+    };
+    if group != "ecmwf"
+        || product != "ecmwf_ifs025"
+        || product_ready.runtime_domain != "ecmwf_ifs025"
+    {
+        bail!("native ECMWF gust interpolation support is declared on the wrong product");
+    }
+    if support.variable != "wind_gusts_10m" {
+        bail!("native ECMWF gust interpolation support variable is invalid");
+    }
+    let expected_source_runs =
+        expected_ecmwf_gust_support_runs(latest_reference, &ready.source_runs);
+    let expected_source_hours = (150..=186).step_by(6).collect::<Vec<_>>();
+    if expected_source_runs.len() != 4
+        || support.source_runs != expected_source_runs
+        || support.source_forecast_hours != expected_source_hours
+        || support.files.len() != expected_source_runs.len()
+    {
+        bail!("native ECMWF gust interpolation support plan is invalid");
+    }
+    for (file, expected_run) in support.files.iter().zip(&expected_source_runs) {
+        let expected_path = format!(
+            "interpolation_support/ecmwf_ifs025/{}/wind_gusts_10m.om",
+            run_relative_path(expected_run)?
+                .to_string_lossy()
+                .replace('\\', "/")
+        );
+        if file.source_run != *expected_run || file.file_path != expected_path {
+            bail!("native ECMWF gust interpolation support file contract is invalid");
+        }
+    }
+    Ok(())
+}
+
 fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if ready.group != group {
         bail!(
@@ -958,7 +1188,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                 2,
             )
         };
-        if ready.native_producer_contract != Some(4)
+        if ready.native_producer_contract != Some(5)
             || ready.nan_fallback_depth != Some(1)
             || ready.short_run_count != Some(expected_short)
             || ready.full_run_count != Some(expected_full)
@@ -987,6 +1217,13 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     }
     for (product, product_ready) in &ready.products {
         validate_native_right_interpolation_support_contract(
+            ready,
+            group,
+            product,
+            product_ready,
+            target,
+        )?;
+        validate_native_ecmwf_gust_interpolation_support_contract(
             ready,
             group,
             product,
@@ -1286,7 +1523,7 @@ mod tests {
         };
         assert_eq!(
             native_time_indices("ncep_gfs013", "temperature_2m", &meta, 209).unwrap(),
-            (0..209).collect::<Vec<_>>()
+            (0..209).map(|index| (index, index)).collect::<Vec<_>>()
         );
     }
 
@@ -1302,7 +1539,7 @@ mod tests {
         };
         assert_eq!(
             native_time_indices("ncep_gfs013", "temperature_2m", &meta, 385).unwrap(),
-            (0..385).collect::<Vec<_>>()
+            (0..385).map(|index| (index, index)).collect::<Vec<_>>()
         );
         validate_run_time_axis("ncep_gfs013", &meta, 384).unwrap();
     }
@@ -1319,7 +1556,7 @@ mod tests {
         };
         assert_eq!(
             native_time_indices("cams_global", "dust", &meta, 41).unwrap(),
-            (0..=120).step_by(3).collect::<Vec<_>>()
+            (0..=120).step_by(3).enumerate().collect::<Vec<_>>()
         );
     }
 
@@ -1421,12 +1658,31 @@ mod tests {
                 .map(|hour| reference_time + Duration::hours(*hour))
                 .collect(),
         };
-        let expected = (1..hours.len()).collect::<Vec<_>>();
+        let allowed_meta_indices = hours
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hour)| {
+                (*hour > 0 && (*hour <= 90 || *hour >= 150)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let expected_dense = allowed_meta_indices
+            .iter()
+            .map(|meta_index| (meta_index - 1, *meta_index))
+            .collect::<Vec<_>>();
+        let expected_sparse = allowed_meta_indices
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<_>>();
 
-        assert_eq!(expected.len(), 84);
+        assert_eq!(expected_dense.len(), 66);
         assert_eq!(
             native_time_indices("ecmwf_ifs025", "wind_gusts_10m", &meta, 84).unwrap(),
-            expected
+            expected_dense
+        );
+        assert_eq!(
+            native_time_indices("ecmwf_ifs025", "wind_gusts_10m", &meta, 66).unwrap(),
+            expected_sparse
         );
         assert!(native_time_indices("ecmwf_ifs025", "temperature_2m", &meta, 84).is_err());
     }
@@ -1668,7 +1924,7 @@ mod tests {
     #[test]
     fn ecmwf_deterministic_runs_use_group_specific_horizons() {
         let ready: NativeReady = serde_json::from_value(json!({
-            "native_producer_contract": 4,
+            "native_producer_contract": 5,
             "status": "complete",
             "runtime_format": "openmeteo-native-v1",
             "group": "ecmwf",
@@ -1698,6 +1954,19 @@ mod tests {
             "products": {
                 "ecmwf_ifs025": {
                     "runtime_domain": "ecmwf_ifs025",
+                    "gust_interpolation_support": {
+                        "variable": "wind_gusts_10m",
+                        "source_runs": [
+                            "2026072700", "2026072712", "2026072800", "2026072812"
+                        ],
+                        "source_forecast_hours": [150, 156, 162, 168, 174, 180, 186],
+                        "files": [
+                            {"source_run": "2026072700", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/27/0000Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072712", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/27/1200Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072800", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/28/0000Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072812", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/28/1200Z/wind_gusts_10m.om"}
+                        ]
+                    },
                     "grid": {
                         "grid_type": "regional_regular_lat_lon",
                         "nx": 297,
@@ -1734,7 +2003,7 @@ mod tests {
     #[test]
     fn ecmwf_accepts_a_short_target_with_its_previous_long_cycle() {
         let ready: NativeReady = serde_json::from_value(json!({
-            "native_producer_contract": 4,
+            "native_producer_contract": 5,
             "status": "complete",
             "runtime_format": "openmeteo-native-v1",
             "group": "ecmwf",
@@ -1764,6 +2033,19 @@ mod tests {
             "products": {
                 "ecmwf_ifs025": {
                     "runtime_domain": "ecmwf_ifs025",
+                    "gust_interpolation_support": {
+                        "variable": "wind_gusts_10m",
+                        "source_runs": [
+                            "2026073012", "2026073100", "2026073112", "2026080100"
+                        ],
+                        "source_forecast_hours": [150, 156, 162, 168, 174, 180, 186],
+                        "files": [
+                            {"source_run": "2026073012", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/30/1200Z/wind_gusts_10m.om"},
+                            {"source_run": "2026073100", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/31/0000Z/wind_gusts_10m.om"},
+                            {"source_run": "2026073112", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/31/1200Z/wind_gusts_10m.om"},
+                            {"source_run": "2026080100", "file_path": "interpolation_support/ecmwf_ifs025/2026/08/01/0000Z/wind_gusts_10m.om"}
+                        ]
+                    },
                     "grid": {
                         "grid_type": "regional_regular_lat_lon",
                         "nx": 297,
@@ -2051,8 +2333,34 @@ mod tests {
             )
             .unwrap();
         }
+        let gust_support_runs = ["2026072712", "2026072800", "2026072812", "2026072900"];
+        let gust_support_hours = [150_i64, 156, 162, 168, 174, 180, 186];
+        for run in gust_support_runs {
+            let reference = parse_run(run).unwrap();
+            let run_root = coverage
+                .join("interpolation_support/ecmwf_ifs025")
+                .join(run_relative_path(run).unwrap());
+            fs::create_dir_all(&run_root).unwrap();
+            write_fake_om(
+                &run_root.join("wind_gusts_10m.om"),
+                [2, 3, gust_support_hours.len() as u64],
+            );
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference,
+                    "variables": ["wind_gusts_10m"],
+                    "valid_times": gust_support_hours
+                        .iter()
+                        .map(|hour| reference + Duration::hours(*hour))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
         let marker = json!({
-            "native_producer_contract": 4,
+            "native_producer_contract": 5,
             "status": "complete",
             "runtime_format": "openmeteo-native-v1",
             "group": "ecmwf",
@@ -2077,6 +2385,17 @@ mod tests {
             "products": {
                 "ecmwf_ifs025": {
                     "runtime_domain": "ecmwf_ifs025",
+                    "gust_interpolation_support": {
+                        "variable": "wind_gusts_10m",
+                        "source_runs": gust_support_runs,
+                        "source_forecast_hours": gust_support_hours,
+                        "files": [
+                            {"source_run": "2026072712", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/27/1200Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072800", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/28/0000Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072812", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/28/1200Z/wind_gusts_10m.om"},
+                            {"source_run": "2026072900", "file_path": "interpolation_support/ecmwf_ifs025/2026/07/29/0000Z/wind_gusts_10m.om"}
+                        ]
+                    },
                     "grid": {
                         "nx": 3, "ny": 2,
                         "lon_min": 70.0, "lat_min": 0.0,
@@ -2109,9 +2428,23 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         loaded_runs.sort_unstable();
-        assert_eq!(loaded_runs, source_runs);
+        let mut expected_loaded_runs = source_runs
+            .iter()
+            .chain(gust_support_runs.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        expected_loaded_runs.sort_unstable();
+        assert_eq!(loaded_runs, expected_loaded_runs);
         assert_eq!(current.manifest.coverage_plan.len(), 353);
-        assert_eq!(current.native_handles.len(), source_runs.len());
+        assert_eq!(
+            current.native_handles.len(),
+            source_runs.len() + gust_support_runs.len()
+        );
+        assert!(gust_support_runs
+            .iter()
+            .all(|run| current.entries_by_source_run[*run]
+                .iter()
+                .all(|entry| entry.interpolation_support)));
         assert!(!history.contains_key("ecmwf_ifs025"));
 
         let mut transitional_marker = marker;
