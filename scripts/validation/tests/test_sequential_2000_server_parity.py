@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import sys
+import threading
 from unittest import mock
 
 
@@ -81,6 +82,40 @@ def test_fetch_uses_a_persistent_production_ssh_client() -> None:
     assert performance["wall_elapsed_seconds"] >= 0
     assert client.request.call_count == 1
     assert "127.0.0.1:8088" in client.request.call_args.args[0]
+
+
+def test_same_point_server_requests_start_in_parallel() -> None:
+    barrier = threading.Barrier(2)
+
+    def fetch_stub(*_args: object, **_kwargs: object):
+        barrier.wait(timeout=1.0)
+        return (
+            {"hourly": {"time": ["2026-07-30T00:00"], "temperature_2m": [1.0]}},
+            {
+                "transport": "test",
+                "response_bytes": 1,
+                "api_elapsed_seconds": 0.001,
+                "wall_elapsed_seconds": 0.001,
+            },
+        )
+
+    with mock.patch.object(parity, "fetch", side_effect=fetch_stub):
+        difference, values_compared, performance = parity.compare_request(
+            shanghai_url="http://127.0.0.1:8088",
+            singapore_url="http://127.0.0.1:8088",
+            model="gfs",
+            point={"latitude": 30.0, "longitude": 120.0},
+            hourly=("temperature_2m",),
+            daily=(),
+            hourly_time_range=("2026-07-30T00:00", "2026-07-30T00:00"),
+            daily_time_range=("2026-07-30", "2026-07-30"),
+            timeout=10.0,
+            retries=0,
+        )
+
+    assert difference is None
+    assert values_compared == 1
+    assert set(performance) == {"shanghai", "singapore"}
 
 
 def test_request_performance_is_aggregated_and_summarized() -> None:

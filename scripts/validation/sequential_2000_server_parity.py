@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -239,12 +240,31 @@ def compare_request(
         hourly_time_range=hourly_time_range if hourly else None,
         daily_time_range=daily_time_range if daily else None,
     )
-    shanghai, shanghai_performance = fetch(
-        shanghai_url, template, timeout, retries, shanghai_ssh_client
-    )
-    singapore, singapore_performance = fetch(
-        singapore_url, template, timeout, retries, singapore_ssh_client
-    )
+    # Both responses belong to the same point gate, so they can be fetched in
+    # parallel without advancing to the next point before comparison passes.
+    # This also keeps a slow disk on one server from serially delaying the
+    # otherwise independent request to the other production server.
+    with ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="server-parity"
+    ) as executor:
+        shanghai_future = executor.submit(
+            fetch,
+            shanghai_url,
+            template,
+            timeout,
+            retries,
+            shanghai_ssh_client,
+        )
+        singapore_future = executor.submit(
+            fetch,
+            singapore_url,
+            template,
+            timeout,
+            retries,
+            singapore_ssh_client,
+        )
+        shanghai, shanghai_performance = shanghai_future.result()
+        singapore, singapore_performance = singapore_future.result()
     performance = {
         "shanghai": shanghai_performance,
         "singapore": singapore_performance,
