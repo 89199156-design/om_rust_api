@@ -1050,7 +1050,10 @@ fn validate_native_ecmwf_gust_interpolation_support_contract(
     latest_reference: DateTime<Utc>,
 ) -> Result<()> {
     let Some(support) = &product_ready.gust_interpolation_support else {
-        if group == "ecmwf" && product == "ecmwf_ifs025" {
+        if group == "ecmwf"
+            && product == "ecmwf_ifs025"
+            && ready.native_producer_contract == Some(5)
+        {
             bail!("native ECMWF deterministic product has no gust interpolation support");
         }
         return Ok(());
@@ -1060,6 +1063,9 @@ fn validate_native_ecmwf_gust_interpolation_support_contract(
         || product_ready.runtime_domain != "ecmwf_ifs025"
     {
         bail!("native ECMWF gust interpolation support is declared on the wrong product");
+    }
+    if ready.native_producer_contract != Some(5) {
+        bail!("native ECMWF gust interpolation support requires producer contract 5");
     }
     if support.variable != "wind_gusts_10m" {
         bail!("native ECMWF gust interpolation support variable is invalid");
@@ -1188,7 +1194,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                 2,
             )
         };
-        if ready.native_producer_contract != Some(5)
+        if !matches!(ready.native_producer_contract, Some(4 | 5))
             || ready.nan_fallback_depth != Some(1)
             || ready.short_run_count != Some(expected_short)
             || ready.full_run_count != Some(expected_full)
@@ -2002,7 +2008,7 @@ mod tests {
 
     #[test]
     fn ecmwf_accepts_a_short_target_with_its_previous_long_cycle() {
-        let ready: NativeReady = serde_json::from_value(json!({
+        let marker = json!({
             "native_producer_contract": 5,
             "status": "complete",
             "runtime_format": "openmeteo-native-v1",
@@ -2060,9 +2066,18 @@ mod tests {
                 }
             },
             "source_run_max_forecast_hours": [144, 360, 144, 360, 144]
-        }))
-        .unwrap();
+        });
+        let ready: NativeReady = serde_json::from_value(marker.clone()).unwrap();
         assert!(validate_ready(&ready, "ecmwf").is_ok());
+
+        let mut legacy_marker = marker;
+        legacy_marker["native_producer_contract"] = json!(4);
+        legacy_marker["products"]["ecmwf_ifs025"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gust_interpolation_support");
+        let legacy: NativeReady = serde_json::from_value(legacy_marker).unwrap();
+        assert!(validate_ready(&legacy, "ecmwf").is_ok());
     }
 
     #[test]
