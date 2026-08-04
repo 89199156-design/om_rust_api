@@ -12,6 +12,7 @@ use crate::solar::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
+use rayon::prelude::*;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -294,6 +295,10 @@ fn current_product_sampling(product: &str) -> Option<ModelSampling> {
                 _ => None,
             })
     })
+}
+
+fn current_request_sampling() -> Option<RequestSampling> {
+    REQUEST_SAMPLING.with(|current| *current.borrow())
 }
 
 pub const OPENMETEO_UPSTREAM_BASELINE: &str = "4efb9c49fb4a3718ed385fb22580d2e0fc56bdb2";
@@ -1318,47 +1323,47 @@ pub fn point_forecast(
             )?,
         );
 
-        for variable in variables {
-            let fast_values = if variable == "precipitation_probability"
-                && current_weather_model() == WeatherModel::Gfs
-            {
-                Some(read_gfs_precipitation_probability_point_series(
-                    snapshot, decoder, &times, latitude, longitude,
-                )?)
-            } else if let Some(decoder) = decoder {
-                match read_variable_point_series(
+        let model = current_weather_model();
+        let sampling = current_request_sampling();
+        let read_variable = |variable: &String| {
+            let read = || {
+                read_hourly_variable_values(
                     snapshot, decoder, variable, &times, latitude, longitude,
-                ) {
-                    Ok(values) => values,
-                    Err(error) if error.to_string().contains("variable/time is not available") => {
-                        None
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                None
+                )
             };
-            let values = if let Some(values) = fast_values {
-                values
-            } else {
-                let mut values = Vec::with_capacity(times.len());
-                for time in &times {
-                    match read_variable_value(
-                        snapshot, decoder, variable, *time, latitude, longitude,
-                    ) {
-                        Ok(value) => values.push(value),
-                        Err(error)
-                            if error.to_string().contains("variable/time is not available") =>
-                        {
-                            values.push(f32::NAN)
-                        }
-                        Err(error) => return Err(error),
-                    }
+            with_weather_model(model, || {
+                let read_with_cache = || match model {
+                    WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(read),
+                    WeatherModel::Gfs => with_gfs_request_cache(read),
+                };
+                match sampling {
+                    Some(sampling) => with_request_sampling(sampling, read_with_cache),
+                    None => read_with_cache(),
                 }
-                values
-            };
-            hourly_units.insert(variable.clone(), unit_for_variable(variable).to_string());
-            hourly.insert(variable.clone(), json_array_for_variable(variable, values));
+            })
+            .map(|values| (variable.clone(), values))
+        };
+        // A complete point response contains dozens of independent fields.
+        // Decode those fields concurrently on Rayon's bounded global pool;
+        // each worker restores the request's model, sampling and cache context
+        // above, so nearest-land selection and model-specific derivations stay
+        // identical to the serial path. Small route and probe requests avoid
+        // the scheduling overhead.
+        let decoded = if decoder.is_some() && variables.len() >= 4 {
+            variables
+                .par_iter()
+                .map(read_variable)
+                .collect::<Vec<Result<(String, Vec<f32>)>>>()
+        } else {
+            variables
+                .iter()
+                .map(read_variable)
+                .collect::<Vec<Result<(String, Vec<f32>)>>>()
+        };
+        for result in decoded {
+            let (variable, values) = result?;
+            hourly_units.insert(variable.clone(), unit_for_variable(&variable).to_string());
+            hourly.insert(variable.clone(), json_array_for_variable(&variable, values));
         }
     }
 
@@ -1376,6 +1381,45 @@ pub fn point_forecast(
         daily_units: None,
         daily: None,
     })
+}
+
+fn read_hourly_variable_values(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitude: f64,
+    longitude: f64,
+) -> Result<Vec<f32>> {
+    let fast_values = if variable == "precipitation_probability"
+        && current_weather_model() == WeatherModel::Gfs
+    {
+        Some(read_gfs_precipitation_probability_point_series(
+            snapshot, decoder, times, latitude, longitude,
+        )?)
+    } else if let Some(decoder) = decoder {
+        match read_variable_point_series(snapshot, decoder, variable, times, latitude, longitude) {
+            Ok(values) => values,
+            Err(error) if error.to_string().contains("variable/time is not available") => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if let Some(values) = fast_values {
+        return Ok(values);
+    }
+    let mut values = Vec::with_capacity(times.len());
+    for time in times {
+        match read_variable_value(snapshot, decoder, variable, *time, latitude, longitude) {
+            Ok(value) => values.push(value),
+            Err(error) if error.to_string().contains("variable/time is not available") => {
+                values.push(f32::NAN);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(values)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6318,9 +6362,50 @@ fn ecmwf_regularize_source_run(
     let count = usize::try_from((max_hour - min_hour) / 3 + 1)?;
     let grid_len = latitudes.len() * longitudes.len();
     let mut frames = vec![vec![f32::NAN; grid_len]; count];
-    for entry in entries {
-        let index = usize::try_from((logical_hour(entry) - min_hour) / 3)?;
-        frames[index] = read_entry_grid(product, entry, decoder, latitudes, longitudes)?;
+    let mut entry_index = 0;
+    while entry_index < entries.len() {
+        let first = entries[entry_index];
+        // Native ECMWF variables keep their time axis in one 3D OM file.
+        // Decode each contiguous span in one codec call so a cold point request
+        // does not repeat the LUT and file-range work for every forecast frame.
+        let contiguous_end = match (first.native_file_path.as_deref(), first.native_time_index) {
+            (Some(first_path), Some(first_native_index)) if first.array.dimensions.len() == 3 => {
+                let mut end = entry_index + 1;
+                while end < entries.len() {
+                    let next = entries[end];
+                    let offset = u64::try_from(end - entry_index)?;
+                    if next.native_file_path.as_deref() != Some(first_path)
+                        || next.native_time_index != Some(first_native_index + offset)
+                        || next.array.dimensions.len() != 3
+                    {
+                        break;
+                    }
+                    end += 1;
+                }
+                end
+            }
+            _ => entry_index + 1,
+        };
+
+        if contiguous_end - entry_index > 1 {
+            let decoded = read_native_entry_grid_time_range(
+                product,
+                first,
+                decoder,
+                latitudes,
+                longitudes,
+                first.native_time_index.expect("checked native time index"),
+                contiguous_end - entry_index,
+            )?;
+            for (entry, values) in entries[entry_index..contiguous_end].iter().zip(decoded) {
+                let index = usize::try_from((logical_hour(entry) - min_hour) / 3)?;
+                frames[index] = values;
+            }
+        } else {
+            let index = usize::try_from((logical_hour(first) - min_hour) / 3)?;
+            frames[index] = read_entry_grid(product, first, decoder, latitudes, longitudes)?;
+        }
+        entry_index = contiguous_end;
     }
 
     let kind = ecmwf_interpolation_kind(raw_variable);
