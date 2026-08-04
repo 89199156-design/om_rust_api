@@ -482,21 +482,26 @@ fn attach_static_elevation(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn expected_gfs_right_support_source(latest_reference: DateTime<Utc>) -> DateTime<Utc> {
+    // Open-Meteo downloads GEFS05 f390...f840 once per day at 23:55 UTC for
+    // that day's 00Z cycle. Every ordinary cycle on the following UTC day
+    // therefore reads the previous day's completed delayed extension.
+    latest_reference - Duration::hours(i64::from(latest_reference.hour())) - Duration::hours(24)
+}
+
 fn attach_native_right_interpolation_support(
     coverage_root: &Path,
     ready: &NativeReady,
     product: &str,
     product_ready: &NativeProductReady,
     source_run: &str,
-    _public_horizon: i64,
-    run_entries: &mut Vec<BundleEntry>,
+    entries_by_source_run: &mut HashMap<String, Vec<BundleEntry>>,
     native_handles: &mut HashMap<String, Arc<File>>,
 ) -> Result<()> {
     let Some(support) = &product_ready.right_interpolation_support else {
         return Ok(());
     };
-    if source_run != support.source_run {
+    if source_run != ready.latest_complete_run {
         return Ok(());
     }
     if product != "ncep_gefs05" || product_ready.runtime_domain != "ncep_gefs05" {
@@ -509,9 +514,7 @@ fn attach_native_right_interpolation_support(
         bail!("native right interpolation support target time is invalid");
     }
     let coverage_reference = parse_run(&support.source_run)?;
-    if coverage_reference.hour() != 0
-        || !product_source_runs(ready, product, product_ready).contains(&support.source_run)
-    {
+    if coverage_reference != expected_gfs_right_support_source(latest_reference) {
         bail!("native right interpolation support source run is invalid");
     }
     let target_source_hour = (expected_target - coverage_reference).num_hours();
@@ -571,12 +574,13 @@ fn attach_native_right_interpolation_support(
     }
 
     native_handles.insert(support.file_path.clone(), handle);
+    let mut support_entries = Vec::with_capacity(expected_source_hours.len());
     for (native_time_index, forecast_hour) in expected_source_hours.into_iter().enumerate() {
-        run_entries.push(BundleEntry {
+        support_entries.push(BundleEntry {
             variable: "precipitation_probability".to_string(),
             variable_path: Some("precipitation_probability".to_string()),
             valid_time_utc: coverage_reference + Duration::hours(forecast_hour),
-            source_run: source_run.to_string(),
+            source_run: support.source_run.clone(),
             forecast_hour,
             coverage_source_run: Some(support.source_run.clone()),
             coverage_forecast_hour: Some(forecast_hour),
@@ -594,6 +598,12 @@ fn attach_native_right_interpolation_support(
             native_time_index: Some(native_time_index as u64),
             native_grid: Some(product_ready.grid.clone()),
         });
+    }
+    if entries_by_source_run
+        .insert(support.source_run.clone(), support_entries)
+        .is_some()
+    {
+        bail!("native right interpolation support collides with the current source run");
     }
     Ok(())
 }
@@ -718,14 +728,14 @@ fn load_native_product_run(
             &mut native_handles,
         )?;
     }
+    let mut entries_by_source_run = HashMap::from([(source_run.to_string(), run_entries)]);
     attach_native_right_interpolation_support(
         coverage_root,
         ready,
         product,
         product_ready,
         source_run,
-        public_horizon,
-        &mut run_entries,
+        &mut entries_by_source_run,
         &mut native_handles,
     )?;
     let manifest_path = coverage_root.join("coverage.json");
@@ -736,7 +746,6 @@ fn load_native_product_run(
         sha256: None,
         entries: Vec::new(),
     };
-    let entries_by_source_run = HashMap::from([(source_run.to_string(), run_entries)]);
     let coverage_plan = meta
         .valid_times
         .iter()
@@ -819,15 +828,9 @@ fn validate_native_right_interpolation_support_contract(
     {
         bail!("native GEFS05 right interpolation support timing is invalid");
     }
-    let expected_source_reference = if latest_reference.hour() == 0 {
-        latest_reference - Duration::hours(24)
-    } else {
-        latest_reference - Duration::hours(i64::from(latest_reference.hour()))
-    };
+    let expected_source_reference = expected_gfs_right_support_source(latest_reference);
     let expected_source_run = expected_source_reference.format("%Y%m%d%H").to_string();
-    if support.source_run != expected_source_run
-        || !product_source_runs(ready, product, product_ready).contains(&support.source_run)
-    {
+    if support.source_run != expected_source_run {
         bail!("native GEFS05 right interpolation support source is invalid");
     }
     let target_source_hour =
@@ -1454,6 +1457,12 @@ mod tests {
             expected_forecast_hours("ecmwf_ifs025_ensemble", 144),
             (3..=144).step_by(3).collect::<Vec<_>>()
         );
+        for latest in ["2026080200", "2026080206", "2026080212", "2026080218"] {
+            assert_eq!(
+                expected_gfs_right_support_source(parse_run(latest).unwrap()),
+                parse_run("2026080100").unwrap()
+            );
+        }
     }
 
     #[test]
@@ -1497,11 +1506,11 @@ mod tests {
             )
             .unwrap();
         }
-        let support_source = parse_run("2026080200").unwrap();
+        let support_source = parse_run("2026080100").unwrap();
         let support_target = parse_run("2026080206").unwrap() + Duration::hours(387);
-        let support_hours = [384_i64, 390, 396, 402];
+        let support_hours = [408_i64, 414, 420, 426];
         let support_relative =
-            "interpolation_support/ncep_gefs05/2026/08/02/0000Z/precipitation_probability.om";
+            "interpolation_support/ncep_gefs05/2026/08/01/0000Z/precipitation_probability.om";
         let support_file = coverage.join(support_relative);
         fs::create_dir_all(support_file.parent().unwrap()).unwrap();
         write_fake_om(&support_file, [2, 3, support_hours.len() as u64]);
@@ -1543,7 +1552,7 @@ mod tests {
                     "source_runs": source_runs,
                     "source_run_max_forecast_hours": horizons,
                     "right_interpolation_support": {
-                        "source_run": "2026080200",
+                        "source_run": "2026080100",
                         "target_valid_time_utc": support_target,
                         "source_forecast_hours": support_hours,
                         "file_path": support_relative,
@@ -1570,14 +1579,7 @@ mod tests {
         assert_eq!(current.entries.len(), 104);
         let latest_entries = current.entries_by_source_run.get("2026080206").unwrap();
         assert_eq!(latest_entries.len(), 104);
-        let source_snapshot = history["ncep_gefs05"]
-            .iter()
-            .find(|snapshot| snapshot.entries_by_source_run.contains_key("2026080200"))
-            .unwrap();
-        let source_entries = source_snapshot
-            .entries_by_source_run
-            .get("2026080200")
-            .unwrap();
+        let source_entries = current.entries_by_source_run.get("2026080100").unwrap();
         let support = source_entries
             .iter()
             .filter(|entry| entry.interpolation_support)
@@ -1591,7 +1593,8 @@ mod tests {
             support_hours
         );
         assert!(support.iter().all(|entry| {
-            entry.coverage_source_run.as_deref() == Some("2026080200")
+            entry.source_run == "2026080100"
+                && entry.coverage_source_run.as_deref() == Some("2026080100")
                 && entry.coverage_forecast_hour == Some(entry.forecast_hour)
         }));
         assert_eq!(
@@ -1601,6 +1604,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(0), Some(1), Some(2), Some(3)]
         );
+        assert!(history["ncep_gefs05"].iter().all(|snapshot| snapshot
+            .entries_by_source_run
+            .values()
+            .flatten()
+            .all(|entry| !entry.interpolation_support)));
         assert_eq!(
             current.manifest.coverage_plan.last().unwrap().forecast_hour,
             384
