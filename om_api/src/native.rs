@@ -67,9 +67,9 @@ struct NativeProductReady {
 #[derive(Debug, Deserialize)]
 struct NativeRightInterpolationSupportReady {
     source_run: String,
-    valid_time_utc: DateTime<Utc>,
+    target_valid_time_utc: DateTime<Utc>,
+    source_forecast_hours: Vec<i64>,
     file_path: String,
-    native_time_index: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,24 +489,24 @@ fn attach_native_right_interpolation_support(
     product: &str,
     product_ready: &NativeProductReady,
     source_run: &str,
-    public_horizon: i64,
+    _public_horizon: i64,
     run_entries: &mut Vec<BundleEntry>,
     native_handles: &mut HashMap<String, Arc<File>>,
 ) -> Result<()> {
     let Some(support) = &product_ready.right_interpolation_support else {
         return Ok(());
     };
-    if source_run != ready.latest_complete_run {
+    if source_run != support.source_run {
         return Ok(());
     }
     if product != "ncep_gefs05" || product_ready.runtime_domain != "ncep_gefs05" {
         bail!("native right interpolation support is declared on the wrong product");
     }
 
-    let logical_reference = parse_run(source_run)?;
-    let expected_valid_time = logical_reference + Duration::hours(public_horizon + 6);
-    if support.valid_time_utc != expected_valid_time {
-        bail!("native right interpolation support valid time is invalid");
+    let latest_reference = parse_run(&ready.latest_complete_run)?;
+    let expected_target = latest_reference + Duration::hours(387);
+    if support.target_valid_time_utc != expected_target {
+        bail!("native right interpolation support target time is invalid");
     }
     let coverage_reference = parse_run(&support.source_run)?;
     if coverage_reference.hour() != 0
@@ -514,9 +514,17 @@ fn attach_native_right_interpolation_support(
     {
         bail!("native right interpolation support source run is invalid");
     }
-    let coverage_forecast_hour = (support.valid_time_utc - coverage_reference).num_hours();
-    if !(390..=840).contains(&coverage_forecast_hour) || coverage_forecast_hour % 6 != 0 {
-        bail!("native right interpolation support is outside the NOAA delayed extension");
+    let target_source_hour = (expected_target - coverage_reference).num_hours();
+    if target_source_hour % 6 != 3 {
+        bail!("native right interpolation target is not between NOAA delayed frames");
+    }
+    let lower = target_source_hour - 3;
+    let expected_source_hours = vec![lower - 6, lower, lower + 6, lower + 12];
+    if support.source_forecast_hours != expected_source_hours
+        || expected_source_hours[0] < 384
+        || *expected_source_hours.last().unwrap() > 840
+    {
+        bail!("native right interpolation support has the wrong NOAA control window");
     }
 
     let expected_relative = format!(
@@ -525,7 +533,7 @@ fn attach_native_right_interpolation_support(
             .to_string_lossy()
             .replace('\\', "/")
     );
-    if support.file_path != expected_relative || support.native_time_index != 0 {
+    if support.file_path != expected_relative {
         bail!("native right interpolation support file contract is invalid");
     }
     let file_path = safe_relative_path(coverage_root, &support.file_path)?;
@@ -536,7 +544,11 @@ fn attach_native_right_interpolation_support(
         })?)?;
     if meta.reference_time != coverage_reference
         || meta.variables != ["precipitation_probability"]
-        || meta.valid_times != [support.valid_time_utc]
+        || meta.valid_times
+            != expected_source_hours
+                .iter()
+                .map(|hour| coverage_reference + Duration::hours(*hour))
+                .collect::<Vec<_>>()
     {
         bail!("native right interpolation support metadata is invalid");
     }
@@ -547,35 +559,42 @@ fn attach_native_right_interpolation_support(
     );
     let array = read_native_array_metadata(&handle)
         .with_context(|| format!("parse native right-support OM {}", file_path.display()))?;
-    if array.dimensions != [product_ready.grid.ny, product_ready.grid.nx, 1]
+    if array.dimensions
+        != [
+            product_ready.grid.ny,
+            product_ready.grid.nx,
+            expected_source_hours.len() as u64,
+        ]
         || array.chunks.len() != 3
     {
         bail!("native right interpolation support dimensions do not match the grid");
     }
 
     native_handles.insert(support.file_path.clone(), handle);
-    run_entries.push(BundleEntry {
-        variable: "precipitation_probability".to_string(),
-        variable_path: Some("precipitation_probability".to_string()),
-        valid_time_utc: support.valid_time_utc,
-        source_run: source_run.to_string(),
-        forecast_hour: public_horizon + 6,
-        coverage_source_run: Some(support.source_run.clone()),
-        coverage_forecast_hour: Some(coverage_forecast_hour),
-        interpolation_support: true,
-        source_url: None,
-        selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
-        array,
-        lut_byte_ranges: Vec::new(),
-        data_byte_ranges: Vec::new(),
-        lut_bytes_read: 0,
-        byte_ranges: Vec::new(),
-        bundle_offset: 0,
-        bundle_bytes: file_path.metadata()?.len(),
-        native_file_path: Some(support.file_path.clone()),
-        native_time_index: Some(support.native_time_index),
-        native_grid: Some(product_ready.grid.clone()),
-    });
+    for (native_time_index, forecast_hour) in expected_source_hours.into_iter().enumerate() {
+        run_entries.push(BundleEntry {
+            variable: "precipitation_probability".to_string(),
+            variable_path: Some("precipitation_probability".to_string()),
+            valid_time_utc: coverage_reference + Duration::hours(forecast_hour),
+            source_run: source_run.to_string(),
+            forecast_hour,
+            coverage_source_run: Some(support.source_run.clone()),
+            coverage_forecast_hour: Some(forecast_hour),
+            interpolation_support: true,
+            source_url: None,
+            selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
+            array: array.clone(),
+            lut_byte_ranges: Vec::new(),
+            data_byte_ranges: Vec::new(),
+            lut_bytes_read: 0,
+            byte_ranges: Vec::new(),
+            bundle_offset: 0,
+            bundle_bytes: file_path.metadata()?.len(),
+            native_file_path: Some(support.file_path.clone()),
+            native_time_index: Some(native_time_index as u64),
+            native_grid: Some(product_ready.grid.clone()),
+        });
+    }
     Ok(())
 }
 
@@ -796,8 +815,7 @@ fn validate_native_right_interpolation_support_contract(
     }
     let public_horizon = run_horizon(ready, product, product_ready, &ready.latest_complete_run)?;
     if public_horizon != 384
-        || support.valid_time_utc != latest_reference + Duration::hours(public_horizon + 6)
-        || support.native_time_index != 0
+        || support.target_valid_time_utc != latest_reference + Duration::hours(387)
     {
         bail!("native GEFS05 right interpolation support timing is invalid");
     }
@@ -812,9 +830,18 @@ fn validate_native_right_interpolation_support_contract(
     {
         bail!("native GEFS05 right interpolation support source is invalid");
     }
-    let source_forecast_hour = (support.valid_time_utc - expected_source_reference).num_hours();
-    if !(390..=840).contains(&source_forecast_hour) || source_forecast_hour % 6 != 0 {
-        bail!("native GEFS05 right interpolation support is not a delayed 00Z frame");
+    let target_source_hour =
+        (support.target_valid_time_utc - expected_source_reference).num_hours();
+    if target_source_hour % 6 != 3 {
+        bail!("native GEFS05 right interpolation target is not on the 3-hour database axis");
+    }
+    let lower = target_source_hour - 3;
+    let expected_source_hours = vec![lower - 6, lower, lower + 6, lower + 12];
+    if support.source_forecast_hours != expected_source_hours
+        || expected_source_hours[0] < 384
+        || *expected_source_hours.last().unwrap() > 840
+    {
+        bail!("native GEFS05 right interpolation support has the wrong control window");
     }
     let expected_file = format!(
         "interpolation_support/ncep_gefs05/{}/precipitation_probability.om",
@@ -1471,18 +1498,22 @@ mod tests {
             .unwrap();
         }
         let support_source = parse_run("2026080200").unwrap();
-        let support_valid = parse_run("2026080206").unwrap() + Duration::hours(390);
+        let support_target = parse_run("2026080206").unwrap() + Duration::hours(387);
+        let support_hours = [384_i64, 390, 396, 402];
         let support_relative =
             "interpolation_support/ncep_gefs05/2026/08/02/0000Z/precipitation_probability.om";
         let support_file = coverage.join(support_relative);
         fs::create_dir_all(support_file.parent().unwrap()).unwrap();
-        write_fake_om(&support_file, [2, 3, 1]);
+        write_fake_om(&support_file, [2, 3, support_hours.len() as u64]);
         fs::write(
             support_file.with_file_name("meta.json"),
             serde_json::to_vec(&json!({
                 "reference_time": support_source,
                 "variables": ["precipitation_probability"],
-                "valid_times": [support_valid],
+                "valid_times": support_hours
+                    .iter()
+                    .map(|hour| support_source + Duration::hours(*hour))
+                    .collect::<Vec<_>>(),
             }))
             .unwrap(),
         )
@@ -1513,9 +1544,9 @@ mod tests {
                     "source_run_max_forecast_hours": horizons,
                     "right_interpolation_support": {
                         "source_run": "2026080200",
-                        "valid_time_utc": support_valid,
+                        "target_valid_time_utc": support_target,
+                        "source_forecast_hours": support_hours,
                         "file_path": support_relative,
-                        "native_time_index": 0
                     }
                 }
             }
@@ -1538,15 +1569,38 @@ mod tests {
         let current = products.get("ncep_gefs05").unwrap();
         assert_eq!(current.entries.len(), 104);
         let latest_entries = current.entries_by_source_run.get("2026080206").unwrap();
-        assert_eq!(latest_entries.len(), 105);
-        let support = latest_entries
+        assert_eq!(latest_entries.len(), 104);
+        let source_snapshot = history["ncep_gefs05"]
             .iter()
-            .find(|entry| entry.interpolation_support)
+            .find(|snapshot| snapshot.entries_by_source_run.contains_key("2026080200"))
             .unwrap();
-        assert_eq!(support.forecast_hour, 390);
-        assert_eq!(support.coverage_source_run.as_deref(), Some("2026080200"));
-        assert_eq!(support.coverage_forecast_hour, Some(396));
-        assert_eq!(support.native_time_index, Some(0));
+        let source_entries = source_snapshot
+            .entries_by_source_run
+            .get("2026080200")
+            .unwrap();
+        let support = source_entries
+            .iter()
+            .filter(|entry| entry.interpolation_support)
+            .collect::<Vec<_>>();
+        assert_eq!(support.len(), 4);
+        assert_eq!(
+            support
+                .iter()
+                .map(|entry| entry.forecast_hour)
+                .collect::<Vec<_>>(),
+            support_hours
+        );
+        assert!(support.iter().all(|entry| {
+            entry.coverage_source_run.as_deref() == Some("2026080200")
+                && entry.coverage_forecast_hour == Some(entry.forecast_hour)
+        }));
+        assert_eq!(
+            support
+                .iter()
+                .map(|entry| entry.native_time_index)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
         assert_eq!(
             current.manifest.coverage_plan.last().unwrap().forecast_hour,
             384
