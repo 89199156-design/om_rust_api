@@ -1265,12 +1265,21 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         {
             bail!("native product {product} contains a negative horizon");
         }
-        if group == "ecmwf"
-            && (product_ready.source_runs != ready.source_runs
-                || product_ready.source_run_max_forecast_hours
-                    != ready.source_run_max_forecast_hours)
-        {
-            bail!("native ECMWF product run contract differs from the group contract");
+        if group == "ecmwf" {
+            let run_count = product_ready.source_runs.len();
+            let expected_runs = ready.source_runs.get(..run_count);
+            let expected_horizons = ready.source_run_max_forecast_hours.get(..run_count);
+            let is_full_group_contract = run_count == ready.source_runs.len();
+            let is_one_cycle_delayed_ensemble =
+                product == "ecmwf_ifs025_ensemble" && run_count + 1 == ready.source_runs.len();
+            if (!is_full_group_contract && !is_one_cycle_delayed_ensemble)
+                || expected_runs != Some(product_ready.source_runs.as_slice())
+                || expected_horizons != Some(product_ready.source_run_max_forecast_hours.as_slice())
+            {
+                bail!(
+                    "native ECMWF product run contract must match the group or a one-cycle-delayed ensemble prefix"
+                );
+            }
         }
     }
     Ok(())
@@ -2063,12 +2072,41 @@ mod tests {
                         "dt_seconds": 10800,
                         "om_file_length": 104
                     }
+                },
+                "ecmwf_ifs025_ensemble": {
+                    "runtime_domain": "ecmwf_ifs025_ensemble",
+                    "source_runs": [
+                        "2026080106",
+                        "2026080112",
+                        "2026080118",
+                        "2026080200"
+                    ],
+                    "source_run_max_forecast_hours": [144, 360, 144, 360],
+                    "grid": {
+                        "grid_type": "regional_regular_lat_lon",
+                        "nx": 297,
+                        "ny": 249,
+                        "lon_min": 68.0,
+                        "lat_min": -2.0,
+                        "dx": 0.25,
+                        "dy": 0.25,
+                        "dt_seconds": 10800,
+                        "om_file_length": 48
+                    }
                 }
             },
             "source_run_max_forecast_hours": [144, 360, 144, 360, 144]
         });
         let ready: NativeReady = serde_json::from_value(marker.clone()).unwrap();
         assert!(validate_ready(&ready, "ecmwf").is_ok());
+
+        let mut over_delayed_marker = marker.clone();
+        over_delayed_marker["products"]["ecmwf_ifs025_ensemble"]["source_runs"] =
+            json!(["2026080106", "2026080112", "2026080118"]);
+        over_delayed_marker["products"]["ecmwf_ifs025_ensemble"]["source_run_max_forecast_hours"] =
+            json!([144, 360, 144]);
+        let over_delayed: NativeReady = serde_json::from_value(over_delayed_marker).unwrap();
+        assert!(validate_ready(&over_delayed, "ecmwf").is_err());
 
         let mut legacy_marker = marker;
         legacy_marker["native_producer_contract"] = json!(4);
