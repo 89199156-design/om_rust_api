@@ -871,6 +871,7 @@ def request_json_via_ssh(
 PRODUCTION_SSH_HELPER = r"""
 import base64
 import gzip
+import hashlib
 import json
 import sys
 import time
@@ -901,12 +902,81 @@ for line in sys.stdin.buffer:
                     raise
                 time.sleep(min(5.0, 2.0**attempt))
                 attempt += 1
-        output = {
-            "ok": True,
-            "body": base64.b64encode(gzip.compress(raw, compresslevel=1)).decode("ascii"),
-            "content_encoding": "gzip+base64",
-            "elapsed": time.monotonic() - started,
-        }
+        projection = request_spec.get("projection")
+        if projection is None:
+            output = {
+                "ok": True,
+                "body": base64.b64encode(gzip.compress(raw, compresslevel=1)).decode("ascii"),
+                "content_encoding": "gzip+base64",
+                "elapsed": time.monotonic() - started,
+            }
+        else:
+            payload = json.loads(raw)
+            if isinstance(payload, list):
+                if len(payload) != 1:
+                    raise ValueError("projection requires exactly one response row")
+                payload = payload[0]
+            if not isinstance(payload, dict):
+                raise ValueError("projection response row is not an object")
+            projected = {}
+            projection_valid = True
+            value_count = 0
+            for period in ("hourly", "daily"):
+                variables = projection.get(period, [])
+                if not variables:
+                    continue
+                period_payload = payload.get(period)
+                if not isinstance(period_payload, dict):
+                    projected[period] = {"__missing_period__": True}
+                    projection_valid = False
+                    continue
+                projected_period = {}
+                times = period_payload.get("time")
+                if "time" in period_payload:
+                    projected_period["time"] = times
+                else:
+                    projected_period["__missing_time__"] = True
+                try:
+                    duplicate_time = (
+                        isinstance(times, list)
+                        and len(set(times)) != len(times)
+                    )
+                except TypeError:
+                    duplicate_time = True
+                if not isinstance(times, list) or duplicate_time:
+                    projection_valid = False
+                for variable in variables:
+                    if variable in period_payload:
+                        values = period_payload[variable]
+                        projected_period[variable] = values
+                    else:
+                        projected_period[f"__missing__:{variable}"] = True
+                        values = None
+                    if (
+                        not isinstance(values, list)
+                        or not isinstance(times, list)
+                        or len(values) != len(times)
+                    ):
+                        projection_valid = False
+                    else:
+                        value_count += len(values)
+                projected[period] = projected_period
+            canonical_projection = json.dumps(
+                projected,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            output = {
+                "ok": True,
+                "projection_sha256": hashlib.sha256(canonical_projection).hexdigest(),
+                "projection_valid": projection_valid,
+                "value_count": value_count,
+                "source_response_bytes": len(raw),
+                "content_encoding": "sha256-json-projection-v1",
+                "elapsed": time.monotonic() - started,
+            }
     except Exception as exc:
         output = {
             "ok": False,
@@ -960,11 +1030,7 @@ class ProductionSshApiClient:
         url: str,
         headers: dict[str, str],
     ) -> tuple[bytes, dict[str, str], float]:
-        self.start()
-        assert self.process is not None
-        if self.process.stdin is None or self.process.stdout is None:
-            raise ValidationError("production SSH API process has no pipes")
-        request_spec = canonical_bytes(
+        response, _response_bytes = self._exchange(
             {
                 "url": url,
                 "headers": headers,
@@ -972,6 +1038,77 @@ class ProductionSshApiClient:
                 "retries": self.retries,
             }
         )
+        if response.get("content_encoding") != "gzip+base64":
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned "
+                "an unsupported body encoding"
+            )
+        try:
+            compressed = base64.b64decode(response["body"], validate=True)
+            raw = gzip.decompress(compressed)
+        except (KeyError, ValueError, OSError) as exc:
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned invalid body"
+            ) from exc
+        return raw, {}, float(response["elapsed"])
+
+    def request_projection_digest(
+        self,
+        url: str,
+        headers: dict[str, str],
+        projection: dict[str, tuple[str, ...]],
+    ) -> dict[str, Any]:
+        response, response_bytes = self._exchange(
+            {
+                "url": url,
+                "headers": headers,
+                "timeout": self.timeout,
+                "retries": self.retries,
+                "projection": {
+                    period: list(variables)
+                    for period, variables in projection.items()
+                    if variables
+                },
+            }
+        )
+        if response.get("content_encoding") != "sha256-json-projection-v1":
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned "
+                "an unsupported projection encoding"
+            )
+        try:
+            digest = str(response["projection_sha256"])
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError("invalid projection digest")
+            projection_valid = response["projection_valid"]
+            if not isinstance(projection_valid, bool):
+                raise TypeError("projection validity is not boolean")
+            value_count = int(response["value_count"])
+            source_response_bytes = int(response["source_response_bytes"])
+            if value_count < 0 or source_response_bytes < 0:
+                raise ValueError("projection counters must not be negative")
+            return {
+                "projection_sha256": digest,
+                "projection_valid": projection_valid,
+                "value_count": value_count,
+                "source_response_bytes": source_response_bytes,
+                "transport_response_bytes": response_bytes,
+                "elapsed": float(response["elapsed"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError(
+                f"production SSH API transport to {self.ssh_host} returned "
+                "an invalid projection digest"
+            ) from exc
+
+    def _exchange(self, request: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        self.start()
+        assert self.process is not None
+        if self.process.stdin is None or self.process.stdout is None:
+            raise ValidationError("production SSH API process has no pipes")
+        request_spec = canonical_bytes(request)
         try:
             self.process.stdin.write(request_spec + b"\n")
             self.process.stdin.flush()
@@ -994,22 +1131,10 @@ class ProductionSshApiClient:
             ) from exc
         if not response.get("ok"):
             raise ValidationError(
-                f"GET {url} through SSH host {self.ssh_host} failed: "
+                f"GET {request.get('url')} through SSH host {self.ssh_host} failed: "
                 f"{response.get('error', 'unknown remote error')}"
             )
-        if response.get("content_encoding") != "gzip+base64":
-            raise ValidationError(
-                f"production SSH API transport to {self.ssh_host} returned "
-                "an unsupported body encoding"
-            )
-        try:
-            compressed = base64.b64decode(response["body"], validate=True)
-            raw = gzip.decompress(compressed)
-        except (KeyError, ValueError, OSError) as exc:
-            raise ValidationError(
-                f"production SSH API transport to {self.ssh_host} returned invalid body"
-            ) from exc
-        return raw, {}, float(response["elapsed"])
+        return response, len(response_line)
 
     def close(self) -> None:
         process = self.process

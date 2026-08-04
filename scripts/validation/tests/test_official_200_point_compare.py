@@ -48,6 +48,38 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(headers, {})
         self.assertEqual(elapsed, 0.012)
 
+    def test_persistent_ssh_transport_accepts_projection_digest(self) -> None:
+        response = compare.canonical_bytes(
+            {
+                "ok": True,
+                "projection_sha256": "a" * 64,
+                "projection_valid": True,
+                "value_count": 361,
+                "source_response_bytes": 812345,
+                "content_encoding": "sha256-json-projection-v1",
+                "elapsed": 0.034,
+            }
+        )
+        process = mock.Mock()
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO(response + b"\n")
+        client = compare.ProductionSshApiClient("singapore", 10.0, 0)
+        client.process = process
+
+        digest = client.request_projection_digest(
+            "http://127.0.0.1:8088/v1/ecmwf?latitude=31.2",
+            {"Accept": "application/json"},
+            {"hourly": ("temperature_2m",), "daily": ()},
+        )
+
+        self.assertEqual(digest["projection_sha256"], "a" * 64)
+        self.assertTrue(digest["projection_valid"])
+        self.assertEqual(digest["value_count"], 361)
+        self.assertEqual(digest["source_response_bytes"], 812345)
+        self.assertEqual(digest["transport_response_bytes"], len(response) + 1)
+        request = json.loads(process.stdin.getvalue())
+        self.assertEqual(request["projection"], {"hourly": ["temperature_2m"]})
+
     def test_ssh_request_decompresses_the_remote_response(self) -> None:
         expected = b'[{"ok":true}]'
         completed = mock.Mock(

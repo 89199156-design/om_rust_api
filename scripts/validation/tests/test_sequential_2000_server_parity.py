@@ -118,6 +118,129 @@ def test_same_point_server_requests_start_in_parallel() -> None:
     assert set(performance) == {"shanghai", "singapore"}
 
 
+def test_equal_remote_projections_avoid_full_response_transfer() -> None:
+    barrier = threading.Barrier(2)
+
+    class DigestClient:
+        def __init__(self, host: str) -> None:
+            self.ssh_host = host
+            self.request = mock.Mock(side_effect=AssertionError("full fetch is forbidden"))
+
+        def request_projection_digest(
+            self,
+            _url: str,
+            _headers: dict[str, str],
+            projection: dict[str, tuple[str, ...]],
+        ) -> dict[str, object]:
+            barrier.wait(timeout=1.0)
+            assert projection == {"hourly": ("temperature_2m",), "daily": ()}
+            return {
+                "projection_sha256": "b" * 64,
+                "projection_valid": True,
+                "value_count": 1,
+                "source_response_bytes": 800000,
+                "transport_response_bytes": 240,
+                "elapsed": 0.002,
+            }
+
+    shanghai = DigestClient("sh-om-new")
+    singapore = DigestClient("singapore")
+    difference, values_compared, performance = parity.compare_request(
+        shanghai_url="http://127.0.0.1:8088",
+        singapore_url="http://127.0.0.1:8088",
+        model="gfs",
+        point={"latitude": 30.0, "longitude": 120.0},
+        hourly=("temperature_2m",),
+        daily=(),
+        hourly_time_range=("2026-07-30T00:00", "2026-07-30T00:00"),
+        daily_time_range=("2026-07-30", "2026-07-30"),
+        timeout=10.0,
+        retries=0,
+        shanghai_ssh_client=shanghai,  # type: ignore[arg-type]
+        singapore_ssh_client=singapore,  # type: ignore[arg-type]
+    )
+
+    assert difference is None
+    assert values_compared == 1
+    assert performance["shanghai"]["response_bytes"] == 800000
+    assert performance["shanghai"]["transport_response_bytes"] == 240
+    assert shanghai.request.call_count == 0
+    assert singapore.request.call_count == 0
+
+
+def test_projection_mismatch_falls_back_to_exact_first_difference() -> None:
+    class DigestClient:
+        def __init__(self, host: str, digest: str) -> None:
+            self.ssh_host = host
+            self.digest = digest
+
+        def request_projection_digest(
+            self,
+            _url: str,
+            _headers: dict[str, str],
+            _projection: dict[str, tuple[str, ...]],
+        ) -> dict[str, object]:
+            return {
+                "projection_sha256": self.digest,
+                "projection_valid": True,
+                "value_count": 1,
+                "source_response_bytes": 100,
+                "transport_response_bytes": 200,
+                "elapsed": 0.001,
+            }
+
+    responses = {
+        "http://sh": {
+            "hourly": {
+                "time": ["2026-07-30T00:00"],
+                "temperature_2m": [1.0],
+            }
+        },
+        "http://sg": {
+            "hourly": {
+                "time": ["2026-07-30T00:00"],
+                "temperature_2m": [2.0],
+            }
+        },
+    }
+
+    def fetch_stub(base: str, *_args: object, **_kwargs: object):
+        return responses[base], {
+            "transport": "test",
+            "response_bytes": 100,
+            "api_elapsed_seconds": 0.001,
+            "wall_elapsed_seconds": 0.001,
+        }
+
+    with mock.patch.object(parity, "fetch", side_effect=fetch_stub) as full_fetch:
+        difference, values_compared, _performance = parity.compare_request(
+            shanghai_url="http://sh",
+            singapore_url="http://sg",
+            model="gfs",
+            point={"latitude": 30.0, "longitude": 120.0},
+            hourly=("temperature_2m",),
+            daily=(),
+            hourly_time_range=("2026-07-30T00:00", "2026-07-30T00:00"),
+            daily_time_range=("2026-07-30", "2026-07-30"),
+            timeout=10.0,
+            retries=0,
+            shanghai_ssh_client=DigestClient("sh-om-new", "a" * 64),  # type: ignore[arg-type]
+            singapore_ssh_client=DigestClient("singapore", "b" * 64),  # type: ignore[arg-type]
+        )
+
+    assert full_fetch.call_count == 2
+    assert values_compared == 0
+    assert difference == {
+        "period": "hourly",
+        "variable": "temperature_2m",
+        "reason": "json_value",
+        "index": 0,
+        "time": "2026-07-30T00:00",
+        "official": 1.0,
+        "local": 2.0,
+    }
+
+
 def test_request_performance_is_aggregated_and_summarized() -> None:
     checkpoint: dict[str, object] = {}
     parity.record_request_performance(
@@ -159,6 +282,7 @@ def test_request_performance_is_aggregated_and_summarized() -> None:
 
     assert summary["shanghai"]["requests"] == 2
     assert summary["shanghai"]["response_bytes"] == 210
+    assert summary["shanghai"]["transport_response_bytes"] == 210
     assert summary["shanghai"]["api_elapsed_seconds_average"] == 0.03
     assert summary["shanghai"]["wall_elapsed_seconds_max"] == 0.08
     assert summary["singapore"]["api_elapsed_seconds_average"] == 0.02

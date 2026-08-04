@@ -216,6 +216,36 @@ def fetch(
     }
 
 
+def fetch_projection_digest(
+    base: str,
+    url: str,
+    hourly: tuple[str, ...],
+    daily: tuple[str, ...],
+    ssh_client: ProductionSshApiClient,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    resolved_url = url.replace("__BASE__", base.rstrip("/"), 1)
+    headers = {
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "User-Agent": "weather-server-sequential-2000-parity/1.0",
+    }
+    started = time.monotonic()
+    digest = ssh_client.request_projection_digest(
+        resolved_url,
+        headers,
+        {"hourly": hourly, "daily": daily},
+    )
+    wall_elapsed = time.monotonic() - started
+    return digest, {
+        "transport": f"production_ssh:{ssh_client.ssh_host}",
+        "comparison_mode": "projection_sha256",
+        "response_bytes": digest["source_response_bytes"],
+        "transport_response_bytes": digest["transport_response_bytes"],
+        "api_elapsed_seconds": digest["elapsed"],
+        "wall_elapsed_seconds": wall_elapsed,
+    }
+
+
 def compare_request(
     *,
     shanghai_url: str,
@@ -240,6 +270,49 @@ def compare_request(
         hourly_time_range=hourly_time_range if hourly else None,
         daily_time_range=daily_time_range if daily else None,
     )
+    if shanghai_ssh_client is not None and singapore_ssh_client is not None:
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="server-parity-digest"
+        ) as executor:
+            shanghai_digest_future = executor.submit(
+                fetch_projection_digest,
+                shanghai_url,
+                template,
+                hourly,
+                daily,
+                shanghai_ssh_client,
+            )
+            singapore_digest_future = executor.submit(
+                fetch_projection_digest,
+                singapore_url,
+                template,
+                hourly,
+                daily,
+                singapore_ssh_client,
+            )
+            shanghai_digest, shanghai_performance = (
+                shanghai_digest_future.result()
+            )
+            singapore_digest, singapore_performance = (
+                singapore_digest_future.result()
+            )
+        digest_performance = {
+            "shanghai": shanghai_performance,
+            "singapore": singapore_performance,
+        }
+        if (
+            shanghai_digest["projection_valid"]
+            and singapore_digest["projection_valid"]
+            and shanghai_digest["projection_sha256"]
+            == singapore_digest["projection_sha256"]
+            and shanghai_digest["value_count"]
+            == singapore_digest["value_count"]
+        ):
+            return None, int(shanghai_digest["value_count"]), digest_performance
+
+        # A digest mismatch is never treated as the reported difference. Fetch
+        # both complete responses and reuse the canonical ordered comparator so
+        # the report still identifies the exact first period, variable and time.
     # Both responses belong to the same point gate, so they can be fetched in
     # parallel without advancing to the next point before comparison passes.
     # This also keeps a slow disk on one server from serially delaying the
@@ -298,6 +371,7 @@ def record_request_performance(
                 "transport": current["transport"],
                 "requests": 0,
                 "response_bytes": 0,
+                "transport_response_bytes": 0,
                 "api_elapsed_seconds_total": 0.0,
                 "wall_elapsed_seconds_total": 0.0,
                 "api_elapsed_seconds_max": 0.0,
@@ -308,6 +382,9 @@ def record_request_performance(
             raise ValueError(f"{server} transport changed during parity validation")
         server_aggregate["requests"] += 1
         server_aggregate["response_bytes"] += current["response_bytes"]
+        server_aggregate["transport_response_bytes"] += current.get(
+            "transport_response_bytes", current["response_bytes"]
+        )
         for metric in ("api_elapsed_seconds", "wall_elapsed_seconds"):
             value = float(current[metric])
             server_aggregate[f"{metric}_total"] += value
