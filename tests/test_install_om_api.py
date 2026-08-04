@@ -411,6 +411,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 "OM_SNAPSHOT_REFRESH_SECONDS=0\n",
                 service_environment,
             )
+            self.assertIn("RAYON_NUM_THREADS=8\n", service_environment)
             self.assertNotIn("OM_API_DEM_ROOT=", service_environment)
             self.assertFalse((data_root / "static").exists())
             for model in ("ncep_gfs013", "ncep_gfs025", "ecmwf_ifs025"):

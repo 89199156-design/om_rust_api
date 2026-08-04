@@ -4,6 +4,7 @@ set -euo pipefail
 INSTALL_DIR="${1:-/opt/1panel/apps/weather_om_api}"
 DATA_ROOT="${OM_DATA_ROOT:-/data/om_raw}"
 BIND_ADDR="${OM_API_BIND:-127.0.0.1:8088}"
+RAYON_THREADS="${OM_API_RAYON_THREADS:-8}"
 SERVICE_NAME="${OM_API_SERVICE_NAME:-weather-om-api}"
 INSTALL_OWNER="${OM_API_USER:-ubuntu}"
 API_DEM_ROOT="${OM_API_DEM_ROOT:-$INSTALL_DIR/static}"
@@ -60,6 +61,10 @@ case "$CONFIGURE_HOST_NGINX" in
     exit 2
     ;;
 esac
+if [[ ! "$RAYON_THREADS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "OM_API_RAYON_THREADS must be a positive integer: $RAYON_THREADS" >&2
+  exit 2
+fi
 configure_host_nginx=false
 if [ "$CONFIGURE_HOST_NGINX" = "1" ]; then
   if [ ! -d "$HOST_NGINX_ROOT" ] || ! command -v nginx >/dev/null 2>&1; then
@@ -465,6 +470,7 @@ OM_MODEL_STATIC_ROOT=$MODEL_STATIC_ROOT
 OM_API_BIND=$BIND_ADDR
 OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
 OM_SNAPSHOT_REFRESH_SECONDS=0
+RAYON_NUM_THREADS=$RAYON_THREADS
 RUST_LOG=info,tower_http=warn
 EOF
 run_privileged install -m 0644 -- "$ENV_FILE_TMP" "$ENV_FILE"

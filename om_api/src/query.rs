@@ -100,12 +100,31 @@ impl WeatherModel {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectGridSeriesCacheKey {
+    model: WeatherModel,
+    variable: String,
+    start_unix: i64,
+    end_unix: i64,
+    count: usize,
+    latitude_bits: u64,
+    longitude_bits: u64,
+    sampling: Option<(u64, u64, u32, u32)>,
+    round_values: bool,
+}
+
+type DirectGridSeriesValues = Vec<Vec<f32>>;
+type DirectGridSeriesCacheSlot = Arc<Mutex<Option<Arc<DirectGridSeriesValues>>>>;
+type DirectGridSeriesRequestCache =
+    Arc<Mutex<HashMap<DirectGridSeriesCacheKey, DirectGridSeriesCacheSlot>>>;
+
 thread_local! {
     static REQUEST_WEATHER_MODEL: RefCell<WeatherModel> = const { RefCell::new(WeatherModel::Gfs) };
     static ECMWF_REQUEST_REGULAR_CACHE: RefCell<Option<HashMap<EcmwfRegularCacheKey, Arc<EcmwfRegularSeries>>>> = const { RefCell::new(None) };
     static GFS_REQUEST_PROBABILITY_HISTORY_CACHE: RefCell<Option<HashMap<GfsProbabilityHistoryCacheKey, Arc<GfsProbabilityPointHistory>>>> = const { RefCell::new(None) };
     static GFS_REQUEST_PROBABILITY_SUPPORT_CACHE: RefCell<Option<HashMap<GfsProbabilitySupportCacheKey, Option<f32>>>> = const { RefCell::new(None) };
     static DAILY_REQUEST_SERIES_CACHE: RefCell<Option<HashMap<DailySeriesCacheKey, Arc<Vec<f32>>>>> = const { RefCell::new(None) };
+    static DIRECT_GRID_SERIES_REQUEST_CACHE: RefCell<Option<DirectGridSeriesRequestCache>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -218,6 +237,46 @@ fn with_daily_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<
             cache.borrow_mut().take();
         });
     }
+    result
+}
+
+/// Share decoded point time slabs across all fields in one API request. Derived
+/// fields such as wind speed and wind direction read the same U/V slabs, and a
+/// complete forecast asks for many such combinations concurrently on Rayon.
+/// Per-key slots prevent two workers from inflating the same OM chunk at once.
+fn with_direct_grid_series_request_cache<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let owns_cache = DIRECT_GRID_SERIES_REQUEST_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_some() {
+            false
+        } else {
+            *cache = Some(Arc::new(Mutex::new(HashMap::new())));
+            true
+        }
+    });
+    let result = operation();
+    if owns_cache {
+        DIRECT_GRID_SERIES_REQUEST_CACHE.with(|cache| {
+            cache.borrow_mut().take();
+        });
+    }
+    result
+}
+
+fn current_direct_grid_series_request_cache() -> Option<DirectGridSeriesRequestCache> {
+    DIRECT_GRID_SERIES_REQUEST_CACHE.with(|cache| cache.borrow().clone())
+}
+
+fn with_direct_grid_series_request_cache_handle<T>(
+    cache: Option<DirectGridSeriesRequestCache>,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let Some(cache) = cache else {
+        return operation();
+    };
+    let previous = DIRECT_GRID_SERIES_REQUEST_CACHE.with(|current| current.replace(Some(cache)));
+    let result = operation();
+    DIRECT_GRID_SERIES_REQUEST_CACHE.with(|current| current.replace(previous));
     result
 }
 
@@ -1026,14 +1085,16 @@ pub fn forecast_for_query(
     query: &PointQuery,
 ) -> Result<serde_json::Value> {
     let model = WeatherModel::parse(query.models.as_deref())?;
-    with_weather_model(model, || {
-        with_daily_request_cache(|| match model {
-            WeatherModel::EcmwfIfs025 => {
-                with_ecmwf_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
-            }
-            WeatherModel::Gfs => {
-                with_gfs_request_cache(|| forecast_for_query_for_model(snapshot, decoder, query))
-            }
+    with_direct_grid_series_request_cache(|| {
+        with_weather_model(model, || {
+            with_daily_request_cache(|| match model {
+                WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(|| {
+                    forecast_for_query_for_model(snapshot, decoder, query)
+                }),
+                WeatherModel::Gfs => with_gfs_request_cache(|| {
+                    forecast_for_query_for_model(snapshot, decoder, query)
+                }),
+            })
         })
     })
 }
@@ -1306,6 +1367,24 @@ pub fn point_forecast(
     end: Option<DateTime<Utc>>,
     limit: Option<usize>,
 ) -> Result<ForecastResponse> {
+    with_direct_grid_series_request_cache(|| {
+        point_forecast_with_request_cache(
+            snapshot, decoder, latitude, longitude, variables, start, end, limit,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn point_forecast_with_request_cache(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    latitude: f64,
+    longitude: f64,
+    variables: &[String],
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<usize>,
+) -> Result<ForecastResponse> {
     validate_coordinate(latitude, longitude)?;
     let started = std::time::Instant::now();
     let mut hourly_units = BTreeMap::new();
@@ -1325,21 +1404,24 @@ pub fn point_forecast(
 
         let model = current_weather_model();
         let sampling = current_request_sampling();
+        let direct_grid_series_cache = current_direct_grid_series_request_cache();
         let read_variable = |variable: &String| {
             let read = || {
                 read_hourly_variable_values(
                     snapshot, decoder, variable, &times, latitude, longitude,
                 )
             };
-            with_weather_model(model, || {
-                let read_with_cache = || match model {
-                    WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(read),
-                    WeatherModel::Gfs => with_gfs_request_cache(read),
-                };
-                match sampling {
-                    Some(sampling) => with_request_sampling(sampling, read_with_cache),
-                    None => read_with_cache(),
-                }
+            with_direct_grid_series_request_cache_handle(direct_grid_series_cache.clone(), || {
+                with_weather_model(model, || {
+                    let read_with_cache = || match model {
+                        WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(read),
+                        WeatherModel::Gfs => with_gfs_request_cache(read),
+                    };
+                    match sampling {
+                        Some(sampling) => with_request_sampling(sampling, read_with_cache),
+                        None => read_with_cache(),
+                    }
+                })
             })
             .map(|values| (variable.clone(), values))
         };
@@ -1391,6 +1473,10 @@ fn read_hourly_variable_values(
     latitude: f64,
     longitude: f64,
 ) -> Result<Vec<f32>> {
+    if current_weather_model() == WeatherModel::Gfs && is_gfs_unavailable_ecmwf_soil_layer(variable)
+    {
+        return Ok(vec![f32::NAN; times.len()]);
+    }
     let fast_values = if variable == "precipitation_probability"
         && current_weather_model() == WeatherModel::Gfs
     {
@@ -1420,6 +1506,25 @@ fn read_hourly_variable_values(
         }
     }
     Ok(values)
+}
+
+/// The official GFS API accepts ECMWF layer-depth aliases in a mixed request,
+/// but GFS has different native soil layers and returns null for these fields.
+/// Avoid attempting hundreds of unavailable OM lookups before producing the
+/// same all-null response. Native GFS 0-10/10-40/40-100/100-200 cm fields are
+/// separate public variables and continue through normal decoding.
+fn is_gfs_unavailable_ecmwf_soil_layer(variable: &str) -> bool {
+    matches!(
+        variable,
+        "soil_temperature_0_to_7cm"
+            | "soil_temperature_7_to_28cm"
+            | "soil_temperature_28_to_100cm"
+            | "soil_temperature_100_to_255cm"
+            | "soil_moisture_0_to_7cm"
+            | "soil_moisture_7_to_28cm"
+            | "soil_moisture_28_to_100cm"
+            | "soil_moisture_100_to_255cm"
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2036,6 +2141,10 @@ fn read_daily_series_uncached(
     latitude: f64,
     longitude: f64,
 ) -> Result<Vec<f32>> {
+    if current_weather_model() == WeatherModel::Gfs && is_gfs_unavailable_ecmwf_soil_layer(variable)
+    {
+        return Ok(vec![f32::NAN; times.len()]);
+    }
     if variable == "precipitation_probability" && current_weather_model() == WeatherModel::Gfs {
         return read_gfs_precipitation_probability_point_series(
             snapshot, decoder, times, latitude, longitude,
@@ -5536,6 +5645,85 @@ fn read_gfs_product_history_grid_with_rounding(
 }
 
 fn read_direct_grid_series(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Vec<Vec<f32>>> {
+    if times.is_empty() || latitudes.len() != 1 || longitudes.len() != 1 {
+        return read_direct_grid_series_uncached(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            latitudes,
+            longitudes,
+            round_values,
+        );
+    }
+    let Some(cache) = current_direct_grid_series_request_cache() else {
+        return read_direct_grid_series_uncached(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            latitudes,
+            longitudes,
+            round_values,
+        );
+    };
+    let (product_name, _) = product_for_variable(snapshot, variable)?;
+    let sampling = current_product_sampling(product_name).map(|sampling| {
+        (
+            sampling.latitude.to_bits(),
+            sampling.longitude.to_bits(),
+            sampling.model_elevation.to_bits(),
+            sampling.target_elevation.to_bits(),
+        )
+    });
+    let key = DirectGridSeriesCacheKey {
+        model: current_weather_model(),
+        variable: variable.to_string(),
+        start_unix: times[0].timestamp(),
+        end_unix: times[times.len() - 1].timestamp(),
+        count: times.len(),
+        latitude_bits: latitudes[0].to_bits(),
+        longitude_bits: longitudes[0].to_bits(),
+        sampling,
+        round_values,
+    };
+    let slot = {
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("direct grid-series request cache lock is poisoned"))?;
+        cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    };
+    let mut cached = slot
+        .lock()
+        .map_err(|_| anyhow!("direct grid-series request cache slot lock is poisoned"))?;
+    if let Some(values) = cached.as_ref() {
+        return Ok((**values).clone());
+    }
+    let values = read_direct_grid_series_uncached(
+        snapshot,
+        decoder,
+        variable,
+        times,
+        latitudes,
+        longitudes,
+        round_values,
+    )?;
+    *cached = Some(Arc::new(values.clone()));
+    Ok(values)
+}
+
+fn read_direct_grid_series_uncached(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     variable: &str,
@@ -10509,6 +10697,34 @@ fn model_latitude_for_variable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfs_only_short_circuits_ecmwf_soil_layer_depths() {
+        for variable in [
+            "soil_temperature_0_to_7cm",
+            "soil_temperature_7_to_28cm",
+            "soil_temperature_28_to_100cm",
+            "soil_temperature_100_to_255cm",
+            "soil_moisture_0_to_7cm",
+            "soil_moisture_7_to_28cm",
+            "soil_moisture_28_to_100cm",
+            "soil_moisture_100_to_255cm",
+        ] {
+            assert!(is_gfs_unavailable_ecmwf_soil_layer(variable));
+        }
+        for variable in [
+            "soil_temperature_0_to_10cm",
+            "soil_temperature_10_to_40cm",
+            "soil_temperature_40_to_100cm",
+            "soil_temperature_100_to_200cm",
+            "soil_moisture_0_to_10cm",
+            "soil_moisture_10_to_40cm",
+            "soil_moisture_40_to_100cm",
+            "soil_moisture_100_to_200cm",
+        ] {
+            assert!(!is_gfs_unavailable_ecmwf_soil_layer(variable));
+        }
+    }
 
     #[test]
     fn static_elevation_accepts_spatial_and_spatial_time_archives() {
