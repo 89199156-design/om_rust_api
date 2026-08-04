@@ -60,6 +60,8 @@ struct NativeProductReady {
     source_runs: Vec<String>,
     #[serde(default)]
     source_run_max_forecast_hours: Vec<i64>,
+    #[serde(default)]
+    interpolation_support_forecast_hours_by_source_run: HashMap<String, Vec<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,6 +474,73 @@ fn attach_static_elevation(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn attach_native_interpolation_support(
+    coverage_root: &Path,
+    product: &str,
+    product_ready: &NativeProductReady,
+    source_run: &str,
+    reference_time: DateTime<Utc>,
+    public_horizon: i64,
+    run_root: &Path,
+    run_entries: &mut Vec<BundleEntry>,
+    native_handles: &mut HashMap<String, Arc<File>>,
+) -> Result<()> {
+    let Some(forecast_hours) = product_ready
+        .interpolation_support_forecast_hours_by_source_run
+        .get(source_run)
+    else {
+        return Ok(());
+    };
+    for forecast_hour in forecast_hours {
+        if product != "ncep_gefs05" || *forecast_hour <= public_horizon {
+            bail!("native interpolation support declaration is invalid");
+        }
+        let file_path = run_root.join(format!(
+            "precipitation_probability_support_f{forecast_hour:03}.om"
+        ));
+        let handle = Arc::new(File::open(&file_path).with_context(|| {
+            format!("open native interpolation support {}", file_path.display())
+        })?);
+        let array = read_native_array_metadata(&handle).with_context(|| {
+            format!("parse native interpolation support {}", file_path.display())
+        })?;
+        if array.dimensions != [product_ready.grid.ny, product_ready.grid.nx, 2_u64]
+            || array.chunks.len() != 3
+        {
+            bail!("native interpolation support dimensions do not match regional grid");
+        }
+        let relative = file_path
+            .strip_prefix(coverage_root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        native_handles.insert(relative.clone(), handle);
+        run_entries.push(BundleEntry {
+            variable: "precipitation_probability".to_string(),
+            variable_path: Some("precipitation_probability".to_string()),
+            valid_time_utc: reference_time + Duration::hours(*forecast_hour),
+            source_run: source_run.to_string(),
+            forecast_hour: *forecast_hour,
+            coverage_source_run: None,
+            coverage_forecast_hour: None,
+            interpolation_support: true,
+            source_url: None,
+            selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
+            array,
+            lut_byte_ranges: Vec::new(),
+            data_byte_ranges: Vec::new(),
+            lut_bytes_read: 0,
+            byte_ranges: Vec::new(),
+            bundle_offset: 0,
+            bundle_bytes: file_path.metadata()?.len(),
+            native_file_path: Some(relative),
+            native_time_index: Some(1),
+            native_grid: Some(product_ready.grid.clone()),
+        });
+    }
+    Ok(())
+}
+
 fn product_uses_static_elevation(product: &str) -> bool {
     matches!(
         product,
@@ -500,13 +569,11 @@ fn load_native_product_run(
     if meta.reference_time != reference_time {
         bail!("native run reference time mismatch: {source_run}");
     }
-    validate_run_time_axis(
-        &product_ready.runtime_domain,
-        &meta,
-        run_horizon(ready, product, product_ready, source_run)?,
-    )?;
+    let public_horizon = run_horizon(ready, product, product_ready, source_run)?;
+    validate_run_time_axis(&product_ready.runtime_domain, &meta, public_horizon)?;
 
     let mut entries = HashMap::new();
+    let mut run_entries = Vec::new();
     let mut static_entries = HashMap::new();
     let mut native_handles = HashMap::new();
     for variable in meta
@@ -550,33 +617,35 @@ fn load_native_product_run(
         native_handles.insert(relative.clone(), handle);
         for (time_index, valid_time_index) in time_indices.into_iter().enumerate() {
             let valid_time = meta.valid_times[valid_time_index];
+            let entry = BundleEntry {
+                variable: variable.clone(),
+                variable_path: Some(variable.clone()),
+                valid_time_utc: valid_time,
+                source_run: source_run.to_string(),
+                forecast_hour: (valid_time - reference_time).num_hours(),
+                coverage_source_run: None,
+                coverage_forecast_hour: None,
+                interpolation_support: false,
+                source_url: None,
+                selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
+                array: array.clone(),
+                lut_byte_ranges: Vec::new(),
+                data_byte_ranges: Vec::new(),
+                lut_bytes_read: 0,
+                byte_ranges: Vec::new(),
+                bundle_offset: 0,
+                bundle_bytes: file_path.metadata()?.len(),
+                native_file_path: Some(relative.clone()),
+                native_time_index: Some(time_index as u64),
+                native_grid: Some(product_ready.grid.clone()),
+            };
+            run_entries.push(entry.clone());
             entries.insert(
                 EntryKey {
                     variable: variable.clone(),
                     valid_time_utc: valid_time,
                 },
-                BundleEntry {
-                    variable: variable.clone(),
-                    variable_path: Some(variable.clone()),
-                    valid_time_utc: valid_time,
-                    source_run: source_run.to_string(),
-                    forecast_hour: (valid_time - reference_time).num_hours(),
-                    coverage_source_run: None,
-                    coverage_forecast_hour: None,
-                    interpolation_support: false,
-                    source_url: None,
-                    selection_ranges: vec![[0, product_ready.grid.ny], [0, product_ready.grid.nx]],
-                    array: array.clone(),
-                    lut_byte_ranges: Vec::new(),
-                    data_byte_ranges: Vec::new(),
-                    lut_bytes_read: 0,
-                    byte_ranges: Vec::new(),
-                    bundle_offset: 0,
-                    bundle_bytes: file_path.metadata()?.len(),
-                    native_file_path: Some(relative.clone()),
-                    native_time_index: Some(time_index as u64),
-                    native_grid: Some(product_ready.grid.clone()),
-                },
+                entry,
             );
         }
     }
@@ -592,6 +661,17 @@ fn load_native_product_run(
             &mut native_handles,
         )?;
     }
+    attach_native_interpolation_support(
+        coverage_root,
+        product,
+        product_ready,
+        source_run,
+        reference_time,
+        public_horizon,
+        &run_root,
+        &mut run_entries,
+        &mut native_handles,
+    )?;
 
     let manifest_path = coverage_root.join("coverage.json");
     let bundle_handle = Arc::new(File::open(&manifest_path)?);
@@ -601,10 +681,7 @@ fn load_native_product_run(
         sha256: None,
         entries: Vec::new(),
     };
-    let entries_by_source_run = HashMap::from([(
-        source_run.to_string(),
-        entries.values().cloned().collect::<Vec<_>>(),
-    )]);
+    let entries_by_source_run = HashMap::from([(source_run.to_string(), run_entries)]);
     let coverage_plan = meta
         .valid_times
         .iter()
@@ -828,6 +905,24 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                     != ready.source_run_max_forecast_hours)
         {
             bail!("native ECMWF product run contract differs from the group contract");
+        }
+        if !product_ready
+            .interpolation_support_forecast_hours_by_source_run
+            .is_empty()
+        {
+            let valid_support_contract = group == "gfs"
+                && product == "ncep_gefs05"
+                && product_ready
+                    .interpolation_support_forecast_hours_by_source_run
+                    .len()
+                    == 1
+                && product_ready
+                    .interpolation_support_forecast_hours_by_source_run
+                    .get(&ready.latest_complete_run)
+                    .is_some_and(|hours| hours == &[390]);
+            if !valid_support_contract {
+                bail!("native product {product} interpolation support contract is invalid");
+            }
         }
     }
     Ok(())
@@ -1256,6 +1351,113 @@ mod tests {
         assert_eq!(
             expected_forecast_hours("ecmwf_ifs025_ensemble", 144),
             (3..=144).step_by(3).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn loads_declared_gefs05_right_interpolation_support_without_exposing_it() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let coverage_id = "gfs_native_2026071300_probability-support";
+        let coverage = root.join("coverages/gfs").join(coverage_id);
+        fs::create_dir_all(&coverage).unwrap();
+        fs::write(coverage.join("coverage.json"), b"{}").unwrap();
+        let source_runs = [
+            "2026071200",
+            "2026071206",
+            "2026071212",
+            "2026071218",
+            "2026071300",
+        ];
+        let horizons = [6_i64, 6, 6, 384, 384];
+        for (run, horizon) in source_runs.iter().zip(horizons) {
+            let reference = parse_run(run).unwrap();
+            let forecast_hours = expected_forecast_hours("ncep_gefs05", horizon);
+            let run_root = coverage
+                .join("data_run/ncep_gefs05")
+                .join(run_relative_path(run).unwrap());
+            fs::create_dir_all(&run_root).unwrap();
+            write_fake_om(
+                &run_root.join("precipitation_probability.om"),
+                [2, 3, forecast_hours.len() as u64],
+            );
+            fs::write(
+                run_root.join("meta.json"),
+                serde_json::to_vec(&json!({
+                    "reference_time": reference,
+                    "variables": ["precipitation_probability"],
+                    "valid_times": forecast_hours
+                        .iter()
+                        .map(|hour| reference + Duration::hours(*hour))
+                        .collect::<Vec<_>>(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            if *run == "2026071300" {
+                write_fake_om(
+                    &run_root.join("precipitation_probability_support_f390.om"),
+                    [2, 3, 2],
+                );
+            }
+        }
+        let marker = json!({
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "gfs",
+            "coverage_id": coverage_id,
+            "latest_complete_run": "2026071300",
+            "source_runs": source_runs,
+            "short_run_count": 3,
+            "full_run_count": 2,
+            "source_run_max_forecast_hours": horizons,
+            "public_start_utc": "2026-07-12T00:00:00Z",
+            "coverage_path": format!("coverages/gfs/{coverage_id}"),
+            "products": {
+                "ncep_gefs05": {
+                    "runtime_domain": "ncep_gefs05",
+                    "grid": {
+                        "nx": 3, "ny": 2,
+                        "lon_min": 70.0, "lat_min": 0.0,
+                        "dx": 0.5, "dy": 0.5,
+                        "dt_seconds": 10800,
+                        "om_file_length": 313
+                    },
+                    "source_runs": source_runs,
+                    "source_run_max_forecast_hours": horizons,
+                    "interpolation_support_forecast_hours_by_source_run": {
+                        "2026071300": [390]
+                    }
+                }
+            }
+        });
+        let marker_path = root.join("groups/gfs/current/ready_for_processing.json");
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+
+        let mut products = HashMap::new();
+        let mut history = HashMap::new();
+        assert!(load_native_group_products(
+            root,
+            "gfs",
+            &["ncep_gefs05"],
+            &mut products,
+            &mut history,
+        )
+        .unwrap());
+
+        let current = products.get("ncep_gefs05").unwrap();
+        assert_eq!(current.entries.len(), 104);
+        let latest_entries = current.entries_by_source_run.get("2026071300").unwrap();
+        assert_eq!(latest_entries.len(), 105);
+        let support = latest_entries
+            .iter()
+            .find(|entry| entry.interpolation_support)
+            .unwrap();
+        assert_eq!(support.forecast_hour, 390);
+        assert_eq!(
+            current.manifest.coverage_plan.last().unwrap().forecast_hour,
+            384
         );
     }
 
