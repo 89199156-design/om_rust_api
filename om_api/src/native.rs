@@ -60,8 +60,6 @@ struct NativeProductReady {
     source_runs: Vec<String>,
     #[serde(default)]
     source_run_max_forecast_hours: Vec<i64>,
-    #[serde(default)]
-    terminal_repeat_forecast_hours_by_source_run: HashMap<String, Vec<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,45 +472,6 @@ fn attach_static_elevation(
     Ok(())
 }
 
-fn attach_native_terminal_repeat(
-    product: &str,
-    product_ready: &NativeProductReady,
-    source_run: &str,
-    reference_time: DateTime<Utc>,
-    public_horizon: i64,
-    run_entries: &mut Vec<BundleEntry>,
-) -> Result<()> {
-    let Some(forecast_hours) = product_ready
-        .terminal_repeat_forecast_hours_by_source_run
-        .get(source_run)
-    else {
-        return Ok(());
-    };
-    for forecast_hour in forecast_hours {
-        if product != "ncep_gefs05" || *forecast_hour != public_horizon + 6 {
-            bail!("native terminal repeat declaration is invalid");
-        }
-        let mut support = run_entries
-            .iter()
-            .find(|entry| {
-                entry.variable == "precipitation_probability"
-                    && entry.forecast_hour == public_horizon
-                    && !entry.interpolation_support
-            })
-            .cloned()
-            .with_context(|| {
-                format!(
-                    "native terminal probability frame is missing: {product} {source_run} f{public_horizon:03}"
-                )
-            })?;
-        support.valid_time_utc = reference_time + Duration::hours(*forecast_hour);
-        support.forecast_hour = *forecast_hour;
-        support.interpolation_support = true;
-        run_entries.push(support);
-    }
-    Ok(())
-}
-
 fn product_uses_static_elevation(product: &str) -> bool {
     matches!(
         product,
@@ -633,15 +592,6 @@ fn load_native_product_run(
             &mut native_handles,
         )?;
     }
-    attach_native_terminal_repeat(
-        product,
-        product_ready,
-        source_run,
-        reference_time,
-        public_horizon,
-        &mut run_entries,
-    )?;
-
     let manifest_path = coverage_root.join("coverage.json");
     let bundle_handle = Arc::new(File::open(&manifest_path)?);
     let bundle_file = ManifestFile {
@@ -874,24 +824,6 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                     != ready.source_run_max_forecast_hours)
         {
             bail!("native ECMWF product run contract differs from the group contract");
-        }
-        if !product_ready
-            .terminal_repeat_forecast_hours_by_source_run
-            .is_empty()
-        {
-            let valid_support_contract = group == "gfs"
-                && product == "ncep_gefs05"
-                && product_ready
-                    .terminal_repeat_forecast_hours_by_source_run
-                    .len()
-                    == 1
-                && product_ready
-                    .terminal_repeat_forecast_hours_by_source_run
-                    .get(&ready.latest_complete_run)
-                    .is_some_and(|hours| hours == &[390]);
-            if !valid_support_contract {
-                bail!("native product {product} terminal repeat contract is invalid");
-            }
         }
     }
     Ok(())
@@ -1320,113 +1252,6 @@ mod tests {
         assert_eq!(
             expected_forecast_hours("ecmwf_ifs025_ensemble", 144),
             (3..=144).step_by(3).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn repeats_declared_gefs05_terminal_frame_without_exposing_it() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        let coverage_id = "gfs_native_2026071300_probability-support";
-        let coverage = root.join("coverages/gfs").join(coverage_id);
-        fs::create_dir_all(&coverage).unwrap();
-        fs::write(coverage.join("coverage.json"), b"{}").unwrap();
-        let source_runs = [
-            "2026071200",
-            "2026071206",
-            "2026071212",
-            "2026071218",
-            "2026071300",
-        ];
-        let horizons = [6_i64, 6, 6, 384, 384];
-        for (run, horizon) in source_runs.iter().zip(horizons) {
-            let reference = parse_run(run).unwrap();
-            let forecast_hours = expected_forecast_hours("ncep_gefs05", horizon);
-            let run_root = coverage
-                .join("data_run/ncep_gefs05")
-                .join(run_relative_path(run).unwrap());
-            fs::create_dir_all(&run_root).unwrap();
-            write_fake_om(
-                &run_root.join("precipitation_probability.om"),
-                [2, 3, forecast_hours.len() as u64],
-            );
-            fs::write(
-                run_root.join("meta.json"),
-                serde_json::to_vec(&json!({
-                    "reference_time": reference,
-                    "variables": ["precipitation_probability"],
-                    "valid_times": forecast_hours
-                        .iter()
-                        .map(|hour| reference + Duration::hours(*hour))
-                        .collect::<Vec<_>>(),
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        }
-        let marker = json!({
-            "status": "complete",
-            "runtime_format": "openmeteo-native-v1",
-            "group": "gfs",
-            "coverage_id": coverage_id,
-            "latest_complete_run": "2026071300",
-            "source_runs": source_runs,
-            "short_run_count": 3,
-            "full_run_count": 2,
-            "source_run_max_forecast_hours": horizons,
-            "public_start_utc": "2026-07-12T00:00:00Z",
-            "coverage_path": format!("coverages/gfs/{coverage_id}"),
-            "products": {
-                "ncep_gefs05": {
-                    "runtime_domain": "ncep_gefs05",
-                    "grid": {
-                        "nx": 3, "ny": 2,
-                        "lon_min": 70.0, "lat_min": 0.0,
-                        "dx": 0.5, "dy": 0.5,
-                        "dt_seconds": 10800,
-                        "om_file_length": 313
-                    },
-                    "source_runs": source_runs,
-                    "source_run_max_forecast_hours": horizons,
-                    "terminal_repeat_forecast_hours_by_source_run": {
-                        "2026071300": [390]
-                    }
-                }
-            }
-        });
-        let marker_path = root.join("groups/gfs/current/ready_for_processing.json");
-        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
-
-        let mut products = HashMap::new();
-        let mut history = HashMap::new();
-        assert!(load_native_group_products(
-            root,
-            "gfs",
-            &["ncep_gefs05"],
-            &mut products,
-            &mut history,
-        )
-        .unwrap());
-
-        let current = products.get("ncep_gefs05").unwrap();
-        assert_eq!(current.entries.len(), 104);
-        let latest_entries = current.entries_by_source_run.get("2026071300").unwrap();
-        assert_eq!(latest_entries.len(), 105);
-        let support = latest_entries
-            .iter()
-            .find(|entry| entry.interpolation_support)
-            .unwrap();
-        assert_eq!(support.forecast_hour, 390);
-        assert_eq!(support.native_time_index, Some(103));
-        assert!(support
-            .native_file_path
-            .as_deref()
-            .unwrap()
-            .ends_with("precipitation_probability.om"));
-        assert_eq!(
-            current.manifest.coverage_plan.last().unwrap().forecast_hour,
-            384
         );
     }
 
