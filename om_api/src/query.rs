@@ -11239,10 +11239,10 @@ mod tests {
             f32::from_bits(0x42d2_3c00) as f64,
         );
 
-        assert_eq!(values[181].to_bits(), 0x4105_3333);
+        assert_eq!(values[181].to_bits(), 0x4102_f407);
         assert_eq!(
             maybe_round_to_scalefactor(values[181], 20.0, true).to_bits(),
-            0x4105_999a
+            0x4103_3333
         );
     }
 
@@ -11655,7 +11655,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_solar_full_series_keeps_official_nan_d_at_night() {
+    fn sparse_solar_full_series_preserves_current_clear_sky_sunset_tail() {
         let start = Utc.with_ymd_and_hms(2026, 8, 4, 9, 0, 0).unwrap();
         let mut values = vec![f32::NAN; 10];
         values[0] = 100.0;
@@ -11665,12 +11665,12 @@ mod tests {
 
         interpolate_solar_backwards_in_place(&mut values, start, 50.315_66, 107.929_69);
 
-        assert_eq!(values[4], 0.0);
+        assert!((values[4] - 0.829_054_7).abs() < 1e-6);
         assert!(values.iter().all(|value| value.is_finite()));
     }
 
     #[test]
-    fn sparse_solar_full_series_copies_finite_pre_recovery_c_to_nighttime_d() {
+    fn sparse_solar_full_series_keeps_current_nighttime_interval_zero() {
         let start = Utc.with_ymd_and_hms(2026, 7, 26, 6, 0, 0).unwrap();
         let mut values = vec![f32::NAN; 10];
         values[0] = 100.0;
@@ -11680,8 +11680,7 @@ mod tests {
 
         interpolate_solar_backwards_in_place(&mut values, start, 6.853_241, 132.656_25);
 
-        assert!(values[4].is_finite());
-        assert!(values[4] > 0.0);
+        assert_eq!(values[4], 0.0);
         assert!(values.iter().all(|value| value.is_finite()));
     }
 
