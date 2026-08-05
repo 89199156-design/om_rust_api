@@ -490,7 +490,7 @@ pub fn clear_sky_radiation_factor_backwards(
     };
     let center = (low + high) * 0.5;
     let half_width = (high - low) * 0.5;
-    let sample_offset = half_width * 0.77459667;
+    let sample_offset = half_width * 0.774_596_7;
     let step_width = p10 - p1;
     let seconds = timestamp.timestamp().rem_euclid(SECONDS_PER_AVERAGE_YEAR) as f32;
     let day = seconds / SECONDS_PER_DAY as f32 - 4.0 + 1.0;
