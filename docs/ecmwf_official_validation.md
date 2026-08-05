@@ -43,7 +43,7 @@ Single Runs API 不能作为通过判定源。它的单周期结果与 live API 
 - hourly 197：a518f8c0ddfb5e11ac5661da7d6c5d588bbb56f33e5267378631947e3a52669c
 - daily 65：87a46a349a767c1e015bf76ab506546865b483365f7e04c543c730d67cd65f33
 
-本次精确复刻审计锁定的 Open-Meteo 官方源码基线为 acfe608b825da1a8b42a755297eb61121986e9da（2026-07-21）。配置加载会硬校验该完整 SHA；更换源码基线必须显式更新 canonical 模块、配置与测试，旧计划会因配置哈希变化而失效。
+本次精确复刻审计锁定的 Open-Meteo 官方源码基线为 fc670930b55c963b10e9578c8628a824da43a3ab（2026-07-24）。配置加载会硬校验该完整 SHA；更换源码基线必须显式更新 canonical 模块、配置与测试，旧计划会因配置哈希变化而失效。
 
 小时变量由 57 个非海洋 surface 字段与 14 层 × 10 类 pressure 字段组成。压力层为 1000、925、850、700、600、500、400、300、250、200、150、100、50、10 hPa；每层依次为 temperature、relative_humidity、geopotential_height、wind_u_component、wind_v_component、wind_speed、wind_direction、vertical_velocity、dew_point、cloud_cover。
 

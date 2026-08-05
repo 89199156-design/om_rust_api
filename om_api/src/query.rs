@@ -5,7 +5,7 @@ use crate::snapshot::OmDataSnapshot;
 use crate::solar::{
     backwards_diffuse_radiation, backwards_direct_normal_irradiance,
     backwards_global_tilted_irradiance, backwards_sunshine_duration, backwards_to_instant_factor,
-    daylight_duration, extra_terrestrial_radiation_backwards,
+    clear_sky_radiation_factor_backwards, daylight_duration, extra_terrestrial_radiation_backwards,
     extra_terrestrial_radiation_factor_backwards, is_day, sun_transit, SunTransit,
     PI as SWIFT_FLOAT_PI, SOLAR_CONSTANT,
 };
@@ -60,7 +60,7 @@ const ECMWF025_ENSEMBLE_STATIC_FILE_SIZE: u64 = 433_744;
 type ElevationCache = HashMap<(PathBuf, u64, u64), f32>;
 static ELEVATION_CACHE: OnceLock<Mutex<ElevationCache>> = OnceLock::new();
 
-pub const ECMWF_UPSTREAM_BASELINE: &str = "acfe608b825da1a8b42a755297eb61121986e9da";
+pub const ECMWF_UPSTREAM_BASELINE: &str = "fc670930b55c963b10e9578c8628a824da43a3ab";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WeatherModel {
@@ -8475,26 +8475,11 @@ fn read_backwards_value(
     ))
 }
 
-fn solar_factor_backwards_with_dt(
-    time: DateTime<Utc>,
-    dt_seconds: i64,
-    latitude: f64,
-    longitude: f64,
-) -> f32 {
-    extra_terrestrial_radiation_factor_backwards(
-        time,
-        dt_seconds,
-        latitude as f32,
-        longitude as f32,
-    )
-    .max(0.0)
-}
-
-/// Port of Open-Meteo's `interpolateInplaceSolarBackwards` for one hourly
-/// location series. The source algorithm is deliberately sequential: after a
-/// sparse interval is filled, its C value is deaveraged in place and becomes
-/// the already-processed A/B input of later intervals. A pointwise four-frame
-/// calculation cannot reproduce sunrise and sunset boundaries.
+/// Port of Open-Meteo's current `interpolateInplaceSolarBackwards`. The source
+/// algorithm is deliberately sequential: after a sparse interval is filled,
+/// its C value is deaveraged in place and becomes the already-processed B input
+/// of later intervals. Centered clearness-index splines preserve each source
+/// interval mean across mixed three- and six-hour cadences.
 pub(crate) fn interpolate_solar_backwards_in_place(
     values: &mut [f32],
     start: DateTime<Utc>,
@@ -8533,17 +8518,16 @@ fn interpolate_solar_backwards_with_dt_in_place(
 
     let solar = (0..values.len())
         .map(|index| {
-            solar_factor_backwards_with_dt(
+            clear_sky_radiation_factor_backwards(
                 start + Duration::seconds(index as i64 * dt_seconds),
                 dt_seconds,
-                latitude,
-                longitude,
+                latitude as f32,
+                longitude as f32,
             )
         })
         .collect::<Vec<_>>();
     let radiation_limit = SOLAR_CONSTANT * 0.95;
     let radiation_minimum = 5.0 / SOLAR_CONSTANT;
-    let official_max_zero = |value: f32| if value.is_nan() { 0.0 } else { value.max(0.0) };
 
     for missing in first_valid..values.len() {
         if !values[missing].is_nan() {
@@ -8562,79 +8546,96 @@ fn interpolate_solar_backwards_with_dt_in_place(
         let Some(pos_c) = ((missing + 1)..search_end).find(|index| !values[*index].is_nan()) else {
             break;
         };
-        let raw_b = values[pos_b];
-        let raw_c = values[pos_c];
+        let value_c = values[pos_c];
         let width = pos_c - pos_b;
         let pos_a = pos_b.checked_sub(width);
         let pos_d = pos_c
             .checked_add(width)
             .filter(|index| *index < values.len());
-        let four_point = pos_a
-            .zip(pos_d)
-            .filter(|(a, d)| !values[*a].is_nan() && !values[*d].is_nan());
+        let pos_b_valid = pos_a.is_some_and(|index| !values[index].is_nan());
+        let pos_d_valid = pos_d.is_some_and(|index| !values[index].is_nan());
 
-        let solar_b = solar[pos_b];
-        let solar_c = solar[pos_c];
         let solar_average_c = solar[(pos_b + 1)..=pos_c].iter().sum::<f32>() / width as f32;
-        let mut kt_c = if solar_average_c <= radiation_minimum {
+        let kt_c = if solar_average_c <= radiation_minimum || value_c <= 0.0 {
             f32::NAN
         } else {
-            (raw_c / solar_average_c).min(radiation_limit)
-        };
-        let mut kt_b = if solar_b <= radiation_minimum || raw_b.is_nan() {
-            kt_c
-        } else {
-            (raw_b / solar_b).min(radiation_limit)
+            (value_c / solar_average_c).min(radiation_limit)
         };
 
-        // ktD must be assigned from the pre-recovery ktC. This is the exact
-        // ordering in the official Swift implementation.
-        let (mut kt_a, kt_d) = if let Some((pos_a, pos_d)) = four_point {
-            let kt_a = if solar[pos_a] <= radiation_minimum {
-                kt_b
+        let kt_b = if pos_b_valid {
+            let pos_a = pos_a.expect("checked valid A position");
+            let value_b = values[(pos_a + 1)..=pos_b].iter().sum::<f32>() / width as f32;
+            let solar_average_b = solar[(pos_a + 1)..=pos_b].iter().sum::<f32>() / width as f32;
+            if solar_average_b <= radiation_minimum {
+                kt_c
             } else {
-                (values[pos_a] / solar[pos_a]).min(radiation_limit)
-            };
+                (value_b / solar_average_b).min(radiation_limit)
+            }
+        } else {
+            kt_c
+        };
+
+        let kt_d = if pos_d_valid {
+            let pos_d = pos_d.expect("checked valid D position");
             let solar_average_d = solar[(pos_c + 1)..=pos_d].iter().sum::<f32>() / width as f32;
-            let kt_d = if solar_average_d <= radiation_minimum {
+            if solar_average_d <= radiation_minimum {
                 kt_c
             } else {
                 (values[pos_d] / solar_average_d).min(radiation_limit)
-            };
-            (kt_a, kt_d)
+            }
         } else {
-            (kt_b, kt_c)
+            kt_c
         };
 
-        if kt_c.is_nan() && kt_b > 0.0 {
-            kt_c = kt_b;
-        }
-        if kt_c.is_nan() && kt_a > 0.0 {
-            kt_b = kt_a;
-            kt_c = kt_a;
-        }
-        if kt_c.is_nan() && kt_d > 0.0 {
-            kt_a = kt_d;
-            kt_b = kt_d;
-            kt_c = kt_d;
+        if kt_b.is_nan() && kt_c.is_nan() && kt_d.is_nan() {
+            values[missing..pos_c].fill(0.0);
+            continue;
         }
 
-        let coefficient_a = -kt_a / 2.0 + (3.0 * kt_b) / 2.0 - (3.0 * kt_c) / 2.0 + kt_d / 2.0;
-        let coefficient_b = kt_a - (5.0 * kt_b) / 2.0 + 2.0 * kt_c - kt_d / 2.0;
-        let coefficient_c = -kt_a / 2.0 + kt_c / 2.0;
-        for target in missing..pos_c {
-            let fraction = (target - pos_b) as f32 / width as f32;
-            let kt = coefficient_a * fraction * fraction * fraction
-                + coefficient_b * fraction * fraction
-                + coefficient_c * fraction
-                + kt_b;
-            values[target] = if kt < 0.0 && raw_b >= 0.0 && raw_c >= 0.0 {
-                (kt_b * (1.0 - fraction) + kt_c * fraction) * solar[target]
+        let recovered = || {
+            let kt_c = if kt_c.is_finite() {
+                kt_c
+            } else if kt_b.is_finite() {
+                kt_b
             } else {
-                official_max_zero(kt) * solar[target]
+                kt_d
             };
+            let kt_b = if kt_b.is_finite() { kt_b } else { kt_c };
+            let kt_d = if kt_d.is_finite() { kt_d } else { kt_c };
+            (kt_b, kt_c, kt_d)
+        };
+        let spline = |fraction: f32| {
+            let (kt_b, kt_c, kt_d) = recovered();
+            let fraction = fraction.clamp(0.0, 1.0);
+            let inverse = 1.0 - fraction;
+            let start_point = (kt_b + kt_c) * 0.5;
+            let end_point = (kt_c + kt_d) * 0.5;
+            inverse * inverse * start_point
+                + 2.0 * inverse * fraction * kt_c
+                + fraction * fraction * end_point
+        };
+
+        let mean_preservation_factor = if value_c > 5.0 {
+            let count = pos_c - missing + 1;
+            let mean = (missing..=pos_c)
+                .map(|target| {
+                    let fraction = (target - pos_b) as f32 / width as f32;
+                    spline(fraction).max(0.0) * solar[target]
+                })
+                .sum::<f32>();
+            if mean <= 5.0 {
+                0.0
+            } else {
+                value_c / mean * count as f32
+            }
+        } else {
+            1.0
+        };
+
+        for target in missing..=pos_c {
+            let fraction = (target - pos_b) as f32 / width as f32;
+            values[target] = spline(fraction).max(0.0) * solar[target] * mean_preservation_factor;
         }
-        values[pos_c] = official_max_zero(kt_c) * solar_c;
     }
 }
 
@@ -11246,30 +11247,53 @@ mod tests {
     }
 
     #[test]
-    fn ecmwf_first_stage_matches_captured_official_sparse_solar_transition() {
-        let start = Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap();
-        let mut values = vec![f32::NAN; 55];
+    fn ecmwf_solar_transition_matches_frozen_2026080400_official_point() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 4, 3, 0, 0).unwrap();
+        let mut values = vec![f32::NAN; 61];
         for (hour, value) in [
-            (132, 510.0),
-            (135, 42.0),
+            (129, 13.0),
+            (132, 5.0),
+            (135, 0.0),
             (138, 0.0),
             (141, 0.0),
-            (144, 0.0),
-            (150, 269.0),
-            (156, 568.0),
-            (162, 19.0),
+            (144, 151.0),
+            (150, 555.0),
+            (156, 142.0),
+            (162, 0.0),
+            (168, 110.0),
+            (174, 395.0),
+            (180, 85.0),
         ] {
-            values[hour / 3] = value;
+            values[(hour - 3) / 3] = value;
         }
 
-        interpolate_solar_backwards_with_dt_in_place(&mut values, start, 3 * 3600, 0.0, 70.0);
+        interpolate_solar_backwards_with_dt_in_place(&mut values, start, 3 * 3600, 20.0, 134.0);
+        for value in values.iter_mut().filter(|value| value.is_finite()) {
+            *value = round_to_scalefactor(*value, 1.0);
+        }
+        let times = (0..values.len())
+            .map(|index| start + Duration::hours(index as i64 * 3))
+            .collect::<Vec<_>>();
+        let hourly = (141..=156)
+            .map(|hour| {
+                ecmwf_second_stage_value(
+                    &values,
+                    &times,
+                    InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 },
+                    Utc.with_ymd_and_hms(2026, 8, 4, 0, 0, 0).unwrap() + Duration::hours(hour),
+                    20.0,
+                    134.0,
+                    3600,
+                )
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            values[44..=54]
-                .iter()
-                .map(|value| round_to_scalefactor(*value, 1.0))
-                .collect::<Vec<_>>(),
-            vec![510.0, 42.0, 0.0, 0.0, 0.0, 70.0, 468.0, 677.0, 466.0, 50.0, 0.0]
+            hourly,
+            vec![
+                2.0, 63.0, 154.0, 271.0, 414.0, 540.0, 609.0, 624.0, 593.0, 528.0, 425.0, 285.0,
+                130.0, 15.0, 0.0, 0.0,
+            ]
         );
     }
 

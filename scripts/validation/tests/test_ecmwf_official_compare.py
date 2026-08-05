@@ -479,7 +479,7 @@ class EcmwfOfficialCompareTests(unittest.TestCase):
         self.assertEqual(len(catalog.AVAILABLE_VARIABLES), 261)
         self.assertEqual(
             catalog.OPEN_METEO_UPSTREAM_BASELINE,
-            "acfe608b825da1a8b42a755297eb61121986e9da",
+            "fc670930b55c963b10e9578c8628a824da43a3ab",
         )
         self.assertEqual(
             config["open_meteo_upstream_baseline"],

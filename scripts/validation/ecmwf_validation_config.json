@@ -74,7 +74,7 @@
     "precipitation",
     "runoff"
   ],
-  "open_meteo_upstream_baseline": "acfe608b825da1a8b42a755297eb61121986e9da",
+  "open_meteo_upstream_baseline": "fc670930b55c963b10e9578c8628a824da43a3ab",
   "variable_catalog": {
     "schema_version": 1,
     "hourly_sha256": "71cfa7319f4026aa85a35ff6a0cc3a323ea094286117646b2ca99b9f16399531",

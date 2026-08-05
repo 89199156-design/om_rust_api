@@ -442,6 +442,65 @@ pub fn extra_terrestrial_radiation_factor_backwards(
     backwards_sun_elevation(geometry, false) / (sun_radius * sun_radius)
 }
 
+/// Backwards-averaged Haurwitz clear-sky solar factor used by current
+/// Open-Meteo sparse-radiation interpolation. The attenuation term has no
+/// closed-form integral, so the official Swift implementation uses a
+/// three-point Gauss-Legendre quadrature over the daylight part of the step.
+pub fn clear_sky_radiation_factor_backwards(
+    timestamp: DateTime<Utc>,
+    dt_seconds: i64,
+    latitude: f32,
+    longitude: f32,
+) -> f32 {
+    let position = sun_position(timestamp);
+    let ut = hour_with_fraction(timestamp);
+    let t1 = radians(90.0 - position.declination_degrees);
+    let p1 = radians(-15.0 * (ut - 12.0 + position.equation_of_time_hours));
+    let ut0 = ut - dt_seconds as f32 / 3600.0;
+    let p10 = radians(-15.0 * (ut0 - 12.0 + position.equation_of_time_hours));
+    let t0 = radians(90.0 - latitude);
+    let mut p0 = radians(longitude);
+    if p0 < p1 - PI {
+        p0 += 2.0 * PI;
+    }
+    if p0 > p1 + PI {
+        p0 -= 2.0 * PI;
+    }
+
+    let a = t0.cos() * t1.cos();
+    let b = t0.sin() * t1.sin();
+    let arg = -a / b;
+    if arg >= 1.0 {
+        return 0.0;
+    }
+    let carg = if arg <= -1.0 { PI } else { arg.acos() };
+    let low = p1.max(p0 - carg);
+    let high = p10.min(p0 + carg);
+    if low >= high {
+        return 0.0;
+    }
+
+    let integrand = |p: f32| {
+        let mu = a + b * (p - p0).cos();
+        if mu < 0.005 {
+            0.0
+        } else {
+            mu * (-0.057 / mu).exp()
+        }
+    };
+    let center = (low + high) * 0.5;
+    let half_width = (high - low) * 0.5;
+    let sample_offset = half_width * 0.77459667;
+    let step_width = p10 - p1;
+    let seconds = timestamp.timestamp().rem_euclid(SECONDS_PER_AVERAGE_YEAR) as f32;
+    let day = seconds / SECONDS_PER_DAY as f32 - 4.0 + 1.0;
+    let sun_radius = 1.0 - 0.01672 * radians((360.0 / 365.256_38) * day).cos();
+    half_width
+        * ((5.0 / 9.0) * (integrand(center - sample_offset) + integrand(center + sample_offset))
+            + (8.0 / 9.0) * integrand(center))
+        / (sun_radius * sun_radius * step_width)
+}
+
 pub fn is_day(timestamp: DateTime<Utc>, latitude: f32, longitude: f32) -> f32 {
     let universal_offset = (longitude / 15.0 * 3600.0) as i64;
     let local_midnight = (timestamp.timestamp() + universal_offset).div_euclid(SECONDS_PER_DAY)
@@ -564,6 +623,26 @@ mod tests {
             )
             .to_bits()
         );
+    }
+
+    #[test]
+    fn clear_sky_radiation_matches_official_three_hour_reference() {
+        let start = Utc.with_ymd_and_hms(2022, 8, 17, 3, 0, 0).unwrap();
+        let expected = [
+            0.0, 28.426155, 427.56738, 776.82776, 744.33136, 349.47205, 7.9511237, 0.0,
+        ];
+        for (index, expected) in expected.into_iter().enumerate() {
+            let actual = clear_sky_radiation_factor_backwards(
+                start + chrono::Duration::hours(index as i64 * 3),
+                3 * 3600,
+                47.0,
+                4.5,
+            ) * 1098.0;
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "index={index} actual={actual:?} expected={expected:?}"
+            );
+        }
     }
 
     #[test]
