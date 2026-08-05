@@ -380,13 +380,13 @@ struct Args {
     top_lat: f64,
     #[arg(long, default_value_t = 2, env = "OM_WEBP_WORKERS")]
     workers: usize,
-    #[arg(long, default_value_t = 24, env = "OM_WEBP_SERIES_BLOCK_HOURS")]
+    #[arg(long, default_value_t = 6, env = "OM_WEBP_SERIES_BLOCK_HOURS")]
     series_block_hours: usize,
     #[arg(long)]
     layers: Option<String>,
     #[arg(long)]
     public_root: Option<PathBuf>,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 1)]
     keep_releases: usize,
 }
 
@@ -708,6 +708,7 @@ fn estimate_staging_bytes(grid_points: usize, layers: usize, frames: usize) -> R
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_strict_data_layout(&args.strict_data_root, &[&args.output_root])?;
+    prune_stale_staging(&args.output_root, args.scope)?;
     let workers = if args.workers == 0 {
         std::thread::available_parallelism()
             .map(usize::from)
@@ -730,6 +731,7 @@ fn main() -> Result<()> {
         &ready.latest_complete_run,
         &selected,
     )? {
+        prune_releases(&args.output_root, args.scope, args.keep_releases.max(1))?;
         println!("{{\"status\":\"skipped\",\"reason\":\"release already rendered\",\"scope\":\"{}\",\"release_id\":\"{}\"}}", args.scope.group(), ready.release_id);
         return Ok(());
     }
@@ -1446,12 +1448,27 @@ fn prune_releases(output_root: &Path, scope: Scope, keep: usize) -> Result<()> {
     if !releases.exists() {
         return Ok(());
     }
+    let current_release = output_root
+        .join("current")
+        .join(format!("{}.json", scope.name()));
+    let current_release = fs::read(&current_release)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(PathBuf::from)
+        });
     let mut candidates = fs::read_dir(&releases)?
         .filter_map(Result::ok)
         .filter(|entry| entry.path().join(scope.product_dir()).exists())
         .collect::<Vec<_>>();
     candidates.sort_by_key(|entry| {
-        std::cmp::Reverse(entry.metadata().and_then(|meta| meta.modified()).ok())
+        (
+            current_release.as_ref() != Some(&entry.path()),
+            std::cmp::Reverse(entry.metadata().and_then(|meta| meta.modified()).ok()),
+        )
     });
     for entry in candidates.into_iter().skip(keep) {
         fs::remove_dir_all(entry.path())?;
@@ -1459,9 +1476,81 @@ fn prune_releases(output_root: &Path, scope: Scope, keep: usize) -> Result<()> {
     Ok(())
 }
 
+fn prune_stale_staging(output_root: &Path, scope: Scope) -> Result<()> {
+    let staging = output_root.join("staging");
+    if !staging.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(staging)?.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.join(scope.product_dir()).exists() {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_defaults_bound_memory_and_retain_only_current_release() {
+        let args = Args::try_parse_from([
+            "om-webp",
+            "--scope",
+            "gfs",
+            "--decoder-lib",
+            "libomfileformat.so",
+        ])
+        .unwrap();
+        assert_eq!(args.series_block_hours, 6);
+        assert_eq!(args.keep_releases, 1);
+    }
+
+    #[test]
+    fn release_pruning_protects_the_published_scope_and_ignores_other_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let releases = root.path().join("releases");
+        let published = releases.join("published-gfs");
+        let obsolete = releases.join("newer-but-obsolete-gfs");
+        let cams = releases.join("cams-release");
+        fs::create_dir_all(published.join(Scope::Gfs.product_dir())).unwrap();
+        fs::create_dir_all(obsolete.join(Scope::Gfs.product_dir())).unwrap();
+        fs::create_dir_all(cams.join(Scope::Cams.product_dir())).unwrap();
+        fs::create_dir_all(root.path().join("current")).unwrap();
+        fs::write(
+            root.path().join("current/gfs.json"),
+            serde_json::to_vec(&serde_json::json!({"path": published})).unwrap(),
+        )
+        .unwrap();
+
+        prune_releases(root.path(), Scope::Gfs, 1).unwrap();
+
+        assert!(published.exists());
+        assert!(!obsolete.exists());
+        assert!(cams.exists());
+    }
+
+    #[test]
+    fn startup_prunes_only_interrupted_staging_for_the_requested_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let gfs = root
+            .path()
+            .join("staging/interrupted-gfs")
+            .join(Scope::Gfs.product_dir());
+        let cams = root
+            .path()
+            .join("staging/interrupted-cams")
+            .join(Scope::Cams.product_dir());
+        fs::create_dir_all(&gfs).unwrap();
+        fs::create_dir_all(&cams).unwrap();
+
+        prune_stale_staging(root.path(), Scope::Gfs).unwrap();
+
+        assert!(!gfs.parent().unwrap().exists());
+        assert!(cams.exists());
+    }
 
     #[test]
     fn singapore_grid_matches_production_manifest() {
