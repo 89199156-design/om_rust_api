@@ -20,6 +20,7 @@ const GFS025_HSURF_RELATIVE_PATH: &str = "static/ncep_gfs025/HSURF.om";
 const GFS025_HSURF_BYTES: u64 = 408_440;
 const GFS025_HSURF_SHA256: &str =
     "fdd9587e606e64d6d85474c703b9898669d230aac1574fc460cc3087227e868d";
+const ECMWF_GEOPOTENTIAL_HEIGHT_SOURCE: &str = "z_div_9.80665";
 
 #[derive(Debug, Deserialize)]
 struct NativeReady {
@@ -50,6 +51,8 @@ struct NativeReady {
     source_run_roles: Vec<String>,
     #[serde(default)]
     nan_fallback_depth: Option<usize>,
+    #[serde(default)]
+    geopotential_height_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +67,8 @@ struct NativeProductReady {
     right_interpolation_support: Option<NativeRightInterpolationSupportReady>,
     #[serde(default)]
     gust_interpolation_support: Option<NativeEcmwfGustInterpolationSupportReady>,
+    #[serde(default)]
+    geopotential_height_source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +119,8 @@ struct NativeRunMeta {
     variables: Vec<String>,
     #[serde(deserialize_with = "deserialize_utc_datetimes")]
     valid_times: Vec<DateTime<Utc>>,
+    #[serde(default)]
+    geopotential_height_source: Option<String>,
 }
 
 fn deserialize_utc_datetimes<'de, D>(
@@ -811,6 +818,7 @@ fn load_native_product_run(
     if meta.reference_time != reference_time {
         bail!("native run reference time mismatch: {source_run}");
     }
+    validate_native_run_provenance(ready, product_ready, &meta)?;
     let public_horizon = run_horizon(ready, product, product_ready, source_run)?;
     validate_run_time_axis(&product_ready.runtime_domain, &meta, public_horizon)?;
 
@@ -1049,11 +1057,9 @@ fn validate_native_ecmwf_gust_interpolation_support_contract(
     product_ready: &NativeProductReady,
     latest_reference: DateTime<Utc>,
 ) -> Result<()> {
+    let requires_gust_support = matches!(ready.native_producer_contract, Some(5..=6));
     let Some(support) = &product_ready.gust_interpolation_support else {
-        if group == "ecmwf"
-            && product == "ecmwf_ifs025"
-            && ready.native_producer_contract == Some(5)
-        {
+        if group == "ecmwf" && product == "ecmwf_ifs025" && requires_gust_support {
             bail!("native ECMWF deterministic product has no gust interpolation support");
         }
         return Ok(());
@@ -1064,8 +1070,8 @@ fn validate_native_ecmwf_gust_interpolation_support_contract(
     {
         bail!("native ECMWF gust interpolation support is declared on the wrong product");
     }
-    if ready.native_producer_contract != Some(5) {
-        bail!("native ECMWF gust interpolation support requires producer contract 5");
+    if !requires_gust_support {
+        bail!("native ECMWF gust interpolation support requires producer contract 5 or 6");
     }
     if support.variable != "wind_gusts_10m" {
         bail!("native ECMWF gust interpolation support variable is invalid");
@@ -1090,6 +1096,20 @@ fn validate_native_ecmwf_gust_interpolation_support_contract(
         if file.source_run != *expected_run || file.file_path != expected_path {
             bail!("native ECMWF gust interpolation support file contract is invalid");
         }
+    }
+    Ok(())
+}
+
+fn validate_native_run_provenance(
+    ready: &NativeReady,
+    product_ready: &NativeProductReady,
+    meta: &NativeRunMeta,
+) -> Result<()> {
+    if ready.native_producer_contract == Some(6)
+        && product_ready.runtime_domain == "ecmwf_ifs025"
+        && meta.geopotential_height_source.as_deref() != Some(ECMWF_GEOPOTENTIAL_HEIGHT_SOURCE)
+    {
+        bail!("native ECMWF deterministic run does not use pinned z / 9.80665 geopotential height");
     }
     Ok(())
 }
@@ -1194,7 +1214,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
                 2,
             )
         };
-        if !matches!(ready.native_producer_contract, Some(4 | 5))
+        if !matches!(ready.native_producer_contract, Some(4..=6))
             || ready.nan_fallback_depth != Some(1)
             || ready.short_run_count != Some(expected_short)
             || ready.full_run_count != Some(expected_full)
@@ -1202,6 +1222,20 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
             || ready.source_run_roles != expected_roles
         {
             bail!("native ECMWF marker does not match the official one-level fallback contract");
+        }
+        if ready.native_producer_contract == Some(6) {
+            let deterministic = ready
+                .products
+                .get("ecmwf_ifs025")
+                .context("native ECMWF marker has no deterministic product")?;
+            if ready.geopotential_height_source.as_deref() != Some(ECMWF_GEOPOTENTIAL_HEIGHT_SOURCE)
+                || deterministic.geopotential_height_source.as_deref()
+                    != Some(ECMWF_GEOPOTENTIAL_HEIGHT_SOURCE)
+            {
+                bail!(
+                    "native ECMWF contract 6 does not declare pinned z / 9.80665 geopotential height"
+                );
+            }
         }
     }
     if group == "cams" && ready.products.contains_key("cams_global_greenhouse_gases") {
@@ -1535,6 +1569,7 @@ mod tests {
                 .iter()
                 .map(|hour| reference_time + Duration::hours(*hour))
                 .collect(),
+            geopotential_height_source: None,
         };
         assert_eq!(
             native_time_indices("ncep_gfs013", "temperature_2m", &meta, 209).unwrap(),
@@ -1551,6 +1586,7 @@ mod tests {
             valid_times: (0..=384)
                 .map(|hour| reference_time + Duration::hours(hour))
                 .collect(),
+            geopotential_height_source: None,
         };
         assert_eq!(
             native_time_indices("ncep_gfs013", "temperature_2m", &meta, 385).unwrap(),
@@ -1568,6 +1604,7 @@ mod tests {
             valid_times: (0..=120)
                 .map(|hour| reference_time + Duration::hours(hour))
                 .collect(),
+            geopotential_height_source: None,
         };
         assert_eq!(
             native_time_indices("cams_global", "dust", &meta, 41).unwrap(),
@@ -1672,6 +1709,7 @@ mod tests {
                 .iter()
                 .map(|hour| reference_time + Duration::hours(*hour))
                 .collect(),
+            geopotential_height_source: None,
         };
         let allowed_meta_indices = hours
             .iter()
@@ -1938,8 +1976,8 @@ mod tests {
 
     #[test]
     fn ecmwf_deterministic_runs_use_group_specific_horizons() {
-        let ready: NativeReady = serde_json::from_value(json!({
-            "native_producer_contract": 5,
+        let marker = json!({
+            "native_producer_contract": 6,
             "status": "complete",
             "runtime_format": "openmeteo-native-v1",
             "group": "ecmwf",
@@ -1960,6 +1998,7 @@ mod tests {
                 "target"
             ],
             "nan_fallback_depth": 1,
+            "geopotential_height_source": "z_div_9.80665",
             "public_start_utc": "2026-07-29T16:00:00Z",
             "generated_at": "2026-07-30T04:00:00Z",
             "local_utc_offset_hours": 8,
@@ -1969,6 +2008,7 @@ mod tests {
             "products": {
                 "ecmwf_ifs025": {
                     "runtime_domain": "ecmwf_ifs025",
+                    "geopotential_height_source": "z_div_9.80665",
                     "gust_interpolation_support": {
                         "variable": "wind_gusts_10m",
                         "source_runs": [
@@ -1996,8 +2036,8 @@ mod tests {
                 }
             },
             "source_run_max_forecast_hours": [360, 144, 360, 144, 360]
-        }))
-        .unwrap();
+        });
+        let ready: NativeReady = serde_json::from_value(marker.clone()).unwrap();
         let product = ready.products.get("ecmwf_ifs025").unwrap();
 
         assert_eq!(
@@ -2013,6 +2053,58 @@ mod tests {
             360
         );
         validate_ready(&ready, "ecmwf").unwrap();
+
+        let mut missing_marker_provenance = marker.clone();
+        missing_marker_provenance
+            .as_object_mut()
+            .unwrap()
+            .remove("geopotential_height_source");
+        let missing: NativeReady = serde_json::from_value(missing_marker_provenance).unwrap();
+        assert!(validate_ready(&missing, "ecmwf").is_err());
+
+        let mut wrong_product_provenance = marker;
+        wrong_product_provenance["products"]["ecmwf_ifs025"]["geopotential_height_source"] =
+            json!("gh_direct");
+        let wrong: NativeReady = serde_json::from_value(wrong_product_provenance).unwrap();
+        assert!(validate_ready(&wrong, "ecmwf").is_err());
+    }
+
+    #[test]
+    fn ecmwf_contract_six_requires_pinned_run_provenance() {
+        let ready: NativeReady = serde_json::from_value(json!({
+            "native_producer_contract": 6,
+            "status": "complete",
+            "runtime_format": "openmeteo-native-v1",
+            "group": "ecmwf",
+            "coverage_id": "ecmwf_native_2026080400",
+            "latest_complete_run": "2026080400",
+            "source_runs": [],
+            "public_start_utc": "2026-08-03T16:00:00Z",
+            "coverage_path": "coverages/ecmwf/ecmwf_native_2026080400",
+            "products": {}
+        }))
+        .unwrap();
+        let product: NativeProductReady = serde_json::from_value(json!({
+            "runtime_domain": "ecmwf_ifs025",
+            "grid": {
+                "nx": 297, "ny": 249,
+                "lon_min": 68.0, "lat_min": -2.0,
+                "dx": 0.25, "dy": 0.25,
+                "dt_seconds": 10800,
+                "om_file_length": 104
+            }
+        }))
+        .unwrap();
+        let reference_time = "2026-08-04T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let mut meta = NativeRunMeta {
+            reference_time,
+            variables: vec!["geopotential_height_500hPa".to_string()],
+            valid_times: vec![reference_time],
+            geopotential_height_source: Some("z_div_9.80665".to_string()),
+        };
+        validate_native_run_provenance(&ready, &product, &meta).unwrap();
+        meta.geopotential_height_source = None;
+        assert!(validate_native_run_provenance(&ready, &product, &meta).is_err());
     }
 
     #[test]
