@@ -5,8 +5,7 @@ use image::codecs::webp::WebPEncoder;
 use image::{ExtendedColorType, ImageEncoder};
 use om_api::official::OfficialDecoder;
 use om_api::query::{
-    read_variable_grid_series, round_variable_output_value, with_ecmwf_request_cache,
-    with_weather_model, WeatherModel,
+    read_variable_grid_series, round_variable_output_value, with_weather_model, WeatherModel,
 };
 use om_api::snapshot::OmDataSnapshot;
 use rayon::prelude::*;
@@ -1139,19 +1138,20 @@ fn read_layer_grid_series(
     grid: &RegionGrid,
     tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<f32>>> {
-    // The ECMWF regular-series cache can retain roughly one full regional
-    // forecast per raw dependency. Keep it scoped to one output layer so a
-    // WebP block does not pin every source variable at once.
-    let values = with_ecmwf_request_cache(|| {
-        read_variable_grid_series(
-            snapshot,
-            decoder,
-            variable,
-            times,
-            &grid.latitudes,
-            &grid.longitudes,
-        )
-    });
+    // Do not enable the point-API request cache for regional rendering. A
+    // derived layer such as ECMWF weather_code reads several raw dependencies;
+    // caching them for the whole derived request pins multiple complete
+    // regional forecasts at once and exceeds small production hosts. Each
+    // direct series read already decodes its native time slab once, so keeping
+    // dependencies strictly sequential bounds the renderer's peak memory.
+    let values = read_variable_grid_series(
+        snapshot,
+        decoder,
+        variable,
+        times,
+        &grid.latitudes,
+        &grid.longitudes,
+    );
     match values {
         Ok(mut series) => {
             for values in &mut series {
