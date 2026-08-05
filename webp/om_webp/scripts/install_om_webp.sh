@@ -90,7 +90,7 @@ if [[ ! "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 
-cargo build --release \
+OM_BUILD_REVISION="$SOURCE_REVISION" cargo build --release \
   --manifest-path "$REPOSITORY_ROOT/webp/om_webp/Cargo.toml" \
   --target-dir "$BUILD_TARGET_DIR" \
   --bin om-webp \

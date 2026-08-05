@@ -16,7 +16,7 @@ case "$requested_scope" in
   ecmwf_ifs025|ecmwf|ec)
     scope="ecmwf_ifs025"
     ready_group="ecmwf"
-    default_workers=1
+    default_workers=2
     ;;
   *) echo "invalid scope: $requested_scope" >&2; exit 2 ;;
 esac

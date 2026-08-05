@@ -15,11 +15,11 @@ Each source `release_id` is built under the configured WebP staging directory. A
 
 Production model tasks invoke WebP only after the matching OM batch is fully validated and published. The disabled legacy 1Panel WebP rows remain non-rendering historical records; there is no polling renderer or shadow release path.
 
-The production inventory renders model-specific GFS, ECMWF and CAMS layers for the configured first 121 forecast frames. Lossless RGBA WebP encoding and scalar/vector contracts are shared by both servers.
+The production inventory renders model-specific GFS, ECMWF and CAMS layers for the configured first 121 forecast frames. Lossless RGBA WebP encoding and scalar/vector contracts are shared by both servers. Current markers and product manifests include the renderer Git revision, so a production code upgrade rebuilds the same OM release instead of incorrectly skipping it.
 
 ## Runtime
 
-`read_variable_grid` decodes the required regional OM rectangle in native calls and then applies the same interpolation, derived-variable formulas and output precision as the point API. Workers are bounded for lightweight servers; `OM_WEBP_WORKERS` can override the deployment default.
+`read_variable_grid_series` decodes each distinct source dependency once for the complete 121-frame output window, then all layers sharing that source are quantized and written in bounded six-frame encoding blocks. This avoids rebuilding native ECMWF run stitching for every block while keeping RGBA buffers bounded. Two workers are used by default for GFS, ECMWF and CAMS; `OM_WEBP_WORKERS` can override the deployment default.
 
 The progress reporter is part of this WebP component at `scripts/task_progress_reporter.py`; the renderer does not depend on an external downloader repository.
 

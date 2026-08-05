@@ -21,6 +21,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const WEBP_CONTRACT_VERSION: u32 = 2;
+const RENDERER_REVISION: &str = match option_env!("OM_BUILD_REVISION") {
+    Some(revision) => revision,
+    None => "unversioned",
+};
 const GFS_100_TO_120_WIND_SCALE: f32 = 1.020_684_4;
 
 const GFS_LAYERS: &[Layer] = &[
@@ -571,6 +575,7 @@ struct DataAttribution {
 #[derive(Debug, Serialize)]
 struct ProductManifest {
     generated_at: i64,
+    renderer_revision: String,
     source: String,
     source_release_id: String,
     source_run: String,
@@ -729,6 +734,7 @@ fn main() -> Result<()> {
         &ready.release_id,
         &ready.latest_complete_run,
         &selected,
+        RENDERER_REVISION,
     )? {
         prune_releases(&args.output_root, args.scope, args.keep_releases.max(1))?;
         println!("{{\"status\":\"skipped\",\"reason\":\"release already rendered\",\"scope\":\"{}\",\"release_id\":\"{}\"}}", args.scope.group(), ready.release_id);
@@ -782,58 +788,82 @@ fn main() -> Result<()> {
         bail!("--series-block-hours must be positive");
     }
     let total_invalid = std::sync::atomic::AtomicUsize::new(0);
-    for (block_index, block_times) in times.chunks(args.series_block_hours).enumerate() {
-        let rendered = pool.install(|| {
-            with_weather_model(args.scope.weather_model(), || {
-                render_series_block(
-                    &snapshot,
-                    &decoder,
-                    &grid,
-                    &selected,
-                    block_times,
-                    args.scope.tolerate_unavailable_layers(),
-                )
-            })
-        })?;
-        for (offset, layers) in rendered.into_iter().enumerate() {
-            let frame_index = block_index * args.series_block_hours + offset;
-            let time = block_times[offset];
-            let stem = format!("{}_{}", time.timestamp(), batch);
-            for layer in layers {
-                ensure_free_space(
-                    &args.output_root,
-                    args.minimum_free_bytes,
-                    layer.bytes.len() as u64,
-                )?;
-                written_bytes += layer.bytes.len() as u64;
-                fs::write(
-                    product_staging
-                        .join(layer.layer_name)
-                        .join(format!("{stem}.webp")),
-                    layer.bytes,
-                )?;
-                total_invalid.fetch_add(layer.invalid_points, std::sync::atomic::Ordering::Relaxed);
-            }
-            let progress_elapsed = last_progress_at.elapsed();
-            if progress_elapsed.as_secs() >= 60 {
-                let growth_bytes = written_bytes.saturating_sub(last_progress_bytes);
-                let speed_mib_s = growth_bytes as f64
-                    / progress_elapsed.as_secs_f64().max(0.001)
-                    / 1024.0
-                    / 1024.0;
+    let mut completed_images = 0_usize;
+    let layer_groups = group_layers_by_source(&selected);
+    pool.install(|| {
+        with_weather_model(args.scope.weather_model(), || {
+            for (group_index, layers) in layer_groups.iter().enumerate() {
+                let source_layer = layers[0];
+                let group_started = Instant::now();
                 println!(
-                    "进度｜阶段：生成 WebP｜类型：{}｜批次：{}｜帧：{}/{}｜近一分钟增长：{:.1} MiB｜速度：{:.2} MiB/s",
+                    "进度｜阶段：读取 OM｜类型：{}｜批次：{}｜源组：{}/{}｜变量：{}",
                     args.scope.group().to_uppercase(),
                     ready.latest_complete_run,
-                    frame_index + 1,
-                    times.len(),
-                    growth_bytes as f64 / 1024.0 / 1024.0,
-                    speed_mib_s
+                    group_index + 1,
+                    layer_groups.len(),
+                    source_layer.variable,
                 );
-                last_progress_at = Instant::now();
-                last_progress_bytes = written_bytes;
+                let values = read_layer_grid_series(
+                    &snapshot,
+                    &decoder,
+                    source_layer.variable,
+                    &times,
+                    &grid,
+                    args.scope.tolerate_unavailable_layers(),
+                )?;
+                let values_v = match source_layer.variable_v {
+                    Some(variable) => Some(read_layer_grid_series(
+                        &snapshot,
+                        &decoder,
+                        variable,
+                        &times,
+                        &grid,
+                        args.scope.tolerate_unavailable_layers(),
+                    )?),
+                    None => None,
+                };
+                for layer in layers {
+                    write_layer_series(
+                        &grid,
+                        layer,
+                        &times,
+                        &values,
+                        values_v.as_deref(),
+                        args.series_block_hours,
+                        &args.output_root,
+                        &product_staging,
+                        args.minimum_free_bytes,
+                        batch,
+                        selected.len(),
+                        &mut completed_images,
+                        &mut written_bytes,
+                        &total_invalid,
+                        &mut last_progress_at,
+                        &mut last_progress_bytes,
+                        args.scope,
+                        &ready.latest_complete_run,
+                    )?;
+                }
+                println!(
+                    "进度｜阶段：完成源组｜类型：{}｜批次：{}｜源组：{}/{}｜变量：{}｜耗时：{:.3}s",
+                    args.scope.group().to_uppercase(),
+                    ready.latest_complete_run,
+                    group_index + 1,
+                    layer_groups.len(),
+                    source_layer.variable,
+                    group_started.elapsed().as_secs_f64(),
+                );
             }
-        }
+            Ok(())
+        })
+    })?;
+
+    if completed_images != selected.len() * times.len() {
+        bail!(
+            "WebP image count mismatch: completed={} expected={}",
+            completed_images,
+            selected.len() * times.len()
+        );
     }
 
     let manifest = build_manifest(args.scope, &ready, &grid, &selected, &times);
@@ -1028,106 +1058,113 @@ fn encode_layer_values(
     })
 }
 
-fn render_series_block(
-    snapshot: &OmDataSnapshot,
-    decoder: &OfficialDecoder,
+fn group_layers_by_source(layers: &[Layer]) -> Vec<Vec<&Layer>> {
+    let mut groups: Vec<Vec<&Layer>> = Vec::new();
+    for layer in layers {
+        if let Some(group) = groups.iter_mut().find(|group| {
+            group[0].variable == layer.variable && group[0].variable_v == layer.variable_v
+        }) {
+            group.push(layer);
+        } else {
+            groups.push(vec![layer]);
+        }
+    }
+    groups
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_layer_series(
     grid: &RegionGrid,
-    layers: &[Layer],
+    layer: &Layer,
     times: &[DateTime<Utc>],
-    tolerate_unavailable: bool,
-) -> Result<Vec<Vec<RenderedLayer>>> {
-    let (weather_layers, regular_layers): (Vec<&Layer>, Vec<&Layer>) = layers
-        .iter()
-        .partition(|layer| !matches!(layer.derive, Derive::None));
-    let mut rendered = (0..times.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-    for layer in regular_layers {
-        let values = read_layer_grid_series(
-            snapshot,
-            decoder,
-            layer.variable,
-            times,
-            grid,
-            tolerate_unavailable,
-        )?;
-        let values_v = match layer.variable_v {
-            Some(variable) => Some(read_layer_grid_series(
-                snapshot,
-                decoder,
-                variable,
-                times,
-                grid,
-                tolerate_unavailable,
-            )?),
-            None => None,
-        };
-        let encoded = values
-            .par_iter()
+    values: &[Vec<f32>],
+    values_v: Option<&[Vec<f32>]>,
+    encode_block_frames: usize,
+    output_root: &Path,
+    product_staging: &Path,
+    minimum_free_bytes: u64,
+    batch: i64,
+    total_layers: usize,
+    completed_images: &mut usize,
+    written_bytes: &mut u64,
+    total_invalid: &std::sync::atomic::AtomicUsize,
+    last_progress_at: &mut Instant,
+    last_progress_bytes: &mut u64,
+    scope: Scope,
+    run: &str,
+) -> Result<()> {
+    if values.len() != times.len() {
+        bail!(
+            "source series length mismatch for {}: values={} times={}",
+            layer.name,
+            values.len(),
+            times.len()
+        );
+    }
+    if let Some(values_v) = values_v {
+        if values_v.len() != times.len() {
+            bail!(
+                "vector source series length mismatch for {}: values_v={} times={}",
+                layer.name,
+                values_v.len(),
+                times.len()
+            );
+        }
+    }
+    for block_start in (0..times.len()).step_by(encode_block_frames) {
+        let block_end = (block_start + encode_block_frames).min(times.len());
+        let encoded = (block_start..block_end)
+            .into_par_iter()
             .enumerate()
-            .map(|(index, values)| {
+            .map(|(_, index)| {
                 encode_layer_values(
                     grid,
                     layer,
-                    values,
+                    &values[index],
                     values_v.as_ref().map(|series| series[index].as_slice()),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        for (frame, layer) in rendered.iter_mut().zip(encoded) {
-            frame.push(layer);
-        }
-    }
-    if !weather_layers.is_empty() {
-        let weather_codes = read_layer_grid_series(
-            snapshot,
-            decoder,
-            weather_layers[0].variable,
-            times,
-            grid,
-            tolerate_unavailable,
-        )?;
-        for layer in weather_layers {
-            let encoded = weather_codes
-                .par_iter()
-                .map(|values| encode_cached_scalar_layer(grid, layer, values))
-                .collect::<Result<Vec<_>>>()?;
-            for (frame, layer) in rendered.iter_mut().zip(encoded) {
-                frame.push(layer);
+        for (offset, rendered) in encoded.into_iter().enumerate() {
+            let frame_index = block_start + offset;
+            let stem = format!("{}_{}", times[frame_index].timestamp(), batch);
+            ensure_free_space(output_root, minimum_free_bytes, rendered.bytes.len() as u64)?;
+            *written_bytes += rendered.bytes.len() as u64;
+            fs::write(
+                product_staging
+                    .join(rendered.layer_name)
+                    .join(format!("{stem}.webp")),
+                rendered.bytes,
+            )?;
+            total_invalid.fetch_add(
+                rendered.invalid_points,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            *completed_images += 1;
+            let progress_elapsed = last_progress_at.elapsed();
+            if progress_elapsed.as_secs() >= 60 {
+                let growth_bytes = written_bytes.saturating_sub(*last_progress_bytes);
+                let speed_mib_s = growth_bytes as f64
+                    / progress_elapsed.as_secs_f64().max(0.001)
+                    / 1024.0
+                    / 1024.0;
+                let equivalent_frames = completed_images.div_ceil(total_layers).min(times.len());
+                println!(
+                    "进度｜阶段：生成 WebP｜类型：{}｜批次：{}｜帧：{}/{}｜图层：{}｜近一分钟增长：{:.1} MiB｜速度：{:.2} MiB/s",
+                    scope.group().to_uppercase(),
+                    run,
+                    equivalent_frames,
+                    times.len(),
+                    layer.name,
+                    growth_bytes as f64 / 1024.0 / 1024.0,
+                    speed_mib_s
+                );
+                *last_progress_at = Instant::now();
+                *last_progress_bytes = *written_bytes;
             }
         }
     }
-    Ok(rendered)
-}
-
-fn encode_cached_scalar_layer(
-    grid: &RegionGrid,
-    layer: &Layer,
-    values: &[f32],
-) -> Result<RenderedLayer> {
-    let mut rgba = vec![0u8; grid.len() * 4];
-    let invalid = std::sync::atomic::AtomicUsize::new(0);
-    rgba.par_chunks_mut(4)
-        .zip(values.par_iter())
-        .for_each(|(pixel, value)| {
-            encode_scalar(
-                pixel,
-                derive_value(*value, layer.derive) * layer.multiplier,
-                layer.vmin,
-                layer.scale,
-                &invalid,
-            );
-        });
-    let mut bytes = Vec::new();
-    WebPEncoder::new_lossless(&mut bytes).write_image(
-        &rgba,
-        grid.manifest.width as u32,
-        grid.manifest.height as u32,
-        ExtendedColorType::Rgba8,
-    )?;
-    Ok(RenderedLayer {
-        layer_name: layer.name,
-        bytes,
-        invalid_points: invalid.load(std::sync::atomic::Ordering::Relaxed),
-    })
+    Ok(())
 }
 
 fn read_layer_grid_series(
@@ -1138,12 +1175,10 @@ fn read_layer_grid_series(
     grid: &RegionGrid,
     tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<f32>>> {
-    // Do not enable the point-API request cache for regional rendering. A
-    // derived layer such as ECMWF weather_code reads several raw dependencies;
-    // caching them for the whole derived request pins multiple complete
-    // regional forecasts at once and exceeds small production hosts. Each
-    // direct series read already decodes its native time slab once, so keeping
-    // dependencies strictly sequential bounds the renderer's peak memory.
+    // Read every requested output frame once for this source dependency. The
+    // caller groups layers that share a source and encodes the returned frames
+    // in small blocks, avoiding both repeated native ECMWF regularization and
+    // the unbounded multi-dependency request cache used by the point API.
     let values = read_variable_grid_series(
         snapshot,
         decoder,
@@ -1269,6 +1304,7 @@ fn build_manifest(
         .collect();
     ProductManifest {
         generated_at: Utc::now().timestamp(),
+        renderer_revision: RENDERER_REVISION.to_string(),
         source: scope.name().to_string(),
         source_release_id: ready.release_id.clone(),
         source_run: ready.latest_complete_run.clone(),
@@ -1326,6 +1362,7 @@ fn publish_current(
             "run":ready.latest_complete_run,
             "path":release_root,
             "contract_version":WEBP_CONTRACT_VERSION,
+            "renderer_revision":RENDERER_REVISION,
             "layers":layers.iter().map(|layer| layer.name).collect::<Vec<_>>(),
         }))?,
     )?;
@@ -1419,7 +1456,13 @@ fn source_resolution(scope: Scope, name: &str) -> &'static str {
     }
 }
 
-fn marker_matches(path: &Path, release_id: &str, run: &str, layers: &[Layer]) -> Result<bool> {
+fn marker_matches(
+    path: &Path,
+    release_id: &str,
+    run: &str,
+    layers: &[Layer],
+    renderer_revision: &str,
+) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
@@ -1435,6 +1478,10 @@ fn marker_matches(path: &Path, release_id: &str, run: &str, layers: &[Layer]) ->
                 .get("contract_version")
                 .and_then(|value| value.as_u64())
                 == Some(u64::from(WEBP_CONTRACT_VERSION))
+            && value
+                .get("renderer_revision")
+                .and_then(|value| value.as_str())
+                == Some(renderer_revision)
             && value
                 .get("layers")
                 .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
@@ -1506,6 +1553,42 @@ mod tests {
         .unwrap();
         assert_eq!(args.series_block_hours, 6);
         assert_eq!(args.keep_releases, 1);
+    }
+
+    #[test]
+    fn layer_source_groups_reuse_shared_dependencies() {
+        let groups = group_layers_by_source(GFS_LAYERS);
+        let weather = groups
+            .iter()
+            .find(|group| group[0].variable == "weather_code")
+            .unwrap();
+        assert_eq!(
+            weather.iter().map(|layer| layer.name).collect::<Vec<_>>(),
+            vec!["precip_phase", "thunderstorm_code"]
+        );
+        assert!(groups.len() < GFS_LAYERS.len());
+    }
+
+    #[test]
+    fn current_marker_is_bound_to_the_renderer_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("gfs.json");
+        let layers = &GFS_LAYERS[..2];
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "release_id": "release-1",
+                "run": "2026080500",
+                "contract_version": WEBP_CONTRACT_VERSION,
+                "renderer_revision": "revision-1",
+                "layers": layers.iter().map(|layer| layer.name).collect::<Vec<_>>(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(marker_matches(&marker, "release-1", "2026080500", layers, "revision-1").unwrap());
+        assert!(!marker_matches(&marker, "release-1", "2026080500", layers, "revision-2").unwrap());
     }
 
     #[test]

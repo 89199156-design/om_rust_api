@@ -101,6 +101,11 @@ def load(path: Path) -> dict:
 
 def verify(args: argparse.Namespace) -> dict[str, object]:
     report: dict[str, object] = {"status": "success", "groups": {}}
+    renderer_revision = (
+        args.app_root / "source-revision"
+    ).read_text(encoding="utf-8").strip()
+    assert len(renderer_revision) == 40
+    assert all(character in "0123456789abcdef" for character in renderer_revision)
     catalog = load(args.public_root / "weather_layer_catalog.json")
     for group in args.scopes:
         expected = EXPECTED[group]
@@ -116,6 +121,7 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
         assert marker["status"] == "complete"
         assert marker["release_id"] == ready["release_id"]
         assert marker["run"] == ready["latest_complete_run"]
+        assert marker["renderer_revision"] == renderer_revision
         product_link = args.public_root / expected["product"]
         assert product_link.is_symlink()
         product_root = product_link.resolve(strict=True)
@@ -124,6 +130,7 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
         assert manifest["source"] == group
         assert manifest["source_release_id"] == ready["release_id"]
         assert manifest["source_run"] == ready["latest_complete_run"]
+        assert manifest["renderer_revision"] == renderer_revision
         assert manifest["frame_count"] == 121
         assert manifest["grid"]["width"] == 597
         assert manifest["grid"]["height"] == 495
@@ -161,6 +168,7 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
         report["groups"][group] = {
             "release_id": ready["release_id"],
             "run": ready["latest_complete_run"],
+            "renderer_revision": renderer_revision,
             "layers": len(expected["layers"]),
             "frames_per_layer": min(layer_counts.values()),
             "webp_files": sum(layer_counts.values()),

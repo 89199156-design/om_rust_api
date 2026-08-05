@@ -26,7 +26,8 @@ class WebpTaskGateTests(unittest.TestCase):
         )
         self.assertIn('export OM_DEM_ROOT="$dem_root"', content)
         self.assertIn('export OM_MODEL_STATIC_ROOT="$model_static_root"', content)
-        self.assertIn("default_workers=1", content)
+        self.assertEqual(content.count("default_workers=2"), 3)
+        self.assertNotIn("default_workers=1", content)
         self.assertIn('workers="${OM_WEBP_WORKERS:-$default_workers}"', content)
         self.assertIn(
             'minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"',
@@ -59,6 +60,7 @@ class WebpTaskGateTests(unittest.TestCase):
             "WebP data path is not on the strict data filesystem",
             content,
         )
+        self.assertIn('OM_BUILD_REVISION="$SOURCE_REVISION" cargo build --release', content)
 
     def test_standalone_tasks_are_disabled_and_do_not_render(self):
         for name, scope in (
