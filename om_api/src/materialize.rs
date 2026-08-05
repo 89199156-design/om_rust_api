@@ -759,14 +759,13 @@ fn load_group_release_candidates(data_root: &Path) -> Result<Vec<(Value, LegacyG
     let current = data_root.join("groups/gfs/current/ready_for_processing.json");
     if current.is_file() {
         if let Some(candidate) = load_group_release_candidate(&current)? {
-            // During deferred activation, a run that was formerly a full
-            // current release can already have a new immutable short-run
-            // identity in the exact three-short/two-full window. The retained
-            // release is authoritative for materialization; current remains
-            // only as the live rollback-safe API marker until publication.
+            // A live native current and a newly retained source release can
+            // legitimately represent different horizons of the same run.
+            // Keep distinct immutable identities available and let the frozen
+            // window select the exact required horizon below.
             if !releases
                 .iter()
-                .any(|(_, release)| release.latest_complete_run == candidate.1.latest_complete_run)
+                .any(|(_, release)| release.release_id == candidate.1.release_id)
             {
                 releases.push(candidate);
             }
@@ -818,78 +817,109 @@ pub fn default_gfs_coverage_id(latest_run: &str, producer_revision: &str) -> Res
     ))
 }
 
+fn select_exact_horizon_candidate(
+    run: &str,
+    expected_horizon: i64,
+    candidates: &[(i64, BTreeMap<String, String>)],
+) -> Result<usize> {
+    let matching = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (horizon, _))| (*horizon == expected_horizon).then_some(index))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        let available = candidates
+            .iter()
+            .map(|(horizon, _)| *horizon)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|horizon| horizon.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("GFS source {run} has available horizons [{available}], expected {expected_horizon}");
+    }
+    let identities = matching
+        .iter()
+        .map(|index| candidates[*index].1.clone())
+        .collect::<BTreeSet<_>>();
+    if identities.len() != 1 {
+        bail!(
+            "retained GFS run {run} has ambiguous source coverage identities for horizon {expected_horizon}"
+        );
+    }
+    Ok(matching[0])
+}
+
 fn load_legacy_sources(
     data_root: &Path,
     latest_run: &str,
 ) -> Result<(Vec<LegacySourceRun>, Value)> {
     let releases = load_group_release_candidates(data_root)?;
-    let matching_latest = releases
-        .iter()
-        .filter(|(_, release)| release.latest_complete_run == latest_run)
-        .collect::<Vec<_>>();
-    let (legacy_marker, _) = matching_latest
-        .first()
-        .copied()
-        .with_context(|| format!("missing retained GFS source release {latest_run}"))?;
-    let latest_identities = matching_latest
-        .iter()
-        .map(|(_, release)| release_coverage_ids(release))
-        .collect::<Result<BTreeSet<_>>>()?;
-    if latest_identities.len() != 1 {
-        bail!("retained GFS run {latest_run} has ambiguous source coverage identities");
-    }
-
     let mut sources = Vec::new();
+    let mut legacy_marker = None;
     for (run, reference_time, horizon) in expected_source_runs(latest_run)? {
         let candidates = releases
             .iter()
             .filter(|(_, release)| release.latest_complete_run == run)
             .collect::<Vec<_>>();
-        let (_, release) = candidates.first().copied().with_context(|| {
-                format!(
-                    "missing retained GFS source run {run}; frozen native publication requires three short and two full consecutive runs"
-                )
-            })?;
-        let identities = candidates
-            .iter()
-            .map(|(_, candidate)| release_coverage_ids(candidate))
-            .collect::<Result<BTreeSet<_>>>()?;
-        if identities.len() != 1 {
-            bail!("retained GFS run {run} has ambiguous source coverage identities");
+        if candidates.is_empty() {
+            bail!(
+                "missing retained GFS source run {run}; frozen native publication requires three short and two full consecutive runs"
+            );
         }
-        let mut products = HashMap::new();
-        let coverage_ids = release_coverage_ids(release)?;
-        for product in GFS_MATERIALIZED_PRODUCTS {
-            let ready = release
-                .product_manifests
-                .get(product)
-                .with_context(|| format!("GFS release {run} has no {product} manifest"))?;
-            let snapshot = Arc::new(load_product_snapshot_for_coverage(
-                data_root,
-                product,
-                &ready.coverage_id,
-            )?);
-            if snapshot
-                .bundle_file
-                .entries
-                .iter()
-                .any(|entry| entry.source_run != run)
-            {
+        let mut loaded = Vec::new();
+        for (marker, release) in candidates {
+            let mut products = HashMap::new();
+            let coverage_ids = release_coverage_ids(release)?;
+            let mut product_horizons = BTreeSet::new();
+            for product in GFS_MATERIALIZED_PRODUCTS {
+                let ready = release
+                    .product_manifests
+                    .get(product)
+                    .with_context(|| format!("GFS release {run} has no {product} manifest"))?;
+                let snapshot = Arc::new(load_product_snapshot_for_coverage(
+                    data_root,
+                    product,
+                    &ready.coverage_id,
+                )?);
+                if snapshot
+                    .bundle_file
+                    .entries
+                    .iter()
+                    .any(|entry| entry.source_run != run)
+                {
+                    bail!(
+                        "GFS source {run}/{product} contains fallback entries from another run; refusing to label it as frozen same-run native data"
+                    );
+                }
+                let max_hour = snapshot
+                    .bundle_file
+                    .entries
+                    .iter()
+                    .map(|entry| entry.forecast_hour)
+                    .max()
+                    .context("legacy GFS source has no frames")?;
+                product_horizons.insert(max_hour);
+                products.insert(product.to_string(), snapshot);
+            }
+            if product_horizons.len() != 1 {
                 bail!(
-                    "GFS source {run}/{product} contains fallback entries from another run; refusing to label it as frozen same-run native data"
+                    "GFS source {run} has inconsistent materialized-product horizons: {product_horizons:?}"
                 );
             }
-            let max_hour = snapshot
-                .bundle_file
-                .entries
-                .iter()
-                .map(|entry| entry.forecast_hour)
-                .max()
-                .context("legacy GFS source has no frames")?;
-            if max_hour != horizon {
-                bail!("GFS source {run}/{product} horizon is {max_hour}, expected {horizon}");
-            }
-            products.insert(product.to_string(), snapshot);
+            let actual_horizon = *product_horizons
+                .first()
+                .context("GFS release has no materialized products")?;
+            loaded.push((marker.clone(), actual_horizon, products, coverage_ids));
+        }
+        let descriptors = loaded
+            .iter()
+            .map(|(_, actual_horizon, _, coverage_ids)| (*actual_horizon, coverage_ids.clone()))
+            .collect::<Vec<_>>();
+        let selected = select_exact_horizon_candidate(&run, horizon, &descriptors)?;
+        let (marker, _, products, coverage_ids) = loaded.swap_remove(selected);
+        if run == latest_run {
+            legacy_marker = Some(marker);
         }
         sources.push(LegacySourceRun {
             run,
@@ -899,7 +929,11 @@ fn load_legacy_sources(
             coverage_ids,
         });
     }
-    Ok((sources, legacy_marker.clone()))
+    Ok((
+        sources,
+        legacy_marker
+            .with_context(|| format!("missing retained GFS source release {latest_run}"))?,
+    ))
 }
 
 fn build_identity(options: &GfsBuildOptions, sources: &[LegacySourceRun]) -> Value {
@@ -3087,7 +3121,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_release_supersedes_same_run_current_identity_during_deferred_activation() {
+    fn retained_release_and_current_keep_distinct_same_run_identities() {
         fn marker(run: &str, release_id: &str, suffix: &str) -> Value {
             let products = GFS_SOURCE_RELEASE_PRODUCTS
                 .iter()
@@ -3133,12 +3167,51 @@ mod tests {
 
         let candidates = load_group_release_candidates(root.path()).unwrap();
 
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].1.release_id, "gfs-bbbbbbbbbbbbbbbb");
-        assert!(release_coverage_ids(&candidates[0].1)
-            .unwrap()
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|(_, release)| release.release_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["gfs-aaaaaaaaaaaaaaaa", "gfs-bbbbbbbbbbbbbbbb"])
+        );
+        let descriptors = candidates
+            .iter()
+            .map(|(_, release)| {
+                let horizon = if release.release_id == "gfs-bbbbbbbbbbbbbbbb" {
+                    6
+                } else {
+                    384
+                };
+                (horizon, release_coverage_ids(release).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let selected = select_exact_horizon_candidate("2026072618", 6, &descriptors).unwrap();
+        assert!(descriptors[selected]
+            .1
             .values()
             .all(|coverage_id| coverage_id.ends_with("_6h")));
+    }
+
+    #[test]
+    fn exact_horizon_selection_rejects_missing_and_ambiguous_sources() {
+        let identity =
+            |suffix: &str| BTreeMap::from([("gfs013_surface".to_string(), suffix.to_string())]);
+        let available = vec![(384, identity("full")), (6, identity("short"))];
+        assert_eq!(
+            select_exact_horizon_candidate("2026080400", 6, &available).unwrap(),
+            1
+        );
+        assert!(select_exact_horizon_candidate("2026080400", 12, &available)
+            .unwrap_err()
+            .to_string()
+            .contains("available horizons [6, 384], expected 12"));
+
+        let ambiguous = vec![(6, identity("short-a")), (6, identity("short-b"))];
+        assert!(select_exact_horizon_candidate("2026080400", 6, &ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous source coverage identities for horizon 6"));
     }
 
     #[test]
