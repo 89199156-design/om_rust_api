@@ -697,6 +697,19 @@ fn release_source_group_memory() {
 #[cfg(not(target_os = "linux"))]
 fn release_source_group_memory() {}
 
+fn source_read_block_frames(
+    scope: Scope,
+    variable: &str,
+    configured_block_frames: usize,
+    total_frames: usize,
+) -> usize {
+    if matches!(scope, Scope::Gfs) && variable == "weather_code" {
+        configured_block_frames.min(total_frames)
+    } else {
+        total_frames
+    }
+}
+
 fn ensure_free_space(path: &Path, reserve_bytes: u64, additional_bytes: u64) -> Result<()> {
     if reserve_bytes < 512 * 1024 * 1024 {
         bail!("WebP minimum free-space reserve must be at least 512 MiB");
@@ -821,50 +834,59 @@ fn main() -> Result<()> {
                     layer_groups.len(),
                     source_layer.variable,
                 );
-                let values = read_layer_grid_series(
-                    &snapshot,
-                    &decoder,
+                let read_block_frames = source_read_block_frames(
+                    args.scope,
                     source_layer.variable,
-                    &times,
-                    &grid,
-                    args.scope.tolerate_unavailable_layers(),
-                )?;
-                let values_v = match source_layer.variable_v {
-                    Some(variable) => Some(read_layer_grid_series(
+                    args.series_block_hours,
+                    times.len(),
+                );
+                for source_times in times.chunks(read_block_frames) {
+                    let values = read_layer_grid_series(
                         &snapshot,
                         &decoder,
-                        variable,
-                        &times,
+                        source_layer.variable,
+                        source_times,
                         &grid,
                         args.scope.tolerate_unavailable_layers(),
-                    )?),
-                    None => None,
-                };
-                for layer in layers {
-                    write_layer_series(
-                        &grid,
-                        layer,
-                        &times,
-                        &values,
-                        values_v.as_deref(),
-                        args.series_block_hours,
-                        &args.output_root,
-                        &product_staging,
-                        args.minimum_free_bytes,
-                        batch,
-                        selected.len(),
-                        &mut completed_images,
-                        &mut written_bytes,
-                        &total_invalid,
-                        &mut last_progress_at,
-                        &mut last_progress_bytes,
-                        args.scope,
-                        &ready.latest_complete_run,
                     )?;
+                    let values_v = match source_layer.variable_v {
+                        Some(variable) => Some(read_layer_grid_series(
+                            &snapshot,
+                            &decoder,
+                            variable,
+                            source_times,
+                            &grid,
+                            args.scope.tolerate_unavailable_layers(),
+                        )?),
+                        None => None,
+                    };
+                    for layer in layers {
+                        write_layer_series(
+                            &grid,
+                            layer,
+                            source_times,
+                            &values,
+                            values_v.as_deref(),
+                            args.series_block_hours,
+                            &args.output_root,
+                            &product_staging,
+                            args.minimum_free_bytes,
+                            batch,
+                            selected.len(),
+                            times.len(),
+                            &mut completed_images,
+                            &mut written_bytes,
+                            &total_invalid,
+                            &mut last_progress_at,
+                            &mut last_progress_bytes,
+                            args.scope,
+                            &ready.latest_complete_run,
+                        )?;
+                    }
+                    drop(values_v);
+                    drop(values);
+                    release_source_group_memory();
                 }
-                drop(values_v);
-                drop(values);
-                release_source_group_memory();
                 println!(
                     "进度｜阶段：完成源组｜类型：{}｜批次：{}｜源组：{}/{}｜变量：{}｜耗时：{:.3}s",
                     args.scope.group().to_uppercase(),
@@ -1106,6 +1128,7 @@ fn write_layer_series(
     minimum_free_bytes: u64,
     batch: i64,
     total_layers: usize,
+    total_frames: usize,
     completed_images: &mut usize,
     written_bytes: &mut u64,
     total_invalid: &std::sync::atomic::AtomicUsize,
@@ -1169,13 +1192,13 @@ fn write_layer_series(
                     / progress_elapsed.as_secs_f64().max(0.001)
                     / 1024.0
                     / 1024.0;
-                let equivalent_frames = completed_images.div_ceil(total_layers).min(times.len());
+                let equivalent_frames = completed_images.div_ceil(total_layers).min(total_frames);
                 println!(
                     "进度｜阶段：生成 WebP｜类型：{}｜批次：{}｜帧：{}/{}｜图层：{}｜近一分钟增长：{:.1} MiB｜速度：{:.2} MiB/s",
                     scope.group().to_uppercase(),
                     run,
                     equivalent_frames,
-                    times.len(),
+                    total_frames,
                     layer.name,
                     growth_bytes as f64 / 1024.0 / 1024.0,
                     speed_mib_s
@@ -1588,6 +1611,22 @@ mod tests {
             vec!["precip_phase", "thunderstorm_code"]
         );
         assert!(groups.len() < GFS_LAYERS.len());
+    }
+
+    #[test]
+    fn gfs_weather_code_uses_bounded_source_reads() {
+        assert_eq!(
+            source_read_block_frames(Scope::Gfs, "weather_code", 6, 121),
+            6
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::Gfs, "temperature_2m", 6, 121),
+            121
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::EcmwfIfs025, "weather_code", 6, 121),
+            121
+        );
     }
 
     #[test]
