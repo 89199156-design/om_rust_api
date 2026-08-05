@@ -679,6 +679,24 @@ fn available_space(path: &Path) -> Result<u64> {
     Ok(output.f_bavail.saturating_mul(output.f_frsize))
 }
 
+#[cfg(target_os = "linux")]
+fn release_source_group_memory() {
+    // A source series contains every output frame so the native OM decoder
+    // inflates each time slab only once.  glibc may otherwise retain those
+    // large, short-lived allocations in its arenas after the Vecs are
+    // dropped, which makes RSS grow once per source group on small production
+    // hosts.  Trimming here preserves the fast full-series read while keeping
+    // the process peak close to one source group.
+    // SAFETY: malloc_trim only asks the process allocator to return unused
+    // heap pages; no live allocation is invalidated.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_source_group_memory() {}
+
 fn ensure_free_space(path: &Path, reserve_bytes: u64, additional_bytes: u64) -> Result<()> {
     if reserve_bytes < 512 * 1024 * 1024 {
         bail!("WebP minimum free-space reserve must be at least 512 MiB");
@@ -844,6 +862,9 @@ fn main() -> Result<()> {
                         &ready.latest_complete_run,
                     )?;
                 }
+                drop(values_v);
+                drop(values);
+                release_source_group_memory();
                 println!(
                     "进度｜阶段：完成源组｜类型：{}｜批次：{}｜源组：{}/{}｜变量：{}｜耗时：{:.3}s",
                     args.scope.group().to_uppercase(),
