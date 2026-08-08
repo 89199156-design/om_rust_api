@@ -30,20 +30,3 @@ def test_public_nginx_surface_does_not_expose_raw_om_bundles():
     assert "/data/webp/" in nginx
     assert "/data/om/" not in nginx
     assert "om_rust_api-" in nginx
-
-
-def test_openresty_mobile_client_entrypoint_is_http_only_and_uses_shared_surface():
-    server = (ROOT / "nginx" / "openresty_om_client_http.conf").read_text(
-        encoding="utf-8"
-    )
-    compose_override = (
-        ROOT / "nginx" / "openresty_compose.override.yml"
-    ).read_text(encoding="utf-8")
-
-    assert "listen 80 default_server;" in server
-    assert "server_name 124.222.212.233 _;" in server
-    assert "om_client_api.inc" in server
-    assert "listen 443" not in server
-    assert "weather_om_webp" in compose_override
-    assert "weather_forecast_server" in compose_override
-    assert ":ro" in compose_override

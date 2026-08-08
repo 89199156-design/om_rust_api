@@ -1,8 +1,0 @@
-services:
-  openresty:
-    volumes:
-      # The public data directory contains absolute release symlinks. Mount the
-      # read-only targets so OpenResty can resolve those symlinks in-container.
-      - /opt/1panel/apps/weather_om_webp:/opt/1panel/apps/weather_om_webp:ro
-      - /opt/1panel/apps/weather_forecast_server:/opt/1panel/apps/weather_forecast_server:ro
-      - /opt/1panel/apps/weather_om_api/source-archives:/opt/1panel/apps/weather_om_api/source-archives:ro
