@@ -127,11 +127,11 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("--data-binary", command)
         self.assertIn("127.0.0.1:8088", command)
 
-    def test_plan_has_exactly_two_hundred_stable_points(self) -> None:
+    def test_plan_has_exactly_three_hundred_stable_points(self) -> None:
         points = compare.sample_points()
-        self.assertEqual(len(points), 200)
+        self.assertEqual(len(points), 300)
         self.assertEqual(points, compare.sample_points())
-        self.assertEqual(len({point["id"] for point in points}), 200)
+        self.assertEqual(len({point["id"] for point in points}), 300)
         kinds = {point["kind"] for point in points}
         self.assertEqual(
             kinds,
@@ -143,11 +143,11 @@ class Official200PointCompareTests(unittest.TestCase):
         )
         self.assertEqual(
             sum(point["kind"] == "random_exact_common_native_grid" for point in points),
-            70,
+            100,
         )
         self.assertEqual(
             sum(point["kind"] != "random_exact_common_native_grid" for point in points),
-            130,
+            200,
         )
 
     def test_probability_daily_aggregations_are_in_both_weather_catalogs(self) -> None:
@@ -406,9 +406,9 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("commercial-secret", json.dumps(persisted_metadata))
         self.assertFalse(metadata["api_key_persisted"])
         self.assertEqual(metadata["api_access_tier"], "customer_commercial")
-        self.assertEqual(metadata["official_request_count"], 2)
+        self.assertEqual(metadata["official_request_count"], 3)
         self.assertEqual(metadata["official_batch_size"], 100)
-        self.assertEqual(len(metadata["batches"]), 2)
+        self.assertEqual(len(metadata["batches"]), 3)
 
     def test_capture_without_key_uses_public_noncommercial_endpoint(self) -> None:
         captured: dict[str, object] = {}
@@ -428,7 +428,7 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("apikey", json.loads(captured["body"]))
         self.assertEqual(metadata["api_access_tier"], "public_noncommercial")
         self.assertEqual(metadata["api_key_transport"], "none")
-        self.assertEqual(metadata["official_request_count"], 2)
+        self.assertEqual(metadata["official_request_count"], 3)
 
     def test_capture_resumes_a_complete_partial_batch_without_requesting_it(self) -> None:
         response = json.dumps([{} for _ in range(100)]).encode()
@@ -449,10 +449,11 @@ class Official200PointCompareTests(unittest.TestCase):
                     "gfs", output, None, 10.0, 0
                 )
 
-        request.assert_called_once()
+        self.assertEqual(request.call_count, 2)
         self.assertTrue(metadata["batches"][0]["resumed_from_disk"])
         self.assertEqual(metadata["batches"][0]["request_exit"], "persisted")
         self.assertFalse(metadata["batches"][1]["resumed_from_disk"])
+        self.assertFalse(metadata["batches"][2]["resumed_from_disk"])
 
     def test_capture_routes_public_batches_through_distinct_ssh_hosts(self) -> None:
         response = json.dumps([{} for _ in range(100)]).encode()
@@ -474,11 +475,11 @@ class Official200PointCompareTests(unittest.TestCase):
                     ssh_hosts=("first-exit", "second-exit"),
                 )
 
-        self.assertEqual(ssh_request.call_count, 2)
+        self.assertEqual(ssh_request.call_count, 3)
         local_request.assert_not_called()
         self.assertEqual(
             [batch["request_exit"] for batch in metadata["batches"]],
-            ["ssh:first-exit", "ssh:second-exit"],
+            ["ssh:first-exit", "ssh:second-exit", "ssh:first-exit"],
         )
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
@@ -532,7 +533,7 @@ class Official200PointCompareTests(unittest.TestCase):
         finally:
             compare.MODEL_SPECS["gfs"] = original
 
-    def test_direct_comparison_reports_missing_official_tail_time(self) -> None:
+    def test_direct_comparison_ignores_official_tail_after_raw_model_end(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
         compare.MODEL_SPECS["gfs"] = {
             **original,
@@ -548,14 +549,80 @@ class Official200PointCompareTests(unittest.TestCase):
                 "hourly": {"time": ["a", "b"], "temperature_2m": [1, 2]},
                 "daily": {"time": []},
             }
+            difference, hourly_count, daily_count = compare.first_direct_difference(
+                "gfs", official, local
+            )
+            self.assertIsNone(difference)
+            self.assertEqual(hourly_count, 1)
+            self.assertEqual(daily_count, 0)
+        finally:
+            compare.MODEL_SPECS["gfs"] = original
+
+    def test_direct_comparison_rejects_missing_hour_inside_raw_model_axis(self) -> None:
+        original = compare.MODEL_SPECS["gfs"]
+        compare.MODEL_SPECS["gfs"] = {
+            **original,
+            "official_hourly": ("temperature_2m",),
+            "daily": (),
+        }
+        try:
+            official = {
+                "hourly": {
+                    "time": ["a", "b", "c"],
+                    "temperature_2m": [1, 2, 3],
+                },
+                "daily": {"time": []},
+            }
+            local = {
+                "hourly": {"time": ["a", "c"], "temperature_2m": [1, 3]},
+                "daily": {"time": []},
+            }
             difference, _, _ = compare.first_direct_difference(
                 "gfs", official, local
             )
             self.assertEqual(difference["reason"], "missing_official_time")
-            self.assertEqual(difference["time"], "c")
-            self.assertEqual(difference["local_end"], "b")
+            self.assertEqual(difference["time"], "b")
         finally:
             compare.MODEL_SPECS["gfs"] = original
+
+    def test_daily_comparison_always_excludes_final_official_day(self) -> None:
+        official = {
+            "daily": {
+                "time": ["2026-08-10", "2026-08-11"],
+                "temperature_2m_max": [2, 99],
+            }
+        }
+        local = {
+            "daily": {
+                "time": ["2026-08-10", "2026-08-11"],
+                "temperature_2m_max": [2, 3],
+            }
+        }
+        difference, hourly_count, daily_count = compare.first_period_difference(
+            "daily", ("temperature_2m_max",), official, local
+        )
+        self.assertIsNone(difference)
+        self.assertEqual(hourly_count, 0)
+        self.assertEqual(daily_count, 1)
+
+    def test_daily_comparison_still_rejects_difference_before_final_day(self) -> None:
+        official = {
+            "daily": {
+                "time": ["2026-08-10", "2026-08-11"],
+                "temperature_2m_max": [2, 99],
+            }
+        }
+        local = {
+            "daily": {
+                "time": ["2026-08-10", "2026-08-11"],
+                "temperature_2m_max": [3, 99],
+            }
+        }
+        difference, _, _ = compare.first_period_difference(
+            "daily", ("temperature_2m_max",), official, local
+        )
+        self.assertEqual(difference["reason"], "json_value")
+        self.assertEqual(difference["time"], "2026-08-10")
 
     def test_validate_model_checkpoints_progress_and_throttles(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
@@ -689,8 +756,27 @@ class Official200PointCompareTests(unittest.TestCase):
                         attempt_id="attempt-a",
                         point_limit=1,
                     )
+                    replay_report = compare.validate_model(
+                        "gfs",
+                        output,
+                        "http://127.0.0.1:8088",
+                        10.0,
+                        0,
+                        0,
+                        field_chunk_size=1,
+                        request_delay_seconds=0,
+                        attempt_id="attempt-b",
+                        point_limit=1,
+                    )
                 receipt = json.loads(
-                    (output / "gfs" / "receipts" / "000_p000.json").read_text(
+                    (
+                        output
+                        / "gfs"
+                        / "receipts"
+                        / "attempts"
+                        / "attempt-a"
+                        / "000_p000.json"
+                    ).read_text(
                         encoding="utf-8"
                     )
                 )
@@ -704,16 +790,27 @@ class Official200PointCompareTests(unittest.TestCase):
                         / "000_p000"
                     ).glob("*.json")
                 )
+                replay_receipt = (
+                    output
+                    / "gfs"
+                    / "receipts"
+                    / "attempts"
+                    / "attempt-b"
+                    / "000_p000.json"
+                )
+                replay_receipt_exists = replay_receipt.exists()
 
-            self.assertEqual(request.call_count, 2)
-            self.assertEqual(resource_guard.call_count, 2)
+            self.assertEqual(request.call_count, 4)
+            self.assertEqual(resource_guard.call_count, 4)
             self.assertEqual(report["status"], "partial")
+            self.assertEqual(replay_report["status"], "partial")
             self.assertEqual(report["points_target"], 1)
             self.assertEqual(report["local_requests_per_point"], 2)
             self.assertEqual(report["local_requests_completed"], 2)
             self.assertEqual(receipt["local_request_count"], 2)
             self.assertEqual(len(receipt["local_response_parts"]), 2)
             self.assertEqual(len(local_parts), 2)
+            self.assertTrue(replay_receipt_exists)
         finally:
             compare.MODEL_SPECS["gfs"] = original
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot once, then compare 200 points against the official APIs.
+"""Snapshot once, then compare 300 points against the official APIs.
 
 The official response for each model is captured by bounded multi-location POSTs.
 Validation then requests the local API one point at a time and stops at the
@@ -49,9 +49,9 @@ except ImportError:
 
 
 SCHEMA_VERSION = 2
-POINT_COUNT = 200
+POINT_COUNT = 300
 OFFICIAL_BATCH_SIZE = 100
-USER_AGENT = "om-weather-server-official-200-point-validation/1.0"
+USER_AGENT = "om-weather-server-official-300-point-validation/1.0"
 # A single-point response with every public surface field is small, while each
 # HTTP round trip makes the API repeat model lookup and time-axis work.  Keep
 # hourly and daily requests separate, but normally fit each period into one
@@ -465,7 +465,7 @@ def wait_for_safe_local_resources(
 
 @contextlib.contextmanager
 def validation_lock(output: Path):
-    lock_path = output / ".official-200-validation.lock"
+    lock_path = output / ".official-300-validation.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     fcntl_module = None
@@ -635,14 +635,14 @@ def write_json(path: Path, value: Any, *, immutable: bool = False) -> None:
 def validation_manifest(models: list[str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_200_point_validation_manifest",
+        "type": "official_300_point_validation_manifest",
         "models": models,
         "point_count_per_model": POINT_COUNT,
         "random_seed": 20260729,
         "sampling_cohorts": {
-            "random_exact_common_native_grid": 70,
-            "random_offgrid_near_native_grid": 70,
-            "random_offgrid_uniform_crop": 60,
+            "random_exact_common_native_grid": 100,
+            "random_offgrid_near_native_grid": 100,
+            "random_offgrid_uniform_crop": 100,
         },
         "cell_selection": "nearest",
         "points": sample_points(),
@@ -702,7 +702,7 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
     ]
     randomizer.shuffle(common_grid)
     points: list[dict[str, Any]] = []
-    for latitude, longitude in common_grid[:70]:
+    for latitude, longitude in common_grid[:100]:
         points.append(
             {
                 "id": f"p{len(points):03d}",
@@ -712,7 +712,7 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
                 "kind": "random_exact_common_native_grid",
             }
         )
-    for latitude, longitude in common_grid[70:140]:
+    for latitude, longitude in common_grid[100:200]:
         latitude += randomizer.uniform(0.031, 0.179)
         longitude += randomizer.uniform(0.031, 0.179)
         points.append(
@@ -1504,16 +1504,35 @@ def first_period_difference(
     local_index_by_time = {
         time_value: index for index, time_value in enumerate(local_times)
     }
-    missing_time = next(
-        (
-            (index, time_value)
-            for index, time_value in enumerate(official_times)
-            if time_value not in local_index_by_time
-        ),
-        None,
-    )
-    if missing_time is not None:
-        index, time_value = missing_time
+    if period == "daily":
+        # The final official aggregate day is intentionally out of scope: its
+        # source hourly window may be incomplete at snapshot time.
+        candidate_indices = list(range(max(0, len(official_times) - 1)))
+    else:
+        candidate_indices = list(range(len(official_times)))
+
+    comparable_indices = [
+        index
+        for index in candidate_indices
+        if official_times[index] in local_index_by_time
+    ]
+    missing_indices = [
+        index
+        for index in candidate_indices
+        if official_times[index] not in local_index_by_time
+    ]
+    if missing_indices and period == "hourly":
+        first_missing = missing_indices[0]
+        permitted_tail = (
+            bool(comparable_indices)
+            and missing_indices == list(range(first_missing, len(official_times)))
+            and first_missing == comparable_indices[-1] + 1
+        )
+        if permitted_tail:
+            missing_indices = []
+    if missing_indices:
+        index = missing_indices[0]
+        time_value = official_times[index]
         return (
             {
                 "period": period,
@@ -1521,6 +1540,18 @@ def first_period_difference(
                 "reason": "missing_official_time",
                 "index": index,
                 "time": time_value,
+                "local_start": local_times[0] if local_times else None,
+                "local_end": local_times[-1] if local_times else None,
+            },
+            hourly_count,
+            daily_count,
+        )
+    if period == "hourly" and not comparable_indices:
+        return (
+            {
+                "period": period,
+                "variable": "time",
+                "reason": "no_common_model_time",
                 "local_start": local_times[0] if local_times else None,
                 "local_end": local_times[-1] if local_times else None,
             },
@@ -1556,7 +1587,8 @@ def first_period_difference(
         index = next(
             (
                 official_index
-                for official_index, time_value in enumerate(official_times)
+                for official_index in comparable_indices
+                for time_value in (official_times[official_index],)
                 if official_values[official_index]
                 != local_values[local_index_by_time[time_value]]
             ),
@@ -1578,9 +1610,9 @@ def first_period_difference(
                 daily_count,
             )
         if period == "hourly":
-            hourly_count += len(official_values)
+            hourly_count += len(comparable_indices)
         else:
-            daily_count += len(official_values)
+            daily_count += len(comparable_indices)
     return None, hourly_count, daily_count
 
 
@@ -1860,7 +1892,7 @@ def validate_model(
     report_path = output / model / "report.json"
     report = {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_200_point_comparison",
+        "type": "official_300_point_comparison",
         "model": model,
         "status": "running",
         "official_snapshot_sha256": metadata["response_sha256"],
@@ -1873,7 +1905,13 @@ def validate_model(
         "local_requests_per_point": len(plan),
         "hourly_values_compared": 0,
         "daily_values_compared": 0,
-        "comparison": "strict_official_json_values_for_field_intersection",
+        "hourly_values_exempted_after_raw_model_end": 0,
+        "daily_values_exempted_on_final_day": 0,
+        "comparison": "strict_common_raw_model_axis_official_json_values",
+        "time_scope_policy": {
+            "hourly": "ignore_only_consecutive_official_tail_after_local_raw_model_end",
+            "daily": "exclude_final_official_day",
+        },
         "local_request_mode": "paired_hourly_daily_chunks",
         "local_request_transport": (
             f"production_ssh:{local_ssh_client.ssh_host}"
@@ -1888,6 +1926,8 @@ def validate_model(
         "current_request": None,
         "current_point_hourly_values_compared": 0,
         "current_point_daily_values_compared": 0,
+        "current_point_hourly_values_exempted_after_raw_model_end": 0,
+        "current_point_daily_values_exempted_on_final_day": 0,
         "attempt_id": attempt_id,
         "point_delay_seconds": point_delay_seconds,
         "request_delay_seconds": request_delay_seconds,
@@ -1912,7 +1952,10 @@ def validate_model(
         timed_request_units_completed=timed_request_units_completed,
     )
     points = sample_points()
-    receipts = output / model / "receipts"
+    # Every repair attempt must prove the complete prefix again from point 0.
+    # Keep prior receipts immutable for audit, but never use them to skip a
+    # point in a later attempt.
+    receipts = output / model / "receipts" / "attempts" / attempt_id
     receipts.mkdir(parents=True, exist_ok=True)
     official_rows = iter_json_array_file(official_path, POINT_COUNT)
     for point in points[:point_limit]:
@@ -1931,6 +1974,12 @@ def validate_model(
             )
             report["hourly_values_compared"] += receipt["hourly_values_compared"]
             report["daily_values_compared"] += receipt["daily_values_compared"]
+            report["hourly_values_exempted_after_raw_model_end"] += receipt.get(
+                "hourly_values_exempted_after_raw_model_end", 0
+            )
+            report["daily_values_exempted_on_final_day"] += receipt.get(
+                "daily_values_exempted_on_final_day", 0
+            )
             request_units_completed += len(plan)
             update_progress_estimate(
                 report,
@@ -1943,6 +1992,8 @@ def validate_model(
         report["current_point"] = point
         report["current_point_hourly_values_compared"] = 0
         report["current_point_daily_values_compared"] = 0
+        report["current_point_hourly_values_exempted_after_raw_model_end"] = 0
+        report["current_point_daily_values_exempted_on_final_day"] = 0
         write_json(report_path, report)
         print(
             json.dumps(
@@ -1959,6 +2010,8 @@ def validate_model(
         )
         hourly_count = 0
         daily_count = 0
+        hourly_exempted = 0
+        daily_exempted = 0
         local_elapsed_seconds = 0.0
         response_parts: list[dict[str, Any]] = []
         for request_index, request_part in enumerate(plan):
@@ -2075,16 +2128,36 @@ def validate_model(
             write_once(local_path, raw)
             local = normalize_rows(json.loads(raw), 1)[0]
             difference = None
+            part_comparison: dict[str, Any] = {}
             for period, variables in periods:
                 difference, hourly_part, daily_part = first_period_difference(
                     period, variables, official, local
                 )
                 hourly_count += hourly_part
                 daily_count += daily_part
+                if difference is None:
+                    official_period = official.get(period, {})
+                    official_times = official_period.get("time", [])
+                    compared = hourly_part if period == "hourly" else daily_part
+                    exempted = len(variables) * len(official_times) - compared
+                    part_comparison[period] = {
+                        "values_compared": compared,
+                        "values_exempted": exempted,
+                    }
+                    if period == "hourly":
+                        hourly_exempted += exempted
+                    else:
+                        daily_exempted += exempted
                 if difference is not None:
                     break
             report["current_point_hourly_values_compared"] = hourly_count
             report["current_point_daily_values_compared"] = daily_count
+            report[
+                "current_point_hourly_values_exempted_after_raw_model_end"
+            ] = hourly_exempted
+            report["current_point_daily_values_exempted_on_final_day"] = (
+                daily_exempted
+            )
             local_elapsed_seconds += elapsed
             part_metadata = {
                 "index": request_index,
@@ -2097,6 +2170,7 @@ def validate_model(
                 "local_elapsed_seconds": round(elapsed, 6),
                 "local_response_headers": headers,
                 "resources_before_request": resource_snapshot,
+                "comparison": part_comparison,
             }
             response_parts.append(part_metadata)
             report["local_requests_completed"] += 1
@@ -2165,16 +2239,22 @@ def validate_model(
             "local_elapsed_seconds": round(local_elapsed_seconds, 6),
             "hourly_values_compared": hourly_count,
             "daily_values_compared": daily_count,
+            "hourly_values_exempted_after_raw_model_end": hourly_exempted,
+            "daily_values_exempted_on_final_day": daily_exempted,
             "status": "passed",
         }
         write_once(receipt_path, pretty_bytes(receipt))
         report["points_completed"] += 1
         report["hourly_values_compared"] += hourly_count
         report["daily_values_compared"] += daily_count
+        report["hourly_values_exempted_after_raw_model_end"] += hourly_exempted
+        report["daily_values_exempted_on_final_day"] += daily_exempted
         report["current_point"] = None
         report["current_request"] = None
         report["current_point_hourly_values_compared"] = 0
         report["current_point_daily_values_compared"] = 0
+        report["current_point_hourly_values_exempted_after_raw_model_end"] = 0
+        report["current_point_daily_values_exempted_on_final_day"] = 0
         write_json(report_path, report)
         print(
             json.dumps(
@@ -2302,7 +2382,7 @@ def parse_args() -> argparse.Namespace:
         "--point-limit",
         type=int,
         default=POINT_COUNT,
-        help="validate only the first N points for a partial smoke run (maximum 200)",
+        help="validate only the first N points for a partial smoke run (maximum 300)",
     )
     return parser.parse_args()
 
