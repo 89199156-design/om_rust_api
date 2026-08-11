@@ -8089,7 +8089,18 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
     latitude: f64,
     longitude: f64,
 ) -> Result<f32> {
-    let product = snapshot.require_product("cams_global_greenhouse_gases")?;
+    let products = snapshot.product_snapshots("cams_global_greenhouse_gases");
+    let product = products
+        .first()
+        .cloned()
+        .context("CAMS greenhouse product is unavailable")?;
+    if let Some(covering) = newest_and_previous_products(&products)
+        .find(|candidate| product_covers_time(candidate, "carbon_monoxide", time))
+    {
+        return read_cams_greenhouse_carbon_monoxide_with_history(
+            snapshot, covering, decoder, time, latitude, longitude,
+        );
+    }
     let native_times = native_times_for_variable(&product, "carbon_monoxide");
     let Some(first) = native_times.first().copied() else {
         return Ok(f32::NAN);
@@ -8098,17 +8109,7 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
         return Ok(f32::NAN);
     };
     if time < first {
-        return read_product_history_value_with_rounding(
-            snapshot,
-            decoder,
-            "cams_global_greenhouse_gases",
-            "carbon_monoxide",
-            "carbon_monoxide",
-            time,
-            latitude,
-            longitude,
-            true,
-        );
+        return Ok(f32::NAN);
     }
     let cadence = native_times
         .windows(2)
@@ -8161,16 +8162,107 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
         }
         return Ok(f32::NAN);
     }
-    read_product_value_with_rounding(
-        &product,
+    Ok(f32::NAN)
+}
+
+fn read_cams_greenhouse_carbon_monoxide_with_history(
+    snapshot: &OmDataSnapshot,
+    product: &ProductSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<f32> {
+    let native_times = native_times_for_variable(product, "carbon_monoxide");
+    let Some((index, fraction)) = interpolation_index(&native_times, time) else {
+        return Ok(f32::NAN);
+    };
+    let b = read_native_value(
+        product,
         decoder,
         "carbon_monoxide",
-        "carbon_monoxide",
-        time,
+        native_times[index],
         latitude,
         longitude,
-        true,
-    )
+    )?;
+    if index + 1 >= native_times.len() {
+        return Ok(round_to_scalefactor(b, 1.0).max(0.0));
+    }
+    let stride_seconds = interpolation_stride_seconds(&native_times, index);
+    let a_time = native_times[index] - Duration::seconds(stride_seconds);
+    let a = match read_native_value_if_present(
+        product,
+        decoder,
+        "carbon_monoxide",
+        &native_times,
+        a_time,
+        latitude,
+        longitude,
+    )? {
+        Some(value) if value.is_finite() => value,
+        Some(_) => b,
+        None => read_cams_greenhouse_retained_native_value(
+            snapshot, decoder, a_time, latitude, longitude,
+        )?
+        .filter(|value| value.is_finite())
+        .unwrap_or(b),
+    };
+    let c = read_native_value(
+        product,
+        decoder,
+        "carbon_monoxide",
+        native_times[index + 1],
+        latitude,
+        longitude,
+    )?;
+    let c = if c.is_finite() { c } else { b };
+    let d_time = native_times[index + 1] + Duration::seconds(stride_seconds);
+    let d = match read_native_value_if_present(
+        product,
+        decoder,
+        "carbon_monoxide",
+        &native_times,
+        d_time,
+        latitude,
+        longitude,
+    )? {
+        Some(value) if value.is_finite() => value,
+        Some(_) => b,
+        None => b,
+    };
+    let coeff_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+    let coeff_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+    let coeff_c = -a / 2.0 + c / 2.0;
+    let h = coeff_a * fraction * fraction * fraction
+        + coeff_b * fraction * fraction
+        + coeff_c * fraction
+        + b;
+    Ok(round_to_scalefactor(h, 1.0).max(0.0))
+}
+
+fn read_cams_greenhouse_retained_native_value(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+) -> Result<Option<f32>> {
+    for product in snapshot.product_snapshots("cams_global_greenhouse_gases") {
+        let native_times = native_times_for_variable(&product, "carbon_monoxide");
+        if native_times.binary_search(&time).is_err() {
+            continue;
+        }
+        return read_native_value(
+            &product,
+            decoder,
+            "carbon_monoxide",
+            time,
+            latitude,
+            longitude,
+        )
+        .map(Some);
+    }
+    Ok(None)
 }
 
 fn product_covers_time(product: &ProductSnapshot, raw_variable: &str, time: DateTime<Utc>) -> bool {
