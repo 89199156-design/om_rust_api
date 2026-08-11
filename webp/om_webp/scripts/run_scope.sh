@@ -120,6 +120,7 @@ run_renderer() {
     --property="MemoryMax=$memory_max" \
     --property="MemorySwapMax=0" \
     --property="CPUQuota=$cpu_quota" \
+    --property="LimitNOFILE=$minimum_open_files" \
     --property="Nice=15" \
     --property="IOSchedulingClass=idle" \
     --setenv="OM_DEM_ROOT=$dem_root" \

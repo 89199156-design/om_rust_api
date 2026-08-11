@@ -34,6 +34,7 @@ class WebpTaskGateTests(unittest.TestCase):
         self.assertIn('--property="MemoryMax=$memory_max"', content)
         self.assertIn('--property="MemorySwapMax=0"', content)
         self.assertIn('--property="CPUQuota=$cpu_quota"', content)
+        self.assertIn('--property="LimitNOFILE=$minimum_open_files"', content)
         self.assertIn('WebP production memory guard requires root and systemd-run', content)
         self.assertIn(
             'minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"',
