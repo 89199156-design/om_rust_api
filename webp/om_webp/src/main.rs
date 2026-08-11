@@ -334,9 +334,8 @@ impl Scope {
                 terms_url: "https://apps.ecmwf.int/datasets/licences/general/",
                 modified: true,
                 transformations: &[
-                    "spatial subsetting",
-                    "range extraction",
-                    "temporal and spatial interpolation",
+                    "native-grid range extraction",
+                    "temporal interpolation",
                     "unit conversion and derived-variable calculation",
                     "lossless WebP encoding",
                 ],
@@ -398,6 +397,23 @@ struct GroupReady {
     status: String,
     latest_complete_run: String,
     release_id: String,
+    products: BTreeMap<String, ReadyProduct>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyProduct {
+    grid: ReadyGrid,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadyGrid {
+    grid_type: String,
+    nx: usize,
+    ny: usize,
+    dx: f64,
+    dy: f64,
+    lon_min: f64,
+    lat_min: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -711,9 +727,11 @@ fn source_read_block_frames(
     //
     // Weather code is different: it holds cloud cover, precipitation, snow,
     // and instability dependencies at the same time. Keep that derived group
-    // bounded for GFS and ECMWF so those complete dependency grids cannot be
-    // resident together on small production hosts.
-    if variable == "weather_code" && matches!(scope, Scope::Gfs | Scope::EcmwfIfs025) {
+    // bounded on the relatively dense GFS render grid. ECMWF and CAMS render
+    // on their much smaller native OM regional grids, so a complete source
+    // series remains within the production memory guard and avoids rebuilding
+    // ECMWF run stitching for every six output hours.
+    if variable == "weather_code" && matches!(scope, Scope::Gfs) {
         configured_block_frames.min(total_frames)
     } else {
         total_frames
@@ -782,7 +800,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let grid = compute_grid(args.left_lon, args.right_lon, args.bottom_lat, args.top_lat)?;
+    let grid = compute_scope_grid(
+        args.scope,
+        &ready,
+        args.left_lon,
+        args.right_lon,
+        args.bottom_lat,
+        args.top_lat,
+    )?;
     let start = parse_run(&ready.latest_complete_run)?;
     let times = render_times(start, args.frames)?;
     let estimated_staging_bytes = estimate_staging_bytes(grid.len(), selected.len(), times.len())?;
@@ -1040,6 +1065,81 @@ fn compute_grid(left: f64, right: f64, bottom: f64, top: f64) -> Result<RegionGr
             row_order: "north_to_south",
             dx: round6(dx),
             dy: round6(dy),
+            sample_bounds,
+            display_bounds,
+        },
+        latitudes,
+        longitudes,
+    })
+}
+
+fn compute_scope_grid(
+    scope: Scope,
+    ready: &GroupReady,
+    left: f64,
+    right: f64,
+    bottom: f64,
+    top: f64,
+) -> Result<RegionGrid> {
+    match scope {
+        // Preserve the established public GFS render extent. EC and CAMS use
+        // every cell from their immutable, already regionalized OM products.
+        Scope::Gfs => compute_grid(left, right, bottom, top),
+        Scope::EcmwfIfs025 | Scope::Cams => compute_native_product_grid(scope, ready),
+    }
+}
+
+fn compute_native_product_grid(scope: Scope, ready: &GroupReady) -> Result<RegionGrid> {
+    let product = ready
+        .products
+        .get(scope.product_dir())
+        .with_context(|| format!("ready manifest has no {} product", scope.product_dir()))?;
+    let source = &product.grid;
+    if source.grid_type != "regional_regular_lat_lon" {
+        bail!(
+            "unsupported {} source grid type: {}",
+            scope.name(),
+            source.grid_type
+        );
+    }
+    if source.nx == 0
+        || source.ny == 0
+        || !source.dx.is_finite()
+        || !source.dy.is_finite()
+        || !source.lon_min.is_finite()
+        || !source.lat_min.is_finite()
+        || source.dx <= 0.0
+        || source.dy <= 0.0
+    {
+        bail!("invalid {} native source grid", scope.name());
+    }
+
+    let longitudes = (0..source.nx)
+        .map(|x| round6(source.lon_min + x as f64 * source.dx))
+        .collect::<Vec<_>>();
+    let latitudes = (0..source.ny)
+        .rev()
+        .map(|y| round6(source.lat_min + y as f64 * source.dy))
+        .collect::<Vec<_>>();
+    let sample_bounds = Bounds {
+        lon_min: *longitudes.first().context("native grid has no longitude")?,
+        lat_min: *latitudes.last().context("native grid has no latitude")?,
+        lon_max: *longitudes.last().context("native grid has no longitude")?,
+        lat_max: *latitudes.first().context("native grid has no latitude")?,
+    };
+    let display_bounds = Bounds {
+        lon_min: round6(sample_bounds.lon_min - source.dx / 2.0),
+        lat_min: round6(sample_bounds.lat_min - source.dy / 2.0),
+        lon_max: round6(sample_bounds.lon_max + source.dx / 2.0),
+        lat_max: round6(sample_bounds.lat_max + source.dy / 2.0),
+    };
+    Ok(RegionGrid {
+        manifest: GridManifest {
+            width: source.nx,
+            height: source.ny,
+            row_order: "north_to_south",
+            dx: round6(source.dx),
+            dy: round6(source.dy),
             sample_bounds,
             display_bounds,
         },
@@ -1624,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn only_dependency_heavy_weather_code_uses_bounded_source_reads() {
+    fn only_dense_gfs_weather_code_uses_bounded_source_reads() {
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "weather_code", 6, 121),
             6
@@ -1635,16 +1735,13 @@ mod tests {
         );
         assert_eq!(
             source_read_block_frames(Scope::EcmwfIfs025, "weather_code", 6, 121),
-            6
+            121
         );
         assert_eq!(
             source_read_block_frames(Scope::EcmwfIfs025, "temperature_2m", 6, 121),
             121
         );
-        assert_eq!(
-            source_read_block_frames(Scope::Cams, "pm2_5", 6, 121),
-            121
-        );
+        assert_eq!(source_read_block_frames(Scope::Cams, "pm2_5", 6, 121), 121);
     }
 
     #[test]

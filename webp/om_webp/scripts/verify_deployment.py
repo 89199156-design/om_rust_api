@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -99,6 +100,26 @@ def load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def expected_output_grid(group: str, ready: dict) -> dict[str, object]:
+    if group == "gfs":
+        # GFS retains the established public display subset.
+        return {"width": 597, "height": 495}
+    source = ready["products"][EXPECTED[group]["product"]]["grid"]
+    assert source["grid_type"] == "regional_regular_lat_lon"
+    return {
+        "width": source["nx"],
+        "height": source["ny"],
+        "dx": source["dx"],
+        "dy": source["dy"],
+        "sample_bounds": {
+            "lon_min": source["lon_min"],
+            "lat_min": source["lat_min"],
+            "lon_max": source["lon_min"] + (source["nx"] - 1) * source["dx"],
+            "lat_max": source["lat_min"] + (source["ny"] - 1) * source["dy"],
+        },
+    }
+
+
 def verify(args: argparse.Namespace) -> dict[str, object]:
     report: dict[str, object] = {"status": "success", "groups": {}}
     renderer_revision = (
@@ -132,8 +153,17 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
         assert manifest["source_run"] == ready["latest_complete_run"]
         assert manifest["renderer_revision"] == renderer_revision
         assert manifest["frame_count"] == 121
-        assert manifest["grid"]["width"] == 597
-        assert manifest["grid"]["height"] == 495
+        expected_grid = expected_output_grid(group, ready)
+        assert manifest["grid"]["width"] == expected_grid["width"]
+        assert manifest["grid"]["height"] == expected_grid["height"]
+        assert manifest["grid"]["row_order"] == "north_to_south"
+        if group != "gfs":
+            assert math.isclose(manifest["grid"]["dx"], expected_grid["dx"], abs_tol=1e-6)
+            assert math.isclose(manifest["grid"]["dy"], expected_grid["dy"], abs_tol=1e-6)
+            for key, value in expected_grid["sample_bounds"].items():
+                assert math.isclose(
+                    manifest["grid"]["sample_bounds"][key], value, abs_tol=1e-6
+                )
         assert set(manifest["layers"]) == expected["layers"]
         assert catalog["products"][group]["source"] == group
         assert catalog["products"][group]["manifest"] == expected["manifest"]
@@ -164,7 +194,9 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
                 text=True,
             )
         )
-        assert (inspected["width"], inspected["height"]) == (597, 495)
+        assert (inspected["width"], inspected["height"]) == (
+            expected_grid["width"], expected_grid["height"]
+        )
         report["groups"][group] = {
             "release_id": ready["release_id"],
             "run": ready["latest_complete_run"],
@@ -172,6 +204,7 @@ def verify(args: argparse.Namespace) -> dict[str, object]:
             "layers": len(expected["layers"]),
             "frames_per_layer": min(layer_counts.values()),
             "webp_files": sum(layer_counts.values()),
+            "grid": f'{expected_grid["width"]}x{expected_grid["height"]}',
             "public_target": str(product_root),
         }
     staging = args.webp_root / "staging"
