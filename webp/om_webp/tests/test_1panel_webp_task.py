@@ -29,6 +29,12 @@ class WebpTaskGateTests(unittest.TestCase):
         self.assertEqual(content.count("default_workers=2"), 3)
         self.assertNotIn("default_workers=1", content)
         self.assertIn('workers="${OM_WEBP_WORKERS:-$default_workers}"', content)
+        self.assertIn('memory_max="${OM_WEBP_MEMORY_MAX:-1536M}"', content)
+        self.assertIn('cpu_quota="${OM_WEBP_CPU_QUOTA:-150%}"', content)
+        self.assertIn('--property="MemoryMax=$memory_max"', content)
+        self.assertIn('--property="MemorySwapMax=0"', content)
+        self.assertIn('--property="CPUQuota=$cpu_quota"', content)
+        self.assertIn('WebP production memory guard requires root and systemd-run', content)
         self.assertIn(
             'minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"',
             content,

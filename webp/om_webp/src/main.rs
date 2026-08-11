@@ -698,16 +698,26 @@ fn release_source_group_memory() {
 fn release_source_group_memory() {}
 
 fn source_read_block_frames(
-    _scope: Scope,
-    _variable: &str,
+    scope: Scope,
+    variable: &str,
     configured_block_frames: usize,
     total_frames: usize,
 ) -> usize {
-    // Keep the decoded OM working set bounded for every source group.  The
-    // encoder was already chunked, but reading the complete 121-frame source
-    // series first still allowed the native decoder and its dependency grids
-    // to push small production hosts into OOM before encoding began.
-    configured_block_frames.min(total_frames)
+    // Direct native GFS/CAMS slabs and ordinary ECMWF variables are fastest
+    // and no larger when decoded once for the complete output axis. Repeating
+    // an ECMWF read for every six output frames rebuilds all retained source
+    // runs and their regular three-hour interpolation grids, which measured
+    // almost thirteen times slower without lowering that decoder peak.
+    //
+    // Weather code is different: it holds cloud cover, precipitation, snow,
+    // and instability dependencies at the same time. Keep that derived group
+    // bounded for GFS and ECMWF so those complete dependency grids cannot be
+    // resident together on small production hosts.
+    if variable == "weather_code" && matches!(scope, Scope::Gfs | Scope::EcmwfIfs025) {
+        configured_block_frames.min(total_frames)
+    } else {
+        total_frames
+    }
 }
 
 fn ensure_free_space(path: &Path, reserve_bytes: u64, additional_bytes: u64) -> Result<()> {
@@ -1614,22 +1624,26 @@ mod tests {
     }
 
     #[test]
-    fn every_source_group_uses_bounded_reads() {
+    fn only_dependency_heavy_weather_code_uses_bounded_source_reads() {
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "weather_code", 6, 121),
             6
         );
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "temperature_2m", 6, 121),
-            6
+            121
         );
         assert_eq!(
             source_read_block_frames(Scope::EcmwfIfs025, "weather_code", 6, 121),
             6
         );
         assert_eq!(
-            source_read_block_frames(Scope::Cams, "pm2_5", 6, 4),
-            4
+            source_read_block_frames(Scope::EcmwfIfs025, "temperature_2m", 6, 121),
+            121
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::Cams, "pm2_5", 6, 121),
+            121
         );
     }
 

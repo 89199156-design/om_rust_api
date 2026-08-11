@@ -33,6 +33,8 @@ model_static_root="${OM_MODEL_STATIC_ROOT:-/opt/1panel/apps/weather_om_api}"
 workers="${OM_WEBP_WORKERS:-$default_workers}"
 frames="${OM_WEBP_FRAMES:-121}"
 minimum_open_files="${OM_WEBP_MIN_OPEN_FILES:-65536}"
+memory_max="${OM_WEBP_MEMORY_MAX:-1536M}"
+cpu_quota="${OM_WEBP_CPU_QUOTA:-150%}"
 reporter="${OM_TASK_PROGRESS_REPORTER:-$app_dir/scripts/task_progress_reporter.py}"
 log_dir="${OM_WEBP_LOG_DIR:-$app_dir/logs}"
 ready_marker="$data_root/groups/$ready_group/current/ready_for_processing.json"
@@ -86,7 +88,8 @@ if [[ ! "$target_run" =~ ^20[0-9]{8}$ ]]; then
 fi
 
 run_renderer() {
-  "$app_dir/bin/om-webp" \
+  local -a renderer=(
+    "$app_dir/bin/om-webp"
     --scope "$scope" \
     --data-root "$data_root" \
     --output-root "$output_root" \
@@ -96,6 +99,32 @@ run_renderer() {
     --decoder-lib "$decoder_lib" \
     --workers "$workers" \
     --frames "$frames"
+  )
+
+  if [[ ! "$memory_max" =~ ^[1-9][0-9]*(K|M|G|T)?$ ]]; then
+    echo "OM_WEBP_MEMORY_MAX must be a positive systemd size: $memory_max" >&2
+    return 2
+  fi
+  if [[ ! "$cpu_quota" =~ ^[1-9][0-9]*%$ ]]; then
+    echo "OM_WEBP_CPU_QUOTA must be a positive percentage: $cpu_quota" >&2
+    return 2
+  fi
+  if [[ "$(id -u)" -ne 0 || ! -d /run/systemd/system ]] \
+    || ! command -v systemd-run >/dev/null 2>&1; then
+    echo "WebP production memory guard requires root and systemd-run" >&2
+    return 1
+  fi
+
+  systemd-run --quiet --pipe --wait --collect \
+    --unit="weather-om-webp-${scope//_/-}-$$" \
+    --property="MemoryMax=$memory_max" \
+    --property="MemorySwapMax=0" \
+    --property="CPUQuota=$cpu_quota" \
+    --property="Nice=15" \
+    --property="IOSchedulingClass=idle" \
+    --setenv="OM_DEM_ROOT=$dem_root" \
+    --setenv="OM_MODEL_STATIC_ROOT=$model_static_root" \
+    "${renderer[@]}"
 }
 
 if [[ ! -f "$reporter" ]]; then

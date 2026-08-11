@@ -19,7 +19,9 @@ The production inventory renders model-specific GFS, ECMWF and CAMS layers for t
 
 ## Runtime
 
-`read_variable_grid_series` decodes each distinct source dependency once for the complete 121-frame output window, then all layers sharing that source are quantized and written in bounded six-frame encoding blocks. This avoids rebuilding native ECMWF run stitching for every block while keeping RGBA buffers bounded. Two workers are used by default for GFS, ECMWF and CAMS; `OM_WEBP_WORKERS` can override the deployment default.
+`read_variable_grid_series` decodes ordinary GFS, ECMWF and CAMS source dependencies once for the complete 121-frame output window, then quantizes and writes them in bounded six-frame encoding blocks. The dependency-heavy GFS/ECMWF `weather_code` source group is also read in six-frame blocks so cloud, precipitation, snow and instability grids are not resident for the complete output window at the same time. This avoids repeatedly rebuilding native ECMWF run stitching for ordinary variables while bounding the one multi-dependency group.
+
+Each production invocation runs in a transient systemd service with a 1536 MiB memory ceiling, no swap allocation and a 150% CPU quota. `OM_WEBP_MEMORY_MAX` and `OM_WEBP_CPU_QUOTA` are explicit operational overrides. The runner fails closed if the memory guard cannot be established, so a renderer regression is terminated without exhausting the production host. Two workers are used by default for GFS, ECMWF and CAMS; `OM_WEBP_WORKERS` can override the deployment default.
 
 The progress reporter is part of this WebP component at `scripts/task_progress_reporter.py`; the renderer does not depend on an external downloader repository.
 
