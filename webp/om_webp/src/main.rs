@@ -698,16 +698,16 @@ fn release_source_group_memory() {
 fn release_source_group_memory() {}
 
 fn source_read_block_frames(
-    scope: Scope,
-    variable: &str,
+    _scope: Scope,
+    _variable: &str,
     configured_block_frames: usize,
     total_frames: usize,
 ) -> usize {
-    if matches!(scope, Scope::Gfs) && variable == "weather_code" {
-        configured_block_frames.min(total_frames)
-    } else {
-        total_frames
-    }
+    // Keep the decoded OM working set bounded for every source group.  The
+    // encoder was already chunked, but reading the complete 121-frame source
+    // series first still allowed the native decoder and its dependency grids
+    // to push small production hosts into OOM before encoding began.
+    configured_block_frames.min(total_frames)
 }
 
 fn ensure_free_space(path: &Path, reserve_bytes: u64, additional_bytes: u64) -> Result<()> {
@@ -1614,18 +1614,22 @@ mod tests {
     }
 
     #[test]
-    fn gfs_weather_code_uses_bounded_source_reads() {
+    fn every_source_group_uses_bounded_reads() {
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "weather_code", 6, 121),
             6
         );
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "temperature_2m", 6, 121),
-            121
+            6
         );
         assert_eq!(
             source_read_block_frames(Scope::EcmwfIfs025, "weather_code", 6, 121),
-            121
+            6
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::Cams, "pm2_5", 6, 4),
+            4
         );
     }
 
