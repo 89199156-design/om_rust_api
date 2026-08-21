@@ -3396,8 +3396,8 @@ pub fn read_variable_grid_series(
                     ));
                 }
                 "wind_direction" | "winddirection" => {
-                    return Ok(combine2(
-                        read_direct_grid_series(
+                    return Ok(wind_direction_grid_series(
+                        &read_direct_grid_series(
                             snapshot,
                             decoder,
                             &raw("wind_u_component"),
@@ -3406,7 +3406,7 @@ pub fn read_variable_grid_series(
                             longitudes,
                             true,
                         )?,
-                        read_direct_grid_series(
+                        &read_direct_grid_series(
                             snapshot,
                             decoder,
                             &raw("wind_v_component"),
@@ -3415,7 +3415,6 @@ pub fn read_variable_grid_series(
                             longitudes,
                             true,
                         )?,
-                        wind_direction,
                     ));
                 }
                 "dew_point" | "dewpoint" => {
@@ -4116,8 +4115,8 @@ pub fn read_variable_grid_series(
             )?,
             |u, v| (u * u + v * v).sqrt(),
         )),
-        "wind_direction_10m" | "winddirection_10m" => Ok(combine2(
-            read_direct_grid_series(
+        "wind_direction_10m" | "winddirection_10m" => Ok(wind_direction_grid_series(
+            &read_direct_grid_series(
                 snapshot,
                 decoder,
                 "wind_u_component_10m",
@@ -4126,7 +4125,7 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?,
-            read_direct_grid_series(
+            &read_direct_grid_series(
                 snapshot,
                 decoder,
                 "wind_v_component_10m",
@@ -4135,7 +4134,6 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?,
-            wind_direction,
         )),
         "wind_speed_100m" | "windspeed_100m" => Ok(combine2(
             read_direct_grid_series(
@@ -4158,8 +4156,8 @@ pub fn read_variable_grid_series(
             )?,
             |u, v| (u * u + v * v).sqrt(),
         )),
-        "wind_direction_100m" | "winddirection_100m" => Ok(combine2(
-            read_direct_grid_series(
+        "wind_direction_100m" | "winddirection_100m" => Ok(wind_direction_grid_series(
+            &read_direct_grid_series(
                 snapshot,
                 decoder,
                 "wind_u_component_100m",
@@ -4168,7 +4166,7 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?,
-            read_direct_grid_series(
+            &read_direct_grid_series(
                 snapshot,
                 decoder,
                 "wind_v_component_100m",
@@ -4177,7 +4175,6 @@ pub fn read_variable_grid_series(
                 longitudes,
                 true,
             )?,
-            wind_direction,
         )),
         "snowfall" => Ok(read_direct_grid_series(
             snapshot,
@@ -10925,23 +10922,51 @@ mod tests {
             (5.0, 3.0),
             (6.0, 4.0),
         ];
-        // Bit patterns captured from the pinned official C source compiled for
-        // the same Linux/x86_64 production target.
+        // Bit patterns captured from the pinned official C source compiled with
+        // the same Linux/x86_64 native production flags.
         let expected = [
-            f32::from_bits(0x41937b00),
+            f32::from_bits(0x41937afd),
             f32::from_bits(0x43b40000),
             f32::from_bits(0x43b40000),
             f32::from_bits(0x43870000),
             f32::from_bits(0x43870000),
             f32::from_bits(0x437b90a1),
             f32::from_bits(0x43736f5d),
-            f32::from_bits(0x436f094c),
+            f32::from_bits(0x436f094b),
             f32::from_bits(0x436c4f56),
         ];
 
-        let actual = inputs.map(|(u, v)| wind_direction(u, v));
-        assert_eq!(actual, expected);
+        let u = inputs.map(|(u, _)| u);
+        let v = inputs.map(|(_, v)| v);
+        assert_eq!(wind_directions(&u, &v), expected);
         assert!(wind_direction(f32::NAN, 1.0).is_nan());
+    }
+
+    #[test]
+    fn ecmwf_native_wind_batch_matches_official_north_boundary_bits() {
+        let u: [f32; 8] = [-1.2, 0.5, 0.2, 1.8, 2.1, 5.3, -3.8, -4.9];
+        let v: [f32; 8] = [2.6, 1.1, -0.7, 2.2, -8.6, -9.6, -4.5, 0.6];
+        let speed: [f32; 8] =
+            std::array::from_fn(|index| (u[index] * u[index] + v[index] * v[index]).sqrt());
+        let direction = wind_directions(&u, &v);
+        let expected_direction_bits = [
+            0x431b3992, 0x434c71a6, 0x43ac06fb, 0x435b4a15, 0x43ad238b, 0x43a58c83, 0x4220b77a,
+            0x42c1f641,
+        ];
+        assert_eq!(
+            direction
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_direction_bits
+        );
+
+        let dominant = dominant_wind_direction(&speed, &direction);
+        assert_eq!(dominant.to_bits(), 0x38070908);
+        assert_eq!(
+            json_value_for_variable("wind_direction_100m", dominant),
+            serde_json::json!(0)
+        );
     }
 
     #[test]
@@ -12770,38 +12795,55 @@ fn thunderstorm_probability(
     (base_probability * cloud_cover_factor * latitude_factor).clamp(0.0, 100.0)
 }
 
-/// Port of Open-Meteo's pinned `CHelper/src/shim.c::windirectionFast`.
-/// Keep all constants and operations in single precision and preserve the
-/// nested fused multiply-add sequence used by the official implementation.
-fn wind_direction(u: f32, v: f32) -> f32 {
-    if v == 0.0 {
-        return if u < 0.0 { 90.0 } else { 270.0 };
-    }
-    if u == 0.0 {
-        return if v < 0.0 { 360.0 } else { 180.0 };
-    }
+unsafe extern "C" {
+    fn om_windirection_fast(num_points: usize, ys: *const f32, xs: *const f32, out: *mut f32);
+}
 
-    let swap = v.abs() < u.abs();
-    let atan_input = if swap { v / u } else { u / v };
-    let x_sq = atan_input * atan_input;
-    let polynomial = x_sq.mul_add(
-        x_sq.mul_add(
-            x_sq.mul_add(
-                x_sq.mul_add(x_sq.mul_add(-0.011_721_2, 0.05265332), -0.11643287),
-                0.19354346,
-            ),
-            -0.33262347,
-        ),
-        0.99997726,
+/// Call Open-Meteo's bulk C implementation without splitting the input into
+/// scalar operations. The official helper is intentionally array-oriented.
+fn wind_directions(u: &[f32], v: &[f32]) -> Vec<f32> {
+    assert_eq!(u.len(), v.len(), "wind component lengths must match");
+    let mut out = vec![f32::NAN; u.len()];
+    if !u.is_empty() {
+        // SAFETY: all pointers remain valid for exactly `u.len()` elements and
+        // the output buffer is uniquely owned for the duration of the call.
+        unsafe {
+            om_windirection_fast(u.len(), u.as_ptr(), v.as_ptr(), out.as_mut_ptr());
+        }
+    }
+    out
+}
+
+fn wind_direction(u: f32, v: f32) -> f32 {
+    wind_directions(&[u], &[v])[0]
+}
+
+/// `read_variable_grid_series` stores values as `[time][point]`, while the
+/// official point reader evaluates the complete time vector for each point.
+fn wind_direction_grid_series(u: &[Vec<f32>], v: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    assert_eq!(u.len(), v.len(), "wind time dimensions must match");
+    let Some(first) = u.first() else {
+        return Vec::new();
+    };
+    let width = first.len();
+    assert!(
+        u.iter().chain(v).all(|frame| frame.len() == width),
+        "wind grid dimensions must match"
     );
-    let mut result = atan_input * polynomial;
-    if swap {
-        result = std::f32::consts::FRAC_PI_2.copysign(atan_input) - result;
+
+    let mut out = vec![vec![f32::NAN; width]; u.len()];
+    let mut point_u = Vec::with_capacity(u.len());
+    let mut point_v = Vec::with_capacity(v.len());
+    for point in 0..width {
+        point_u.clear();
+        point_v.clear();
+        point_u.extend(u.iter().map(|frame| frame[point]));
+        point_v.extend(v.iter().map(|frame| frame[point]));
+        for (time, direction) in wind_directions(&point_u, &point_v).into_iter().enumerate() {
+            out[time][point] = direction;
+        }
     }
-    if v < 0.0 {
-        result += std::f32::consts::PI.copysign(u);
-    }
-    result * (180.0 / std::f32::consts::PI) + 180.0
+    out
 }
 
 /// Reproduce `GenericDailyCalculator.dominantDirection` from the pinned
