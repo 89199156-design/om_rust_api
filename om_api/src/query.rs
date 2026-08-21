@@ -1993,11 +1993,7 @@ fn daily_weather_value(
         {
             return Ok(f32::NAN);
         }
-        return Ok(dominant_wind_direction(
-            &speed_values,
-            &direction_values,
-            current_weather_model() == WeatherModel::EcmwfIfs025,
-        ));
+        return Ok(dominant_wind_direction(&speed_values, &direction_values));
     }
 
     let source = aggregation.seed_variable();
@@ -8158,7 +8154,7 @@ fn read_cams_greenhouse_carbon_monoxide_for_mixer(
                 + coeff_b * fraction * fraction
                 + coeff_c * fraction
                 + b;
-            return Ok(round_to_scalefactor(h, 1.0).max(0.0));
+            return Ok(round_to_scalefactor(h, 1.0).clamp(0.0, f32::INFINITY));
         }
         return Ok(f32::NAN);
     }
@@ -8186,7 +8182,7 @@ fn read_cams_greenhouse_carbon_monoxide_with_history(
         longitude,
     )?;
     if index + 1 >= native_times.len() {
-        return Ok(round_to_scalefactor(b, 1.0).max(0.0));
+        return Ok(round_to_scalefactor(b, 1.0).clamp(0.0, f32::INFINITY));
     }
     let stride_seconds = interpolation_stride_seconds(&native_times, index);
     let a_time = native_times[index] - Duration::seconds(stride_seconds);
@@ -8237,7 +8233,7 @@ fn read_cams_greenhouse_carbon_monoxide_with_history(
         + coeff_b * fraction * fraction
         + coeff_c * fraction
         + b;
-    Ok(round_to_scalefactor(h, 1.0).max(0.0))
+    Ok(round_to_scalefactor(h, 1.0).clamp(0.0, f32::INFINITY))
 }
 
 fn read_cams_greenhouse_retained_native_value(
@@ -10962,7 +10958,7 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_100m",
-                dominant_wind_direction(&speed, &direction, false),
+                dominant_wind_direction(&speed, &direction),
             ),
             serde_json::json!(360)
         );
@@ -10982,17 +10978,17 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_10m",
-                dominant_wind_direction(&speed, &direction, false),
+                dominant_wind_direction(&speed, &direction),
             ),
             serde_json::json!(184)
         );
     }
 
     #[test]
-    fn dominant_wind_direction_canonicalizes_sub_ulp_north_boundary() {
+    fn dominant_wind_direction_preserves_sub_ulp_north_as_360() {
         // Frozen ECMWF p0487 spatial-archive frames for 2026-07-30. Their
         // reconstructed u sum is less than one ULP of the northward v sum;
-        // the official temporal API returns the equivalent canonical 0.
+        // the official source preserves the north boundary as 360.
         let speed = [
             f32::from_bits(0x3f3a5eed),
             f32::from_bits(0x3f9bb7fe),
@@ -11016,9 +11012,9 @@ mod tests {
         assert_eq!(
             json_value_for_variable(
                 "wind_direction_100m",
-                dominant_wind_direction(&speed, &direction, true),
+                dominant_wind_direction(&speed, &direction),
             ),
-            serde_json::json!(0)
+            serde_json::json!(360)
         );
     }
 
@@ -12812,7 +12808,7 @@ fn wind_direction(u: f32, v: f32) -> f32 {
 /// Open-Meteo source. The official path derives speed and direction for every
 /// model frame, reconstructs the two components in single precision, sums
 /// those reconstructed components, and only then evaluates the fast angle.
-fn dominant_wind_direction(speed: &[f32], direction: &[f32], canonicalize_north: bool) -> f32 {
+fn dominant_wind_direction(speed: &[f32], direction: &[f32]) -> f32 {
     debug_assert_eq!(speed.len(), direction.len());
     let u = speed
         .iter()
@@ -12824,13 +12820,6 @@ fn dominant_wind_direction(speed: &[f32], direction: &[f32], canonicalize_north:
         .zip(direction)
         .map(|(&speed, &direction)| -speed * (direction * SWIFT_FLOAT_PI / 180.0).cos())
         .sum::<f32>();
-    // The temporal API and spatial OM archive can differ by a final component
-    // quantization ULP. Canonicalize only a numerically indistinguishable
-    // northward vector; larger positive components still preserve official
-    // 360-degree output (including the frozen p0014 boundary).
-    if canonicalize_north && v < 0.0 && u.abs() <= f32::EPSILON * v.abs() {
-        return 0.0;
-    }
     wind_direction(u, v)
 }
 
