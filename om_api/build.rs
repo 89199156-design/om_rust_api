@@ -1,7 +1,9 @@
 fn main() {
     let mut build = cc::Build::new();
+    if let Ok(compiler) = std::env::var("OM_CC") {
+        build.compiler(compiler);
+    }
     build
-        .compiler("clang")
         .file("src/wind_direction.c")
         .opt_level(3)
         .warnings(true)

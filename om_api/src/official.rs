@@ -407,6 +407,135 @@ impl OfficialDecoder {
         Ok(output)
     }
 
+    /// Decode one already-compressed chunk from an OM numeric array without
+    /// requiring the original file header or lookup table. RegionPack archives
+    /// retain the exact compressed source chunks and their original global
+    /// chunk indexes, so reconstructing only the numeric-array metadata is both
+    /// lossless and substantially cheaper than materialising another OM file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_compressed_array_chunk(
+        &self,
+        dimensions: &[u64],
+        chunks: &[u64],
+        scale_factor: f32,
+        add_offset: f32,
+        data_type: u8,
+        compression: u8,
+        chunk_index: u64,
+        compressed: &[u8],
+    ) -> Result<Vec<f32>> {
+        if dimensions.len() != chunks.len() || dimensions.len() != 1 {
+            bail!("direct compressed-chunk decoding requires one matching array dimension");
+        }
+        if dimensions[0] == 0 || chunks[0] == 0 || compressed.is_empty() {
+            bail!("direct compressed-chunk metadata and payload must not be empty");
+        }
+        let chunk_start = chunk_index
+            .checked_mul(chunks[0])
+            .context("compressed chunk offset overflow")?;
+        if chunk_start >= dimensions[0] {
+            bail!("compressed chunk index exceeds the source array");
+        }
+        let output_count = chunks[0].min(dimensions[0] - chunk_start);
+        let functions = self
+            .inner
+            .encoder
+            .context("official OM library cannot construct numeric-array metadata")?;
+        let name = b"regionpack";
+        let metadata_size = unsafe {
+            (functions.om_variable_write_numeric_array_size)(
+                u16::try_from(name.len())?,
+                0,
+                dimensions.len() as u64,
+            )
+        };
+        let mut metadata = vec![0_u8; metadata_size];
+        unsafe {
+            (functions.om_variable_write_numeric_array)(
+                metadata.as_mut_ptr() as *mut c_void,
+                u16::try_from(name.len())?,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                name.as_ptr() as *const c_char,
+                data_type.into(),
+                compression.into(),
+                scale_factor,
+                add_offset,
+                dimensions.len() as u64,
+                dimensions.as_ptr(),
+                chunks.as_ptr(),
+                0,
+                0,
+            );
+        }
+
+        let read_offset = [chunk_start];
+        let read_count = [output_count];
+        let cube_offset = [0_u64];
+        let cube_dimensions = [output_count];
+        let variable_ptr = unsafe { (self.inner.om_variable_init)(metadata.as_ptr().cast()) };
+        let mut decoder = OmDecoder {
+            dimensions_count: 0,
+            io_size_merge: 0,
+            io_size_max: 0,
+            lut_chunk_length: 0,
+            lut_start: 0,
+            number_of_chunks: 0,
+            dimensions: std::ptr::null(),
+            chunks: std::ptr::null(),
+            read_offset: std::ptr::null(),
+            read_count: std::ptr::null(),
+            cube_dimensions: std::ptr::null(),
+            cube_offset: std::ptr::null(),
+            scale_factor: 1.0,
+            add_offset: 0.0,
+            data_type: 0,
+            compression: 0,
+            bytes_per_element: 0,
+            bytes_per_element_compressed: 0,
+        };
+        let error = unsafe {
+            (self.inner.om_decoder_init)(
+                &mut decoder,
+                variable_ptr,
+                1,
+                read_offset.as_ptr(),
+                read_count.as_ptr(),
+                cube_offset.as_ptr(),
+                cube_dimensions.as_ptr(),
+                0,
+                64 * 1024 * 1024,
+            )
+        };
+        self.ensure_ok(error)?;
+
+        let mut output = vec![f32::NAN; usize::try_from(output_count)?];
+        let mut chunk_buffer =
+            vec![0_u8; unsafe { (self.inner.om_decoder_read_buffer_size)(&decoder) } as usize];
+        let mut decode_error = 0_u32;
+        let ok = unsafe {
+            (self.inner.om_decoder_decode_chunks)(
+                &decoder,
+                OmRange {
+                    lower_bound: chunk_index,
+                    upper_bound: chunk_index + 1,
+                },
+                compressed.as_ptr().cast(),
+                compressed.len() as u64,
+                output.as_mut_ptr().cast(),
+                chunk_buffer.as_mut_ptr().cast(),
+                &mut decode_error,
+            )
+        };
+        if !ok {
+            self.ensure_ok(decode_error)?;
+            bail!("official OM decoder rejected a retained compressed chunk");
+        }
+        self.ensure_ok(decode_error)?;
+        Ok(output)
+    }
+
     fn ensure_ok(&self, error: u32) -> Result<()> {
         if error == 0 {
             return Ok(());

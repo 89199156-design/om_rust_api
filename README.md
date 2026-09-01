@@ -2,7 +2,7 @@
 
 上海和新加坡生产环境共有的 Rust 点位 API 与 WebP 生成仓库。
 
-本仓库只消费已经发布的 Open-Meteo Native/OM 数据，不下载官方 OM，也不把原始 GFS、ECMWF、CAMS 数据转换为 OM：
+本仓库只消费部署环境已经发布的只读数据，不执行任何上游下载，也不保存下载凭据：GFS、ECMWF IFS 0.25°、CAMS 使用 Open-Meteo Native/OM；ECMWF IFS 9 km 直接读取闭源下载仓库产出的裁剪 RegionPack，不再转换成 OM 数据库。
 
 - `om_rust_api`：共有 Rust API、WebP、部署脚本和跨服务器一致性验证。
 - `om_data_raw`：仅新加坡，Swift 将官方原始模型数据生成 OM。
@@ -13,11 +13,13 @@
 ## 组件
 
 - `om_api/`：Rust HTTP API、OM 解码、插值、小时/日聚合、派生变量、数据身份和归属接口。
-- `webp/om_webp/`：Rust WebP 渲染器与部署/校验脚本。
+- `webp/om_webp/`：Rust WebP 渲染器与部署/校验脚本；EC9 和点位 API 共用同一开源解码、批次降级和插值逻辑。
 - `scripts/`：API 安装、原生解码库构建和官方/双服务器一致性验证。
 - `nginx/`：API、来源归档和 WebP 的生产反向代理配置。
 
 仓库不包含下载器、Swift 生产代码、运行时天气数据、编译产物、容器镜像或服务器备份。
+
+本仓库按公开源码维护，禁止写入任何账号、API Key、Token、密码或带认证信息的 URL。`scripts/check_secrets.py --history`、Git 提交钩子和 GitHub Actions 会扫描当前文件及完整可达历史；一旦真实凭据进入提交，即使随后删除也必须立即轮换，不能只依赖仓库可见性或删除提交。
 
 ## 数据根目录
 
@@ -29,6 +31,8 @@
 - 固定模型高程：`OM_MODEL_STATIC_ROOT=/opt/1panel/apps/weather_om_api`
 
 API 在启动或 HUP 时构建只读快照；生产流水线只在完整批次原子发布后刷新一次。WebP 读取同一批次标识，生成完整不可变 release 后再切换 current。
+
+EC9 的公开入口为 `/v1/ecmwf-ifs9km`、`/v1/ecmwf-ifs9km/catalog` 和 `/v1/ecmwf-ifs9km/route`。其默认小时轴从上海当天 00:00 开始，按保留的五个源批次从新到旧选择结构覆盖并对 NaN 继续向旧批次降级，确保当天已经过去的小时不会仅因最新模式起报时间较晚而缺失。
 
 ## 本地验证
 

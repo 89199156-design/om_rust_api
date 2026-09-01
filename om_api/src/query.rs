@@ -66,6 +66,7 @@ pub const ECMWF_UPSTREAM_BASELINE: &str = "fc670930b55c963b10e9578c8628a824da43a
 pub enum WeatherModel {
     Gfs,
     EcmwfIfs025,
+    EcmwfIfs9km,
 }
 
 impl WeatherModel {
@@ -74,6 +75,7 @@ impl WeatherModel {
         match value.as_str() {
             "" | "gfs" | "ncep_gfs" | "ncep_gfs013" => Ok(Self::Gfs),
             "ec" | "ecmwf" | "ecmwf_ifs025" => Ok(Self::EcmwfIfs025),
+            "ec9" | "ecmwf_ifs9km" | "ecmwf_ifs_9km" => Ok(Self::EcmwfIfs9km),
             _ => bail!("unsupported weather model: {value}"),
         }
     }
@@ -82,13 +84,15 @@ impl WeatherModel {
         match self {
             Self::Gfs => "gfs013_surface",
             Self::EcmwfIfs025 => "ecmwf_ifs025",
+            Self::EcmwfIfs9km => "ecmwf_ifs9km",
         }
     }
 
-    fn static_elevation_spec(self) -> StaticElevationSpec {
+    fn static_elevation_spec(self) -> Option<StaticElevationSpec> {
         match self {
-            Self::Gfs => GFS013_STATIC_SPEC,
-            Self::EcmwfIfs025 => ECMWF025_STATIC_SPEC,
+            Self::Gfs => Some(GFS013_STATIC_SPEC),
+            Self::EcmwfIfs025 => Some(ECMWF025_STATIC_SPEC),
+            Self::EcmwfIfs9km => None,
         }
     }
 
@@ -96,7 +100,12 @@ impl WeatherModel {
         match self {
             Self::Gfs => "GFS013",
             Self::EcmwfIfs025 => "ECMWF IFS025",
+            Self::EcmwfIfs9km => "ECMWF IFS 9 km",
         }
+    }
+
+    fn is_ecmwf(self) -> bool {
+        matches!(self, Self::EcmwfIfs025 | Self::EcmwfIfs9km)
     }
 }
 
@@ -285,7 +294,7 @@ fn current_weather_model() -> WeatherModel {
 }
 
 fn derives_diffuse_radiation(model: WeatherModel) -> bool {
-    model == WeatherModel::EcmwfIfs025
+    model.is_ecmwf()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +331,7 @@ struct RequestSampling {
     gefs05: Option<ModelSampling>,
     ecmwf025: Option<ModelSampling>,
     ecmwf025_ensemble: Option<ModelSampling>,
+    ecmwf9km: Option<ModelSampling>,
     response_elevation: f32,
 }
 
@@ -351,6 +361,7 @@ fn current_product_sampling(product: &str) -> Option<ModelSampling> {
                 "ncep_gefs05" => sampling.gefs05,
                 "ecmwf_ifs025" => sampling.ecmwf025,
                 "ecmwf_ifs025_ensemble" => sampling.ecmwf025_ensemble,
+                "ecmwf_ifs9km" => sampling.ecmwf9km,
                 _ => None,
             })
     })
@@ -621,6 +632,68 @@ pub const ECMWF_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
     "weather_code",
     "is_day",
 ];
+pub const ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
+    "temperature_2m",
+    "temperature_2m_min",
+    "temperature_2m_max",
+    "relative_humidity_2m",
+    "dew_point_2m",
+    "apparent_temperature",
+    "wet_bulb_temperature_2m",
+    "pressure_msl",
+    "surface_pressure",
+    "cloud_cover",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "precipitation",
+    "rain",
+    "showers",
+    "snowfall",
+    "snowfall_water_equivalent",
+    "snow_depth",
+    "cape",
+    "convective_inhibition",
+    "boundary_layer_height",
+    "visibility",
+    "shortwave_radiation",
+    "shortwave_radiation_instant",
+    "direct_radiation",
+    "direct_radiation_instant",
+    "diffuse_radiation",
+    "diffuse_radiation_instant",
+    "direct_normal_irradiance",
+    "direct_normal_irradiance_instant",
+    "global_tilted_irradiance",
+    "global_tilted_irradiance_instant",
+    "sunshine_duration",
+    "et0_fao_evapotranspiration",
+    "vapor_pressure_deficit",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "wind_gusts_10m",
+    "wind_speed_100m",
+    "wind_direction_100m",
+    "wind_speed_200m",
+    "wind_direction_200m",
+    "surface_temperature",
+    "skin_temperature",
+    "soil_temperature_0cm",
+    "soil_temperature_0_to_7cm",
+    "soil_temperature_7_to_28cm",
+    "soil_temperature_28_to_100cm",
+    "soil_temperature_100_to_255cm",
+    "soil_temperature_0_to_100cm",
+    "soil_moisture_0_to_7cm",
+    "soil_moisture_7_to_28cm",
+    "soil_moisture_28_to_100cm",
+    "soil_moisture_100_to_255cm",
+    "soil_moisture_0_to_100cm",
+    "total_column_integrated_water_vapour",
+    "growing_degree_days_base_0_limit_50",
+    "weather_code",
+    "is_day",
+];
 pub const ECMWF_PUBLIC_PRESSURE_VARIABLE_TYPES: &[&str] = &[
     "temperature",
     "relative_humidity",
@@ -714,6 +787,39 @@ pub fn ecmwf_public_hourly_variables() -> Vec<String> {
             variables.push(format!("{variable_type}_{level}hPa"));
         }
     }
+    variables
+}
+
+pub fn ecmwf_ifs9km_public_hourly_variables() -> Vec<String> {
+    ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES
+        .iter()
+        .map(|variable| (*variable).to_string())
+        .collect()
+}
+
+pub fn ecmwf_ifs9km_public_daily_variables() -> Vec<String> {
+    let mut variables = ECMWF_PUBLIC_DAILY_VARIABLES
+        .iter()
+        .copied()
+        .filter(|variable| !variable.starts_with("precipitation_probability_"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    variables.extend(
+        [
+            "showers_sum",
+            "visibility_max",
+            "visibility_mean",
+            "visibility_min",
+            "wind_direction_200m_dominant",
+            "wind_speed_200m_max",
+            "wind_speed_200m_mean",
+            "wind_speed_200m_min",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    variables.sort();
+    variables.dedup();
     variables
 }
 
@@ -865,6 +971,10 @@ fn is_ecmwf_public_hourly_variable(variable: &str) -> bool {
         || is_ecmwf_public_pressure_variable(variable)
 }
 
+fn is_ecmwf_ifs9km_public_hourly_variable(variable: &str) -> bool {
+    ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES.contains(&variable)
+}
+
 fn is_gfs_public_daily_variable(variable: &str) -> bool {
     matches!(
         variable,
@@ -938,6 +1048,7 @@ fn validate_public_hourly_variables(variables: &[String]) -> Result<()> {
         let supported = match current_weather_model() {
             WeatherModel::Gfs => is_public_hourly_variable(variable),
             WeatherModel::EcmwfIfs025 => is_ecmwf_public_hourly_variable(variable),
+            WeatherModel::EcmwfIfs9km => is_ecmwf_ifs9km_public_hourly_variable(variable),
         };
         if !supported {
             bail!("unsupported public hourly variable: {variable}");
@@ -948,8 +1059,17 @@ fn validate_public_hourly_variables(variables: &[String]) -> Result<()> {
 
 fn validate_public_daily_variables(variables: &[String]) -> Result<()> {
     for variable in variables {
-        if current_weather_model() == WeatherModel::EcmwfIfs025 {
-            if !ECMWF_PUBLIC_DAILY_VARIABLES.contains(&variable.as_str()) {
+        if current_weather_model().is_ecmwf() {
+            let supported = match current_weather_model() {
+                WeatherModel::EcmwfIfs025 => {
+                    ECMWF_PUBLIC_DAILY_VARIABLES.contains(&variable.as_str())
+                }
+                WeatherModel::EcmwfIfs9km => ecmwf_ifs9km_public_daily_variables()
+                    .iter()
+                    .any(|candidate| candidate == variable),
+                WeatherModel::Gfs => unreachable!(),
+            };
+            if !supported {
                 bail!("unsupported ECMWF daily variable: {variable}");
             }
         } else {
@@ -1088,9 +1208,11 @@ pub fn forecast_for_query(
     with_direct_grid_series_request_cache(|| {
         with_weather_model(model, || {
             with_daily_request_cache(|| match model {
-                WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(|| {
-                    forecast_for_query_for_model(snapshot, decoder, query)
-                }),
+                WeatherModel::EcmwfIfs025 | WeatherModel::EcmwfIfs9km => {
+                    with_ecmwf_request_cache(|| {
+                        forecast_for_query_for_model(snapshot, decoder, query)
+                    })
+                }
                 WeatherModel::Gfs => with_gfs_request_cache(|| {
                     forecast_for_query_for_model(snapshot, decoder, query)
                 }),
@@ -1225,6 +1347,7 @@ fn forecast_for_query_for_model(
                     let model = match current_weather_model() {
                         WeatherModel::Gfs => sampling.gfs013,
                         WeatherModel::EcmwfIfs025 => sampling.ecmwf025,
+                        WeatherModel::EcmwfIfs9km => sampling.ecmwf9km,
                     };
                     if let Some(model) = model {
                         response.latitude = model.latitude;
@@ -1291,7 +1414,7 @@ pub fn route_forecast(
 ) -> Result<RouteResponse> {
     let model = WeatherModel::parse(query.models.as_deref())?;
     with_weather_model(model, || match model {
-        WeatherModel::EcmwfIfs025 => {
+        WeatherModel::EcmwfIfs025 | WeatherModel::EcmwfIfs9km => {
             with_ecmwf_request_cache(|| route_forecast_for_model(snapshot, decoder, query))
         }
         WeatherModel::Gfs => {
@@ -1414,7 +1537,9 @@ fn point_forecast_with_request_cache(
             with_direct_grid_series_request_cache_handle(direct_grid_series_cache.clone(), || {
                 with_weather_model(model, || {
                     let read_with_cache = || match model {
-                        WeatherModel::EcmwfIfs025 => with_ecmwf_request_cache(read),
+                        WeatherModel::EcmwfIfs025 | WeatherModel::EcmwfIfs9km => {
+                            with_ecmwf_request_cache(read)
+                        }
                         WeatherModel::Gfs => with_gfs_request_cache(read),
                     };
                     match sampling {
@@ -1618,6 +1743,9 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
         "wind_speed_100m_max" => DailyWeatherAggregation::Max("wind_speed_100m"),
         "wind_speed_100m_min" => DailyWeatherAggregation::Min("wind_speed_100m"),
         "wind_speed_100m_mean" => DailyWeatherAggregation::Mean("wind_speed_100m"),
+        "wind_speed_200m_max" => DailyWeatherAggregation::Max("wind_speed_200m"),
+        "wind_speed_200m_min" => DailyWeatherAggregation::Min("wind_speed_200m"),
+        "wind_speed_200m_mean" => DailyWeatherAggregation::Mean("wind_speed_200m"),
         "wind_direction_10m_dominant" | "winddirection_10m_dominant" => {
             DailyWeatherAggregation::DominantWindDirection {
                 speed: "wind_speed_10m",
@@ -1629,6 +1757,11 @@ fn daily_weather_aggregation(variable: &str) -> Result<DailyWeatherAggregation> 
             speed: "wind_speed_100m",
             direction: "wind_direction_100m",
             output: "wind_direction_100m",
+        },
+        "wind_direction_200m_dominant" => DailyWeatherAggregation::DominantWindDirection {
+            speed: "wind_speed_200m",
+            direction: "wind_direction_200m",
+            output: "wind_direction_200m",
         },
         "precipitation_hours" => DailyWeatherAggregation::PrecipitationHours("precipitation"),
         "visibility_max" => DailyWeatherAggregation::Max("visibility"),
@@ -1857,6 +1990,57 @@ fn select_weather_dates(
         bail!("past_days and forecast_days cannot be combined with start_date and end_date");
     }
 
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+        let (first, last) = regionpack.time_bounds()?;
+        let first_date = first.with_timezone(&timezone.offset).date_naive();
+        let last_date = last.with_timezone(&timezone.offset).date_naive();
+        let (requested_start, requested_end) = match (start_date, end_date) {
+            (Some(start), Some(end)) => (
+                NaiveDate::parse_from_str(start, "%Y-%m-%d")
+                    .with_context(|| format!("invalid date: {start}"))?,
+                NaiveDate::parse_from_str(end, "%Y-%m-%d")
+                    .with_context(|| format!("invalid date: {end}"))?,
+            ),
+            (None, None) => {
+                let past_days = past_days.unwrap_or(0);
+                let forecast_days = forecast_days.unwrap_or(7);
+                if forecast_days == 0 || forecast_days > 16 {
+                    bail!("forecast_days must be between 1 and 16");
+                }
+                let today = Utc::now().with_timezone(&timezone.offset).date_naive();
+                (
+                    today
+                        .checked_sub_signed(Duration::days(past_days as i64))
+                        .context("daily start date overflow")?,
+                    today
+                        .checked_add_signed(Duration::days(forecast_days as i64 - 1))
+                        .context("daily end date overflow")?,
+                )
+            }
+            _ => unreachable!("validated matching start/end date options"),
+        };
+        if requested_start > requested_end {
+            bail!("start_date must not be after end_date");
+        }
+        if requested_start < first_date || requested_end > last_date {
+            bail!(
+                "daily date range is outside available EC9 data: {} to {}",
+                first_date,
+                last_date
+            );
+        }
+        let mut dates = Vec::new();
+        let mut date = requested_start;
+        while date <= requested_end {
+            dates.push(date);
+            date = date.succ_opt().context("daily date range overflow")?;
+        }
+        return Ok(dates);
+    }
+
     let raw_seed = if current_weather_model() == WeatherModel::EcmwfIfs025
         || seed_variable == "precipitation_probability"
     {
@@ -1976,7 +2160,7 @@ fn daily_weather_value(
         speed, direction, ..
     } = aggregation
     {
-        let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025 {
+        let step_hours = if current_weather_model().is_ecmwf() {
             3
         } else {
             1
@@ -1997,7 +2181,7 @@ fn daily_weather_value(
     }
 
     let source = aggregation.seed_variable();
-    let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025
+    let step_hours = if current_weather_model().is_ecmwf()
         && matches!(
             aggregation,
             DailyWeatherAggregation::Mean(_)
@@ -2308,6 +2492,29 @@ fn select_times(
     end: Option<DateTime<Utc>>,
     limit: Option<usize>,
 ) -> Result<Vec<DateTime<Utc>>> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+        let (first, last) = regionpack.time_bounds()?;
+        let selected_start = start
+            .map(|requested| requested.max(first))
+            .unwrap_or_else(|| regionpack.public_start_utc().max(first));
+        let selected_end = end.unwrap_or(last).min(last);
+        let mut times = Vec::new();
+        let mut time = selected_start;
+        while time <= selected_end {
+            times.push(time);
+            time += Duration::hours(1);
+        }
+        if let Some(limit) = limit {
+            times.truncate(limit);
+        }
+        if times.is_empty() {
+            bail!("no EC9 data available for requested time range");
+        }
+        return Ok(times);
+    }
     let contains_weather = variables.is_empty()
         || variables
             .iter()
@@ -2720,6 +2927,44 @@ pub fn read_variable_value(
             )?;
             return Ok((u * u + v * v).sqrt());
         }
+        "wind_speed_200m" | "windspeed_200m" => {
+            let u = read_direct(
+                snapshot,
+                decoder,
+                "wind_u_component_200m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let v = read_direct(
+                snapshot,
+                decoder,
+                "wind_v_component_200m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            return Ok((u * u + v * v).sqrt());
+        }
+        "wind_direction_200m" | "winddirection_200m" => {
+            let u = read_direct(
+                snapshot,
+                decoder,
+                "wind_u_component_200m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let v = read_direct(
+                snapshot,
+                decoder,
+                "wind_v_component_200m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            return Ok(wind_direction(u, v));
+        }
         "wind_direction_100m"
         | "winddirection_100m"
         | "wind_direction_120m"
@@ -3128,7 +3373,7 @@ pub fn read_variable_grid(
     if latitudes.is_empty() || longitudes.is_empty() {
         bail!("regional grid dimensions must not be empty");
     }
-    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+    if current_weather_model().is_ecmwf() {
         let mut frames =
             read_variable_grid_series(snapshot, decoder, variable, &[time], latitudes, longitudes)?;
         return Ok(frames.remove(0));
@@ -4170,6 +4415,47 @@ pub fn read_variable_grid_series(
                 snapshot,
                 decoder,
                 "wind_v_component_100m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+        )),
+        "wind_speed_200m" | "windspeed_200m" => Ok(combine2(
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_200m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_200m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            |u, v| (u * u + v * v).sqrt(),
+        )),
+        "wind_direction_200m" | "winddirection_200m" => Ok(wind_direction_grid_series(
+            &read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_u_component_200m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )?,
+            &read_direct_grid_series(
+                snapshot,
+                decoder,
+                "wind_v_component_200m",
                 times,
                 latitudes,
                 longitudes,
@@ -5285,6 +5571,13 @@ fn read_weather_surface_elevation_grid(
     longitudes: &[f64],
 ) -> Result<Vec<f32>> {
     let model = current_weather_model();
+    if model == WeatherModel::EcmwfIfs9km {
+        let elevation = current_product_sampling("ecmwf_ifs9km")
+            .map(surface_pressure_elevation)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0);
+        return Ok(vec![elevation; latitudes.len() * longitudes.len()]);
+    }
     let product = snapshot.require_product(model.primary_product())?;
     let mut values = if let Some(entry) = product.static_entries.get("surface_elevation") {
         read_entry_grid(&product, entry, decoder, latitudes, longitudes)?
@@ -5292,7 +5585,9 @@ fn read_weather_surface_elevation_grid(
         read_static_elevation_grid_for_coordinates(
             snapshot,
             decoder,
-            model.static_elevation_spec(),
+            model
+                .static_elevation_spec()
+                .context("weather model has no static elevation contract")?,
             latitudes,
             longitudes,
         )?
@@ -5338,6 +5633,26 @@ fn read_direct_with_rounding(
     longitude: f64,
     round_values: bool,
 ) -> Result<f32> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let decoder = decoder.context("official OM decoder is required for EC9 RegionPack data")?;
+        let mut frames = read_ecmwf_ifs9km_window_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            &[time],
+            &[latitude],
+            &[longitude],
+        )?;
+        let mut value = frames.remove(0).remove(0);
+        if !round_values {
+            // The retained source chunks already carry their native scale. The
+            // two-stage ECMWF path quantises derived hourly values by design;
+            // exact native control points are unchanged by that quantisation.
+            return Ok(value);
+        }
+        value = round_variable_output_value(variable, value);
+        return Ok(value);
+    }
     if variable == "carbon_monoxide"
         && snapshot.product("cams_global_greenhouse_gases").is_some()
         && snapshot.product("cams_global").is_some()
@@ -5425,7 +5740,7 @@ fn read_direct_grid(
     if variable == "carbon_monoxide" {
         bail!("regional carbon_monoxide mixing is not implemented");
     }
-    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+    if current_weather_model().is_ecmwf() {
         let mut frames = read_direct_grid_series(
             snapshot,
             decoder,
@@ -5725,6 +6040,24 @@ fn read_direct_grid_series_uncached(
     longitudes: &[f64],
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let mut values = read_ecmwf_ifs9km_window_grid_series(
+            snapshot, decoder, variable, times, latitudes, longitudes,
+        )?;
+        if round_values {
+            for frame in &mut values {
+                for value in frame {
+                    *value = round_variable_output_value(variable, *value);
+                }
+            }
+        }
+        for frame in &mut values {
+            for value in frame {
+                *value = apply_elevation_correction("ecmwf_ifs9km", variable, *value);
+            }
+        }
+        return Ok(values);
+    }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     // Point requests resolve a potentially different nearest land/model cell
     // for every product (for example GFS 0.13° surface versus 0.25° wind).
@@ -5895,7 +6228,10 @@ fn is_gfs_probability_product(product_name: &str) -> bool {
 }
 
 fn is_ecmwf_product(product_name: &str) -> bool {
-    matches!(product_name, "ecmwf_ifs025" | "ecmwf_ifs025_ensemble")
+    matches!(
+        product_name,
+        "ecmwf_ifs025" | "ecmwf_ifs025_ensemble" | "ecmwf_ifs9km"
+    )
 }
 
 fn is_cams_product(product_name: &str) -> bool {
@@ -7176,6 +7512,154 @@ fn read_ecmwf_window_grid_series(
         latitudes,
         longitudes,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_ecmwf_ifs9km_window_grid_series(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<Vec<f32>>> {
+    if times.is_empty() {
+        return Ok(Vec::new());
+    }
+    let regionpack = snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+    let first_requested = *times
+        .iter()
+        .min()
+        .context("EC9 request has no first time")?;
+    let last_requested = *times
+        .iter()
+        .max()
+        .context("EC9 request has no final time")?;
+    // Four six-hour source intervals cover Hermite A/B/C/D support at the
+    // sparse long-range boundary while keeping retained older runs bounded.
+    let support_start = first_requested - Duration::hours(24);
+    let support_end = last_requested + Duration::hours(24);
+    let key = EcmwfRegularCacheKey {
+        coverage_id: format!(
+            "{}:{}:{}",
+            regionpack.batch_id(),
+            support_start.timestamp(),
+            support_end.timestamp()
+        ),
+        raw_variable: raw_variable.to_string(),
+        latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
+        longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
+    };
+    let build = || {
+        build_ecmwf_ifs9km_regular_series(
+            regionpack.as_ref(),
+            decoder,
+            raw_variable,
+            support_start,
+            support_end,
+            latitudes,
+            longitudes,
+        )
+    };
+    // Point and route requests benefit from retaining one regularized source
+    // series across derived fields. A map render can contain hundreds of
+    // thousands of points; retaining each dependency there would make
+    // weather-code generation hold several complete five-run grids at once.
+    // Build those large series as short-lived values instead.
+    let regular = if latitudes.len().saturating_mul(longitudes.len()) > 65_536 {
+        build()?.map(Arc::new)
+    } else {
+        ecmwf_cached_regular_series(key, build)?
+    }
+    .with_context(|| format!("EC9 variable is not available: {raw_variable}"))?;
+    read_ecmwf_regular_series_grid(
+        &[regular],
+        "ecmwf_ifs9km",
+        raw_variable,
+        times,
+        latitudes,
+        longitudes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ecmwf_ifs9km_regular_series(
+    regionpack: &crate::regionpack::RegionPackSnapshot,
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    support_start: DateTime<Utc>,
+    support_end: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<EcmwfRegularSeries>> {
+    let plan = regionpack.sampling_plan(latitudes, longitudes)?;
+    let grid_len = latitudes.len() * longitudes.len();
+    let width = longitudes.len();
+    let mut runs = Vec::new();
+    for run in regionpack.runs_oldest_to_newest() {
+        let selected = run
+            .frames
+            .iter()
+            .filter_map(|(valid_time, file)| {
+                let forecast_seconds = (*valid_time - run.reference_time).num_seconds();
+                (forecast_seconds >= 0
+                    && forecast_seconds % (3 * 3600) == 0
+                    && *valid_time >= support_start
+                    && *valid_time <= support_end)
+                    .then_some((*valid_time, file))
+            })
+            .collect::<Vec<_>>();
+        let Some((first_time, _)) = selected.first() else {
+            continue;
+        };
+        let first_time = *first_time;
+        let last_time = selected.last().expect("selected EC9 frame exists").0;
+        let count = usize::try_from((last_time - first_time).num_hours() / 3 + 1)?;
+        let mut frames = vec![vec![f32::NAN; grid_len]; count];
+        let mut variable_found = false;
+        for (valid_time, file) in selected {
+            let index = usize::try_from((valid_time - first_time).num_hours() / 3)?;
+            if let Some(values) = file.decode(decoder, regionpack.bounds(), raw_variable, &plan)? {
+                variable_found = true;
+                frames[index] = values;
+            }
+        }
+        if !variable_found {
+            continue;
+        }
+        let kind = ecmwf_interpolation_kind(raw_variable);
+        let is_gust = raw_variable == "wind_gusts_10m";
+        for point in 0..grid_len {
+            let mut values = frames.iter().map(|frame| frame[point]).collect::<Vec<_>>();
+            ecmwf_first_stage_point(
+                &mut values,
+                kind,
+                first_time,
+                latitudes[point / width] as f32,
+                longitudes[point % width] as f32,
+                is_gust,
+                false,
+            );
+            for (frame, value) in frames.iter_mut().zip(values) {
+                frame[point] = value;
+            }
+        }
+        runs.push(EcmwfRegularRun {
+            source_run: run.source_run.clone(),
+            start: first_time,
+            frames,
+        });
+    }
+    if runs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(EcmwfRegularSeries {
+        runs,
+        public_start_utc: Some(regionpack.public_start_utc()),
+        latest_source_run: Some(regionpack.latest_complete_run().to_string()),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9223,7 +9707,7 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
     if is_cams_variable(variable) {
         return cams_interpolation_kind(variable);
     }
-    if current_weather_model() == WeatherModel::EcmwfIfs025 {
+    if current_weather_model().is_ecmwf() {
         return ecmwf_interpolation_kind(variable);
     }
     if variable.ends_with("hPa") {
@@ -9279,7 +9763,9 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
         | "wind_u_component_80m"
         | "wind_v_component_80m"
         | "wind_u_component_100m"
-        | "wind_v_component_100m" => InterpolationKind::Hermite {
+        | "wind_v_component_100m"
+        | "wind_u_component_200m"
+        | "wind_v_component_200m" => InterpolationKind::Hermite {
             scalefactor: 10.0,
             bounds: None,
         },
@@ -9365,6 +9851,8 @@ fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
             | "wind_v_component_10m"
             | "wind_u_component_100m"
             | "wind_v_component_100m"
+            | "wind_u_component_200m"
+            | "wind_v_component_200m"
             | "wind_gusts_10m" => 10.0,
             "cloud_cover"
             | "cloud_cover_low"
@@ -9489,6 +9977,25 @@ fn product_for_variable(
     snapshot: &OmDataSnapshot,
     variable: &str,
 ) -> Result<(&'static str, String)> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let raw_variable = match variable {
+            "soil_temperature_0_to_10cm" => "soil_temperature_0_to_7cm",
+            "soil_moisture_0_to_10cm" => "soil_moisture_0_to_7cm",
+            "skin_temperature" | "soil_temperature_0cm" => "surface_temperature",
+            _ => variable,
+        };
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+        if !regionpack
+            .available_variables()
+            .iter()
+            .any(|available| available == raw_variable)
+        {
+            bail!("EC9 raw variable is not available: {raw_variable}");
+        }
+        return Ok(("ecmwf_ifs9km", raw_variable.to_string()));
+    }
     let candidates: &[&str] = if variable == "carbon_monoxide" {
         &["cams_global_greenhouse_gases", "cams_global"]
     } else if is_cams_variable(variable) {
@@ -9497,6 +10004,7 @@ fn product_for_variable(
         match current_weather_model() {
             WeatherModel::Gfs => &["ncep_gefs025", "ncep_gefs05"],
             WeatherModel::EcmwfIfs025 => &["ecmwf_ifs025_ensemble"],
+            WeatherModel::EcmwfIfs9km => &[],
         }
     } else if current_weather_model() == WeatherModel::EcmwfIfs025 {
         &["ecmwf_ifs025"]
@@ -9599,6 +10107,9 @@ fn seed_variable_for_times(variable: &str) -> String {
         | "windspeed_120m"
         | "wind_direction_120m"
         | "winddirection_120m" => "wind_u_component_100m",
+        "wind_speed_200m" | "windspeed_200m" | "wind_direction_200m" | "winddirection_200m" => {
+            "wind_u_component_200m"
+        }
         "temperature_120m" => "temperature_100m",
         "precip_phase" | "thunderstorm_code" => "cloud_cover",
         "european_aqi" | "european_aqi_pm2_5" | "european_aqi_pm10" | "us_aqi" | "us_aqi_pm2_5"
@@ -9673,7 +10184,7 @@ fn is_pressure_variable(variable: &str) -> bool {
 
 fn is_elevation_correctable(variable: &str) -> bool {
     match current_weather_model() {
-        WeatherModel::EcmwfIfs025 => matches!(
+        WeatherModel::EcmwfIfs025 | WeatherModel::EcmwfIfs9km => matches!(
             variable,
             "temperature_2m"
                 | "temperature_2m_min"
@@ -10276,6 +10787,22 @@ fn resolve_request_sampling(
     } else {
         None
     };
+    let ecmwf9km = if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+        let (model_latitude, model_longitude) =
+            regionpack.nearest_coordinate(latitude, longitude)?;
+        let model_elevation = if target.is_finite() { target } else { 0.0 };
+        Some(ModelSampling {
+            latitude: model_latitude,
+            longitude: model_longitude,
+            model_elevation,
+            target_elevation: target,
+        })
+    } else {
+        None
+    };
     let response_elevation = if target.is_nan() {
         gfs013
             .or(gfs025)
@@ -10283,6 +10810,7 @@ fn resolve_request_sampling(
             .or(gefs05)
             .or(ecmwf025)
             .or(ecmwf025_ensemble)
+            .or(ecmwf9km)
             .map(|sampling| sampling.model_elevation)
             .unwrap_or(f32::NAN)
     } else {
@@ -10295,6 +10823,7 @@ fn resolve_request_sampling(
         gefs05,
         ecmwf025,
         ecmwf025_ensemble,
+        ecmwf9km,
         response_elevation,
     })
 }
@@ -10604,8 +11133,18 @@ fn weather_model_location(
     longitude: f64,
 ) -> Result<Option<(f64, f64, f32)>> {
     let model = current_weather_model();
+    if model == WeatherModel::EcmwfIfs9km {
+        let Some(regionpack) = snapshot.ecmwf_ifs9km() else {
+            return Ok(None);
+        };
+        let (model_latitude, model_longitude) =
+            regionpack.nearest_coordinate(latitude, longitude)?;
+        return Ok(Some((model_latitude, model_longitude, 0.0)));
+    }
     let product_name = model.primary_product();
-    let spec = model.static_elevation_spec();
+    let spec = model
+        .static_elevation_spec()
+        .context("weather model has no static elevation contract")?;
     if let Some(sampling) = current_product_sampling(product_name) {
         return Ok(Some((
             sampling.latitude,
@@ -10758,6 +11297,15 @@ fn model_latitude_for_variable(
     latitude: f64,
     longitude: f64,
 ) -> Result<f32> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        if let Some(sampling) = current_product_sampling("ecmwf_ifs9km") {
+            return Ok(sampling.latitude as f32);
+        }
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
+        return Ok(regionpack.nearest_coordinate(latitude, longitude)?.0 as f32);
+    }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     if let Some(sampling) = current_product_sampling(product_name) {
         return Ok(sampling.latitude as f32);
@@ -11294,6 +11842,7 @@ mod tests {
             gefs05: None,
             ecmwf025: None,
             ecmwf025_ensemble: None,
+            ecmwf9km: None,
             response_elevation: 0.0,
         };
         let selected_latitude = with_request_sampling(sampling, || {
@@ -12239,41 +12788,53 @@ fn read_weather_code_grid_series(
         )?
     };
 
-    let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
-    let products = snapshot.product_snapshots(product_name);
-    // The GFS data cadence becomes three-hourly after f120. The values above
-    // are still interpolated to hourly frames, so derive the invariant grid
-    // coordinates from any cloud-cover entry rather than requiring a raw
-    // frame at a requested interpolated hour.
-    let entry = products
-        .iter()
-        .find_map(|product| {
-            product
-                .entries
-                .iter()
-                .find(|(key, _)| key.variable == raw_variable)
-                .map(|(_, entry)| entry)
-        })
-        .context("weather-code series has no cloud-cover grid entry")?;
-    // The point time-slab path replaces each product's coordinates with the
-    // cell selected by cell_selection. WeatherCode must receive that same
-    // GFS013 model latitude; using the original request latitude can cross the
-    // strict thunderstorm-probability threshold even though every input value
-    // came from the selected model cell.
-    let model_latitudes = match point_weather_code_model_latitudes(latitudes, longitudes) {
-        Some(values) => values,
-        None => latitudes
+    let model_latitudes = if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("EC9 weather-code snapshot is not available")?;
+        latitudes
             .iter()
             .map(|latitude| {
-                let (y, _) = grid_index_for_lat_lon(
-                    &entry.array,
-                    entry.native_grid.as_ref(),
-                    *latitude,
-                    longitudes[0],
-                )?;
-                grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+                regionpack
+                    .nearest_coordinate(*latitude, longitudes[0])
+                    .map(|(model_latitude, _)| model_latitude as f32)
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
+        let products = snapshot.product_snapshots(product_name);
+        // The GFS data cadence becomes three-hourly after f120. The values
+        // above are still interpolated to hourly frames, so derive invariant
+        // grid coordinates from any cloud-cover entry instead of requiring an
+        // original frame at an interpolated hour.
+        let entry = products
+            .iter()
+            .find_map(|product| {
+                product
+                    .entries
+                    .iter()
+                    .find(|(key, _)| key.variable == raw_variable)
+                    .map(|(_, entry)| entry)
+            })
+            .context("weather-code series has no cloud-cover grid entry")?;
+        // The point time-slab path replaces each product's coordinates with
+        // the cell selected by cell_selection. WeatherCode must receive that
+        // same model latitude.
+        match point_weather_code_model_latitudes(latitudes, longitudes) {
+            Some(values) => values,
+            None => latitudes
+                .iter()
+                .map(|latitude| {
+                    let (y, _) = grid_index_for_lat_lon(
+                        &entry.array,
+                        entry.native_grid.as_ref(),
+                        *latitude,
+                        longitudes[0],
+                    )?;
+                    grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }
     };
     let width = longitudes.len();
     let mut output = Vec::with_capacity(times.len());
@@ -12439,31 +13000,45 @@ fn read_weather_code_grid(
             longitudes,
         )?
     };
-    let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
-    let products = snapshot.product_snapshots(product_name);
-    let entry = products
-        .iter()
-        .find_map(|product| {
-            product.entries.get(&EntryKey {
-                variable: raw_variable.clone(),
-                valid_time_utc: time,
-            })
-        })
-        .with_context(|| format!("variable/time is not available: cloud_cover {}", time))?;
-    let model_latitudes = match point_weather_code_model_latitudes(latitudes, longitudes) {
-        Some(values) => values,
-        None => latitudes
+    let model_latitudes = if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        let regionpack = snapshot
+            .ecmwf_ifs9km()
+            .context("EC9 weather-code snapshot is not available")?;
+        latitudes
             .iter()
             .map(|latitude| {
-                let (y, _) = grid_index_for_lat_lon(
-                    &entry.array,
-                    entry.native_grid.as_ref(),
-                    *latitude,
-                    longitudes[0],
-                )?;
-                grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+                regionpack
+                    .nearest_coordinate(*latitude, longitudes[0])
+                    .map(|(model_latitude, _)| model_latitude as f32)
             })
-            .collect::<Result<Vec<_>>>()?,
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let (product_name, raw_variable) = product_for_variable(snapshot, "cloud_cover")?;
+        let products = snapshot.product_snapshots(product_name);
+        let entry = products
+            .iter()
+            .find_map(|product| {
+                product.entries.get(&EntryKey {
+                    variable: raw_variable.clone(),
+                    valid_time_utc: time,
+                })
+            })
+            .with_context(|| format!("variable/time is not available: cloud_cover {}", time))?;
+        match point_weather_code_model_latitudes(latitudes, longitudes) {
+            Some(values) => values,
+            None => latitudes
+                .iter()
+                .map(|latitude| {
+                    let (y, _) = grid_index_for_lat_lon(
+                        &entry.array,
+                        entry.native_grid.as_ref(),
+                        *latitude,
+                        longitudes[0],
+                    )?;
+                    grid_latitude_for_index(&entry.array, entry.native_grid.as_ref(), y)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }
     };
     let width = longitudes.len();
     let mut values = Vec::with_capacity(cloudcover.len());
@@ -13097,6 +13672,8 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "wind_v_component_80m"
         | "wind_u_component_100m"
         | "wind_v_component_100m"
+        | "wind_u_component_200m"
+        | "wind_v_component_200m"
         | "wind_speed_10m"
         | "windspeed_10m"
         | "wind_speed_80m"
@@ -13105,6 +13682,8 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "windspeed_100m"
         | "wind_speed_120m"
         | "windspeed_120m"
+        | "wind_speed_200m"
+        | "windspeed_200m"
         | "wind_gusts_10m" => "m/s",
         "wind_direction_10m"
         | "winddirection_10m"
@@ -13113,7 +13692,9 @@ fn unit_for_variable(variable: &str) -> &'static str {
         | "wind_direction_100m"
         | "winddirection_100m"
         | "wind_direction_120m"
-        | "winddirection_120m" => "°",
+        | "winddirection_120m"
+        | "wind_direction_200m"
+        | "winddirection_200m" => "°",
         "pressure_msl" | "surface_pressure" => "hPa",
         "visibility" => "m",
         "freezing_level_height" | "boundary_layer_height" | "snow_depth" => "m",
@@ -13872,6 +14453,8 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "winddirection_100m"
         | "wind_direction_120m"
         | "winddirection_120m"
+        | "wind_direction_200m"
+        | "winddirection_200m"
         | "categorical_freezing_rain"
         | "is_day" => OutputDecimals::Integer,
         "precipitation_type" => OutputDecimals::Fixed(1),
@@ -13883,12 +14466,16 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "windspeed_100m"
         | "wind_speed_120m"
         | "windspeed_120m"
+        | "wind_speed_200m"
+        | "windspeed_200m"
         | "wind_u_component_10m"
         | "wind_v_component_10m"
         | "wind_u_component_80m"
         | "wind_v_component_80m"
         | "wind_u_component_100m"
         | "wind_v_component_100m"
+        | "wind_u_component_200m"
+        | "wind_v_component_200m"
         | "vertical_velocity"
         | "aerosol_optical_depth" => OutputDecimals::Fixed(2),
         "soil_moisture_0_to_10cm"

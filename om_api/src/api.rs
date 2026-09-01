@@ -1,5 +1,6 @@
 use crate::official::OfficialDecoder;
 use crate::query::{
+    ecmwf_ifs9km_public_daily_variables, ecmwf_ifs9km_public_hourly_variables,
     ecmwf_public_hourly_variables, forecast_for_query, route_forecast, validate_cams_query,
     validate_explicit_variables, validate_gfs_query, PointQuery, RouteQuery, WeatherModel,
     ECMWF_PUBLIC_DAILY_VARIABLES,
@@ -50,6 +51,7 @@ struct SnapshotIdentity {
     cams_ready: Option<GroupIdentity>,
     cams_greenhouse_ready: Option<GroupIdentity>,
     ecmwf_ready: Option<GroupIdentity>,
+    ecmwf_ifs9km_ready: Option<GroupIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -61,6 +63,12 @@ struct GroupIdentity {
     latest_complete_run: String,
     #[serde(default)]
     coverage_id: String,
+    #[serde(default)]
+    batch_id: String,
+    #[serde(default)]
+    batch_ready_sha256: String,
+    #[serde(default)]
+    public_start_utc: String,
     #[serde(default)]
     products: serde_json::Value,
     #[serde(default)]
@@ -95,6 +103,7 @@ impl SnapshotIdentity {
             cams_ready: marker(data_root, "cams")?,
             cams_greenhouse_ready: marker(data_root, "cams_greenhouse")?,
             ecmwf_ready: marker(data_root, "ecmwf")?,
+            ecmwf_ifs9km_ready: marker(data_root, "ecmwf_ifs9km")?,
         })
     }
 }
@@ -126,6 +135,9 @@ impl AppState {
                     "runtime_format": identity.runtime_format,
                     "latest_complete_run": identity.latest_complete_run,
                     "coverage_id": identity.coverage_id,
+                    "batch_id": identity.batch_id,
+                    "batch_ready_sha256": identity.batch_ready_sha256,
+                    "public_start_utc": identity.public_start_utc,
                 }),
                 None => serde_json::Value::Null,
             }
@@ -140,6 +152,7 @@ impl AppState {
             "cams": group(guard.identity.cams_ready.as_ref()),
             "cams_greenhouse": group(guard.identity.cams_greenhouse_ready.as_ref()),
             "ecmwf": group(guard.identity.ecmwf_ready.as_ref()),
+            "ecmwf_ifs9km": group(guard.identity.ecmwf_ifs9km_ready.as_ref()),
         }))
     }
 
@@ -151,6 +164,7 @@ impl AppState {
         let identity = match model {
             WeatherModel::Gfs => guard.identity.gfs_ready.as_ref(),
             WeatherModel::EcmwfIfs025 => guard.identity.ecmwf_ready.as_ref(),
+            WeatherModel::EcmwfIfs9km => guard.identity.ecmwf_ifs9km_ready.as_ref(),
         }
         .context("weather OM group marker is unavailable")?;
         if identity.status != "complete" || identity.latest_complete_run.is_empty() {
@@ -245,9 +259,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gfs", get(gfs_forecast))
         .route("/v1/ecmwf", get(ecmwf_forecast).post(ecmwf_forecast_post))
         .route("/v1/ecmwf/catalog", get(ecmwf_catalog))
+        .route(
+            "/v1/ecmwf-ifs9km",
+            get(ecmwf_ifs9km_forecast).post(ecmwf_ifs9km_forecast_post),
+        )
+        .route("/v1/ecmwf-ifs9km/catalog", get(ecmwf_ifs9km_catalog))
         .route("/v1/cams", get(cams_forecast))
         .route("/v1/route", post(route))
         .route("/v1/ecmwf/route", post(ecmwf_route))
+        .route("/v1/ecmwf-ifs9km/route", post(ecmwf_ifs9km_route))
         .with_state(state)
         .layer(middleware::map_response(source_offer_headers))
         .layer(TraceLayer::new_for_http())
@@ -300,6 +320,25 @@ fn weather_attribution_payload() -> serde_json::Value {
                     "spatial subsetting",
                     "range extraction",
                     "temporal and spatial interpolation where requested",
+                    "unit conversion and derived-variable calculation where requested",
+                    "lossless WebP encoding for map layers"
+                ],
+                "disclaimer": "ECMWF has no liability in respect of this service or its transformed outputs."
+            },
+            "ecmwf_ifs9km": {
+                "provider": "European Centre for Medium-Range Weather Forecasts (ECMWF)",
+                "provider_url": "https://www.ecmwf.int/",
+                "dataset": "ECMWF IFS 9 km deterministic forecast open data",
+                "license": "CC-BY-4.0",
+                "license_url": ECMWF_LICENSE_URL,
+                "terms_url": "https://apps.ecmwf.int/datasets/licences/general/",
+                "attribution": "This service is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF). Contains modified ECMWF data.",
+                "modified": true,
+                "transformations": [
+                    "HTTP range extraction and spatial subsetting",
+                    "direct decoding of immutable RegionPack artifacts",
+                    "nearest-grid sampling",
+                    "temporal interpolation where requested",
                     "unit conversion and derived-variable calculation where requested",
                     "lossless WebP encoding for map layers"
                 ],
@@ -431,6 +470,40 @@ async fn ecmwf_forecast_post(
     Ok(Json(payload))
 }
 
+async fn ecmwf_ifs9km_forecast(
+    State(state): State<AppState>,
+    Query(mut query): Query<PointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_explicit_variables(&query)?;
+    query.models = Some("ecmwf_ifs9km".to_string());
+    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs9km)?;
+    let decoder = state.decoder.clone();
+    let mut payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("ECMWF IFS 9 km forecast worker failed")??;
+    attach_model_run(&mut payload, &model_run)?;
+    Ok(Json(payload))
+}
+
+async fn ecmwf_ifs9km_forecast_post(
+    State(state): State<AppState>,
+    Json(mut query): Json<PointQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_explicit_variables(&query)?;
+    query.models = Some("ecmwf_ifs9km".to_string());
+    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs9km)?;
+    let decoder = state.decoder.clone();
+    let mut payload = tokio::task::spawn_blocking(move || {
+        forecast_for_query(&snapshot, decoder.as_ref(), &query)
+    })
+    .await
+    .context("ECMWF IFS 9 km POST forecast worker failed")??;
+    attach_model_run(&mut payload, &model_run)?;
+    Ok(Json(payload))
+}
+
 fn attach_model_run(payload: &mut serde_json::Value, model_run: &str) -> Result<()> {
     fn attach(response: &mut serde_json::Value, model_run: &str) -> Result<()> {
         response
@@ -489,6 +562,48 @@ async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json:
     })))
 }
 
+async fn ecmwf_ifs9km_catalog(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let snapshot = state.snapshot()?;
+    let product = snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km RegionPack snapshot is unavailable")?;
+    let hourly = ecmwf_ifs9km_public_hourly_variables();
+    let daily = ecmwf_ifs9km_public_daily_variables();
+    let available_variables = hourly
+        .iter()
+        .map(String::as_str)
+        .chain(daily.iter().map(String::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    let (time_start, time_end) = product.time_bounds()?;
+    let bounds = product.bounds();
+    Ok(Json(json!({
+        "model": "ecmwf_ifs9km",
+        "runtime_format": "weather-region-pack-v1",
+        "batch_id": product.batch_id(),
+        "latest_complete_run": product.latest_complete_run(),
+        "public_start_utc": product.public_start_utc(),
+        "time_start_utc": time_start,
+        "time_end_utc": time_end,
+        "grid": {
+            "name": "O1280 reduced Gaussian",
+            "nominal_resolution_km": 9,
+            "bounds": {
+                "west": bounds.west,
+                "east": bounds.east,
+                "south": bounds.south,
+                "north": bounds.north,
+            }
+        },
+        "available_source_variables": product.available_variables(),
+        "available_hourly_variables": hourly,
+        "available_daily_variables": daily,
+        "available_variables": available_variables,
+        "attribution": weather_attribution_payload()["data_sources"]["ecmwf_ifs9km"].clone(),
+    })))
+}
+
 async fn cams_forecast(
     State(state): State<AppState>,
     Query(mut query): Query<PointQuery>,
@@ -529,6 +644,20 @@ async fn ecmwf_route(
         tokio::task::spawn_blocking(move || route_forecast(&snapshot, decoder.as_ref(), &query))
             .await
             .context("ECMWF route worker failed")??;
+    Ok(Json(serde_json::to_value(payload)?))
+}
+
+async fn ecmwf_ifs9km_route(
+    State(state): State<AppState>,
+    Json(mut query): Json<RouteQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    query.models = Some("ecmwf_ifs9km".to_string());
+    let snapshot = state.snapshot()?;
+    let decoder = state.decoder.clone();
+    let payload =
+        tokio::task::spawn_blocking(move || route_forecast(&snapshot, decoder.as_ref(), &query))
+            .await
+            .context("ECMWF IFS 9 km route worker failed")??;
     Ok(Json(serde_json::to_value(payload)?))
 }
 

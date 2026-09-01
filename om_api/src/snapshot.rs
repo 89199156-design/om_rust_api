@@ -1,5 +1,6 @@
 use crate::manifest::{load_product_snapshot_for_coverage, ProductSnapshot};
 use crate::native::load_native_group_products;
+use crate::regionpack::RegionPackSnapshot;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub struct OmDataSnapshot {
     pub data_root: PathBuf,
     products: HashMap<String, Arc<ProductSnapshot>>,
     historical_products: HashMap<String, Vec<Arc<ProductSnapshot>>>,
+    ecmwf_ifs9km: Option<Arc<RegionPackSnapshot>>,
 }
 
 impl OmDataSnapshot {
@@ -126,10 +128,12 @@ impl OmDataSnapshot {
                 &mut historical_products,
             )?;
         }
+        let ecmwf_ifs9km = RegionPackSnapshot::load(&data_root)?.map(Arc::new);
         Ok(Self {
             data_root,
             products,
             historical_products,
+            ecmwf_ifs9km,
         })
     }
 
@@ -151,6 +155,10 @@ impl OmDataSnapshot {
             snapshots.extend(history.iter().cloned());
         }
         snapshots
+    }
+
+    pub fn ecmwf_ifs9km(&self) -> Option<Arc<RegionPackSnapshot>> {
+        self.ecmwf_ifs9km.clone()
     }
 }
 

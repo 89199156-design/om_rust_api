@@ -261,12 +261,114 @@ const ECMWF_IFS025_LAYERS: &[Layer] = &[
     ),
 ];
 
+// IFS 9 km is decoded directly from the cropped immutable RegionPack batch.
+// Keep the established client encoding contract and publish only fields that
+// the EC9 source actually carries; visibility, showers, and 200 m wind are
+// available here even though they are absent from the free IFS 0.25 feed.
+const ECMWF_IFS9KM_LAYERS: &[Layer] = &[
+    Layer::scalar("cloud_total_1", "cloud_cover", "%", 0.0, 100.0, 0.0, 100.0),
+    Layer::scalar(
+        "cloud_high_1",
+        "cloud_cover_high",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar(
+        "cloud_mid_1",
+        "cloud_cover_mid",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar(
+        "cloud_low_1",
+        "cloud_cover_low",
+        "%",
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ),
+    Layer::scalar("t2m", "temperature_2m", "C", -100.0, 100.0, -100.0, 100.0),
+    Layer::scalar(
+        "surface_temperature",
+        "surface_temperature",
+        "C",
+        -100.0,
+        100.0,
+        -100.0,
+        100.0,
+    ),
+    Layer::scalar("d2m", "dew_point_2m", "C", -100.0, 100.0, -100.0, 100.0),
+    Layer::scalar("r2", "relative_humidity_2m", "%", 0.0, 100.0, 0.0, 100.0),
+    Layer::wind("wind", "wind_u_component_10m", "wind_v_component_10m"),
+    Layer::wind(
+        "wind_100m",
+        "wind_u_component_100m",
+        "wind_v_component_100m",
+    ),
+    Layer::wind(
+        "wind_200m",
+        "wind_u_component_200m",
+        "wind_v_component_200m",
+    ),
+    Layer::scalar("tp", "precipitation", "mm", 0.0, 600.0, 0.0, 100.0),
+    Layer::scalar("showers", "showers", "mm", 0.0, 600.0, 0.0, 100.0),
+    Layer::scaled("snod", "snow_depth", "mm", 0.0, 2000.0, 0.0, 10.0, 1000.0),
+    Layer::scalar("gust", "wind_gusts_10m", "m/s", 0.0, 200.0, 0.0, 100.0),
+    Layer::scalar("vis", "visibility", "m", 0.0, 100000.0, 0.0, 0.1),
+    Layer::derived(
+        "precip_phase",
+        "weather_code",
+        "code",
+        0.0,
+        4.0,
+        Derive::PrecipPhase,
+    ),
+    Layer::derived(
+        "thunderstorm_code",
+        "weather_code",
+        "wmo code",
+        0.0,
+        100.0,
+        Derive::ThunderstormCode,
+    ),
+    Layer::scalar("cape", "cape", "J/kg", 0.0, 65535.0, 0.0, 1.0),
+    Layer::scaled(
+        "prmsl",
+        "pressure_msl",
+        "Pa",
+        50000.0,
+        115000.0,
+        50000.0,
+        1.0,
+        100.0,
+    ),
+    Layer::scaled(
+        "sp",
+        "surface_pressure",
+        "Pa",
+        50000.0,
+        115000.0,
+        50000.0,
+        1.0,
+        100.0,
+    ),
+];
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Scope {
     Gfs,
     Cams,
     #[value(name = "ecmwf_ifs025", alias = "ecmwf", alias = "ec")]
     EcmwfIfs025,
+    #[value(name = "ecmwf_ifs9km", alias = "ec9", alias = "ecmwf9km")]
+    EcmwfIfs9km,
 }
 
 impl Scope {
@@ -275,6 +377,7 @@ impl Scope {
             Self::Gfs => "gfs",
             Self::Cams => "cams",
             Self::EcmwfIfs025 => "ecmwf",
+            Self::EcmwfIfs9km => "ecmwf_ifs9km",
         }
     }
 
@@ -283,6 +386,7 @@ impl Scope {
             Self::Gfs => "gfs",
             Self::Cams => "cams",
             Self::EcmwfIfs025 => "ecmwf_ifs025",
+            Self::EcmwfIfs9km => "ecmwf_ifs9km",
         }
     }
 
@@ -291,6 +395,7 @@ impl Scope {
             Self::Gfs => "gfs013_surface",
             Self::Cams => "cams_global",
             Self::EcmwfIfs025 => "ecmwf_ifs025",
+            Self::EcmwfIfs9km => "ecmwf_ifs9km",
         }
     }
 
@@ -299,6 +404,7 @@ impl Scope {
             Self::Gfs => "gfs013_surface_data.json",
             Self::Cams => "cams_global_data.json",
             Self::EcmwfIfs025 => "ecmwf_ifs025_data.json",
+            Self::EcmwfIfs9km => "ecmwf_ifs9km_data.json",
         }
     }
 
@@ -307,6 +413,7 @@ impl Scope {
             Self::Gfs => GFS_LAYERS,
             Self::Cams => CAMS_LAYERS,
             Self::EcmwfIfs025 => ECMWF_IFS025_LAYERS,
+            Self::EcmwfIfs9km => ECMWF_IFS9KM_LAYERS,
         }
     }
 
@@ -314,11 +421,12 @@ impl Scope {
         match self {
             Self::Gfs | Self::Cams => WeatherModel::Gfs,
             Self::EcmwfIfs025 => WeatherModel::EcmwfIfs025,
+            Self::EcmwfIfs9km => WeatherModel::EcmwfIfs9km,
         }
     }
 
     fn tolerate_unavailable_layers(self) -> bool {
-        !matches!(self, Self::EcmwfIfs025)
+        !matches!(self, Self::EcmwfIfs025 | Self::EcmwfIfs9km)
     }
 
     fn data_attribution(self) -> Option<DataAttribution> {
@@ -335,6 +443,25 @@ impl Scope {
                 modified: true,
                 transformations: &[
                     "native-grid range extraction",
+                    "temporal interpolation",
+                    "unit conversion and derived-variable calculation",
+                    "lossless WebP encoding",
+                ],
+            }),
+            Self::EcmwfIfs9km => Some(DataAttribution {
+                attribution: "This service is based on data and products of the European Centre for Medium-Range Weather Forecasts (ECMWF). Contains modified ECMWF data.",
+                provider: "European Centre for Medium-Range Weather Forecasts (ECMWF)",
+                provider_url: "https://www.ecmwf.int/",
+                distributor: "ECMWF Open Data",
+                distributor_url: "https://www.ecmwf.int/en/forecasts/datasets/open-data",
+                license: "CC-BY-4.0",
+                license_url: "https://creativecommons.org/licenses/by/4.0/",
+                terms_url: "https://apps.ecmwf.int/datasets/licences/general/",
+                modified: true,
+                transformations: &[
+                    "HTTP range extraction and spatial subsetting",
+                    "direct decoding of immutable RegionPack artifacts",
+                    "nearest-grid sampling to the published regular grid",
                     "temporal interpolation",
                     "unit conversion and derived-variable calculation",
                     "lossless WebP encoding",
@@ -397,6 +524,9 @@ struct GroupReady {
     status: String,
     latest_complete_run: String,
     release_id: String,
+    #[serde(default)]
+    public_start_utc: Option<DateTime<Utc>>,
+    #[serde(default)]
     products: BTreeMap<String, ReadyProduct>,
 }
 
@@ -731,7 +861,9 @@ fn source_read_block_frames(
     // on their much smaller native OM regional grids, so a complete source
     // series remains within the production memory guard and avoids rebuilding
     // ECMWF run stitching for every six output hours.
-    if variable == "weather_code" && matches!(scope, Scope::Gfs) {
+    if matches!(scope, Scope::EcmwfIfs9km)
+        || (variable == "weather_code" && matches!(scope, Scope::Gfs))
+    {
         configured_block_frames.min(total_frames)
     } else {
         total_frames
@@ -808,7 +940,12 @@ fn main() -> Result<()> {
         args.bottom_lat,
         args.top_lat,
     )?;
-    let start = parse_run(&ready.latest_complete_run)?;
+    let start = match args.scope {
+        Scope::EcmwfIfs9km => ready
+            .public_start_utc
+            .context("ECMWF IFS 9 km ready marker has no public_start_utc")?,
+        Scope::Gfs | Scope::Cams | Scope::EcmwfIfs025 => parse_run(&ready.latest_complete_run)?,
+    };
     let times = render_times(start, args.frames)?;
     let estimated_staging_bytes = estimate_staging_bytes(grid.len(), selected.len(), times.len())?;
     ensure_free_space(
@@ -1073,6 +1210,57 @@ fn compute_grid(left: f64, right: f64, bottom: f64, top: f64) -> Result<RegionGr
     })
 }
 
+fn compute_ecmwf_ifs9km_grid(left: f64, right: f64, bottom: f64, top: f64) -> Result<RegionGrid> {
+    const STEP: f64 = 360.0 / 4_608.0;
+    let x0 = (((left + 180.0) / STEP) - 1e-9).ceil().max(0.0) as usize;
+    let x1 = (((right + 180.0) / STEP) + 1e-9).floor().min(4_607.0) as usize;
+    let y0 = (((bottom + 90.0) / STEP) - 1e-9).ceil().max(0.0) as usize;
+    let y1 = (((top + 90.0) / STEP) + 1e-9).floor().min(2_304.0) as usize;
+    if x0 > x1 || y0 > y1 {
+        bail!("region does not overlap the ECMWF IFS 9 km render grid");
+    }
+    let longitudes = (x0..=x1)
+        .map(|x| round6(-180.0 + x as f64 * STEP))
+        .collect::<Vec<_>>();
+    let latitudes = (y0..=y1)
+        .rev()
+        .map(|y| round6(-90.0 + y as f64 * STEP))
+        .collect::<Vec<_>>();
+    let sample_bounds = Bounds {
+        lon_min: *longitudes
+            .first()
+            .context("EC9 render grid has no longitude")?,
+        lat_min: *latitudes
+            .last()
+            .context("EC9 render grid has no latitude")?,
+        lon_max: *longitudes
+            .last()
+            .context("EC9 render grid has no longitude")?,
+        lat_max: *latitudes
+            .first()
+            .context("EC9 render grid has no latitude")?,
+    };
+    let display_bounds = Bounds {
+        lon_min: round6(sample_bounds.lon_min - STEP / 2.0),
+        lat_min: round6(sample_bounds.lat_min - STEP / 2.0),
+        lon_max: round6(sample_bounds.lon_max + STEP / 2.0),
+        lat_max: round6(sample_bounds.lat_max + STEP / 2.0),
+    };
+    Ok(RegionGrid {
+        manifest: GridManifest {
+            width: longitudes.len(),
+            height: latitudes.len(),
+            row_order: "north_to_south",
+            dx: round6(STEP),
+            dy: round6(STEP),
+            sample_bounds,
+            display_bounds,
+        },
+        latitudes,
+        longitudes,
+    })
+}
+
 fn compute_scope_grid(
     scope: Scope,
     ready: &GroupReady,
@@ -1086,6 +1274,7 @@ fn compute_scope_grid(
         // every cell from their immutable, already regionalized OM products.
         Scope::Gfs => compute_grid(left, right, bottom, top),
         Scope::EcmwfIfs025 | Scope::Cams => compute_native_product_grid(scope, ready),
+        Scope::EcmwfIfs9km => compute_ecmwf_ifs9km_grid(left, right, bottom, top),
     }
 }
 
@@ -1583,6 +1772,22 @@ fn catalog_payload() -> serde_json::Value {
                     "wind_120m": "not_published_by_free_ecmwf_ifs025",
                     "freezing_level_height": "not_published_by_free_ecmwf_ifs025",
                 },
+            },
+            "ecmwf_ifs9km": {
+                "source": "ecmwf_ifs9km",
+                "manifest": Scope::EcmwfIfs9km.manifest_name(),
+                "file_pattern": "{timestamp}_{batch}.webp",
+                "layers": layers(Scope::EcmwfIfs9km),
+                "data_attribution": Scope::EcmwfIfs9km.data_attribution(),
+                "unavailable_layers": {
+                    "uv_index": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "t80m": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "t100m": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "t120m": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "wind_80m": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "wind_120m": "not_present_in_ecmwf_ifs9km_regionpack",
+                    "freezing_level_height": "not_present_in_ecmwf_ifs9km_regionpack",
+                },
             }
         }
     })
@@ -1592,6 +1797,7 @@ fn source_resolution(scope: Scope, name: &str) -> &'static str {
     match scope {
         Scope::Cams => "44km",
         Scope::EcmwfIfs025 => "25km",
+        Scope::EcmwfIfs9km => "9km",
         Scope::Gfs => match name {
             "gust"
             | "vis"
@@ -1724,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn only_dense_gfs_weather_code_uses_bounded_source_reads() {
+    fn dense_gfs_weather_code_and_every_ec9_layer_use_bounded_source_reads() {
         assert_eq!(
             source_read_block_frames(Scope::Gfs, "weather_code", 6, 121),
             6
@@ -1742,6 +1948,14 @@ mod tests {
             121
         );
         assert_eq!(source_read_block_frames(Scope::Cams, "pm2_5", 6, 121), 121);
+        assert_eq!(
+            source_read_block_frames(Scope::EcmwfIfs9km, "temperature_2m", 6, 121),
+            6
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::EcmwfIfs9km, "weather_code", 6, 121),
+            6
+        );
     }
 
     #[test]
@@ -1819,10 +2033,23 @@ mod tests {
     }
 
     #[test]
+    fn ec9_regular_render_grid_is_nominally_nine_kilometres() {
+        let grid = compute_ecmwf_ifs9km_grid(70.0, 140.0, 0.0, 58.0).unwrap();
+        assert_eq!((grid.manifest.width, grid.manifest.height), (897, 743));
+        assert_eq!(grid.manifest.dx, 0.078125);
+        assert_eq!(grid.manifest.dy, 0.078125);
+        assert_eq!(grid.manifest.sample_bounds.lon_min, 70.0);
+        assert_eq!(grid.manifest.sample_bounds.lon_max, 140.0);
+        assert_eq!(grid.manifest.sample_bounds.lat_min, 0.0);
+        assert_eq!(grid.manifest.sample_bounds.lat_max, 57.96875);
+    }
+
+    #[test]
     fn layer_inventory_matches_client_contract() {
         assert_eq!(GFS_LAYERS.len(), 26);
         assert_eq!(CAMS_LAYERS.len(), 4);
         assert_eq!(ECMWF_IFS025_LAYERS.len(), 18);
+        assert_eq!(ECMWF_IFS9KM_LAYERS.len(), 21);
         for unavailable in [
             "vis",
             "uv_index",
@@ -1858,7 +2085,7 @@ mod tests {
         assert!(ECMWF_IFS025_LAYERS
             .iter()
             .any(|layer| layer.name == "wind_100m"));
-        for layers in [GFS_LAYERS, ECMWF_IFS025_LAYERS] {
+        for layers in [GFS_LAYERS, ECMWF_IFS025_LAYERS, ECMWF_IFS9KM_LAYERS] {
             let surface_temperature = layers
                 .iter()
                 .find(|layer| layer.name == "surface_temperature")
@@ -1943,6 +2170,24 @@ mod tests {
     }
 
     #[test]
+    fn ec9_scope_uses_regionpack_group_and_model_contracts() {
+        let args = Args::try_parse_from([
+            "om-webp",
+            "--scope",
+            "ec9",
+            "--decoder-lib",
+            "/tmp/libomfileformat.so",
+        ])
+        .unwrap();
+
+        assert_eq!(args.scope.name(), "ecmwf_ifs9km");
+        assert_eq!(args.scope.group(), "ecmwf_ifs9km");
+        assert_eq!(args.scope.product_dir(), "ecmwf_ifs9km");
+        assert_eq!(args.scope.manifest_name(), "ecmwf_ifs9km_data.json");
+        assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs9km);
+    }
+
+    #[test]
     fn catalog_publishes_ecmwf_under_the_model_key() {
         let catalog = catalog_payload();
         let product = &catalog["products"]["ecmwf_ifs025"];
@@ -1963,5 +2208,17 @@ mod tests {
         assert!(product["layers"].get("showers").is_none());
         assert!(product["layers"].get("tp").is_some());
         assert!(product["unavailable_layers"].get("gust").is_none());
+
+        let ec9 = &catalog["products"]["ecmwf_ifs9km"];
+        assert_eq!(ec9["source"], "ecmwf_ifs9km");
+        assert_eq!(ec9["manifest"], "ecmwf_ifs9km_data.json");
+        for available in ["gust", "vis", "showers", "wind_100m", "wind_200m"] {
+            assert!(
+                ec9["layers"].get(available).is_some(),
+                "missing {available}"
+            );
+            assert!(ec9["unavailable_layers"].get(available).is_none());
+        }
+        assert_eq!(ec9["data_attribution"]["license"], "CC-BY-4.0");
     }
 }

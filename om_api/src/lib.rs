@@ -5,6 +5,7 @@ pub mod materialize;
 pub mod native;
 pub mod official;
 pub mod query;
+pub mod regionpack;
 pub mod snapshot;
 pub mod solar;
 mod solar_lookup;
