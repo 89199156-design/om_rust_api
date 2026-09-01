@@ -2671,6 +2671,9 @@ pub fn read_variable_value(
                 .unwrap_or(0.0);
             return Ok(surface_pressure(temperature, pressure_msl, elevation));
         }
+        "dew_point_2m" | "dewpoint_2m" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            return read_direct(snapshot, decoder, "dew_point_2m", time, latitude, longitude);
+        }
         "dew_point_2m" | "dewpoint_2m" => {
             let temperature = read_direct(
                 snapshot,
@@ -3737,6 +3740,17 @@ pub fn read_variable_grid_series(
         }
     }
     match variable {
+        "dew_point_2m" | "dewpoint_2m" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "dew_point_2m",
+                times,
+                latitudes,
+                longitudes,
+                true,
+            )
+        }
         "dew_point_2m" | "dewpoint_2m" => Ok(combine2(
             read_direct_grid_series(
                 snapshot,
@@ -5634,6 +5648,32 @@ fn read_direct_with_rounding(
     round_values: bool,
 ) -> Result<f32> {
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        if matches!(variable, "relative_humidity_2m" | "relativehumidity_2m") {
+            let temperature = read_direct_with_rounding(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                time,
+                latitude,
+                longitude,
+                false,
+            )?;
+            let dewpoint = read_direct_with_rounding(
+                snapshot,
+                decoder,
+                "dew_point_2m",
+                time,
+                latitude,
+                longitude,
+                false,
+            )?;
+            let humidity = relative_humidity_from_dew_point(temperature, dewpoint);
+            return Ok(if round_values {
+                round_variable_output_value("relative_humidity_2m", humidity)
+            } else {
+                humidity
+            });
+        }
         let decoder = decoder.context("official OM decoder is required for EC9 RegionPack data")?;
         let mut frames = read_ecmwf_ifs9km_window_grid_series(
             snapshot,
@@ -5983,7 +6023,13 @@ fn read_direct_grid_series(
             round_values,
         );
     };
-    let (product_name, _) = product_for_variable(snapshot, variable)?;
+    let product_name = if current_weather_model() == WeatherModel::EcmwfIfs9km
+        && matches!(variable, "relative_humidity_2m" | "relativehumidity_2m")
+    {
+        "ecmwf_ifs9km"
+    } else {
+        product_for_variable(snapshot, variable)?.0
+    };
     let sampling = current_product_sampling(product_name).map(|sampling| {
         (
             sampling.latitude.to_bits(),
@@ -6041,6 +6087,47 @@ fn read_direct_grid_series_uncached(
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        if matches!(variable, "relative_humidity_2m" | "relativehumidity_2m") {
+            let temperature = read_direct_grid_series_uncached(
+                snapshot,
+                decoder,
+                "temperature_2m",
+                times,
+                latitudes,
+                longitudes,
+                false,
+            )?;
+            let dewpoint = read_direct_grid_series_uncached(
+                snapshot,
+                decoder,
+                "dew_point_2m",
+                times,
+                latitudes,
+                longitudes,
+                false,
+            )?;
+            let mut humidity = temperature
+                .into_iter()
+                .zip(dewpoint)
+                .map(|(temperature, dewpoint)| {
+                    temperature
+                        .into_iter()
+                        .zip(dewpoint)
+                        .map(|(temperature, dewpoint)| {
+                            relative_humidity_from_dew_point(temperature, dewpoint)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            if round_values {
+                for frame in &mut humidity {
+                    for value in frame {
+                        *value = round_variable_output_value("relative_humidity_2m", *value);
+                    }
+                }
+            }
+            return Ok(humidity);
+        }
         let mut values = read_ecmwf_ifs9km_window_grid_series(
             snapshot, decoder, variable, times, latitudes, longitudes,
         )?;
@@ -10067,6 +10154,11 @@ fn seed_variable_for_times(variable: &str) -> String {
         }
     }
     let seed = match variable {
+        "relative_humidity_2m" | "relativehumidity_2m"
+            if current_weather_model() == WeatherModel::EcmwfIfs9km =>
+        {
+            "temperature_2m"
+        }
         "dew_point_2m"
         | "dewpoint_2m"
         | "wet_bulb_temperature_2m"
@@ -11444,6 +11536,13 @@ mod tests {
     }
 
     #[test]
+    fn relative_humidity_is_recovered_from_ec9_temperature_and_dew_point() {
+        assert_eq!(relative_humidity_from_dew_point(20.0, 20.0), 100.0);
+        assert!((relative_humidity_from_dew_point(20.0, 10.0) - 52.54).abs() < 0.02);
+        assert!(relative_humidity_from_dew_point(f32::NAN, 10.0).is_nan());
+    }
+
+    #[test]
     fn combined_soil_layer_preserves_official_float_weight_order() {
         let value = weighted_soil_layer_0_to_100cm(0.354, 0.356, 0.343);
         assert_eq!(
@@ -12425,6 +12524,14 @@ mod tests {
             assert_eq!(
                 seed_variable_for_times("cloud_cover_850hPa"),
                 "relative_humidity_850hPa"
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_weather_model(WeatherModel::EcmwfIfs9km, || {
+            assert_eq!(
+                seed_variable_for_times("relative_humidity_2m"),
+                "temperature_2m"
             );
             Ok(())
         })
@@ -13498,6 +13605,17 @@ fn dew_point(temperature: f32, relative_humidity: f32) -> f32 {
     // cross a public two-decimal rounding boundary in downstream VPD.
     lambda * (log_relative_humidity + temperature_term)
         / (beta - log_relative_humidity - temperature_term)
+}
+
+fn relative_humidity_from_dew_point(temperature: f32, dewpoint: f32) -> f32 {
+    if !temperature.is_finite() || !dewpoint.is_finite() {
+        return f32::NAN;
+    }
+    let beta = 17.625_f32;
+    let lambda = 243.04_f32;
+    (100.0 * ((beta * dewpoint) / (lambda + dewpoint)).exp()
+        / ((beta * temperature) / (lambda + temperature)).exp())
+    .clamp(0.0, 100.0)
 }
 
 fn wet_bulb_temperature(temperature: f32, relative_humidity: f32) -> f32 {
