@@ -442,7 +442,10 @@ impl RegionPackSnapshot {
         let frame = newest
             .frames
             .values()
-            .next()
+            // The analysis (lead-zero) frame intentionally omits accumulated
+            // fields such as precipitation, showers, and radiation. A later
+            // forecast frame carries the complete EC9 variable inventory.
+            .next_back()
             .context("EC9 newest run has no frames")?;
         let header = frame.header(self.bounds)?;
         let mut variables = header.variables.keys().cloned().collect::<Vec<_>>();
