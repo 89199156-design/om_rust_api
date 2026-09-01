@@ -539,9 +539,10 @@ impl RegionPackFile {
         let mut variables = HashMap::new();
         let mut previous_payload_end = 0_u64;
         for variable in wire.variables {
+            let normalized_shape =
+                normalize_source_spatial_shape(&variable.dimensions, &variable.chunks);
             if variable.name.is_empty()
-                || variable.dimensions != [O1280_POINT_COUNT]
-                || variable.chunks != [SOURCE_CHUNK_POINTS]
+                || normalized_shape.is_none()
                 || variable.source_data_type != 20
                 || variable.payload_chunks.len() != wire.spatial_chunks.len()
             {
@@ -550,6 +551,7 @@ impl RegionPackFile {
                     variable.name
                 );
             }
+            let (dimensions, chunks) = normalized_shape.expect("shape was validated above");
             for payload in &variable.payload_chunks {
                 if payload.length == 0
                     || payload.offset < previous_payload_end
@@ -567,8 +569,8 @@ impl RegionPackFile {
                 compression: variable.source_compression,
                 scale_factor: variable.scale_factor,
                 add_offset: variable.add_offset,
-                dimensions: variable.dimensions,
-                chunks: variable.chunks,
+                dimensions,
+                chunks,
                 payload_chunks: variable.payload_chunks,
             };
             if variables.insert(variable.name, compact).is_some() {
@@ -640,6 +642,21 @@ impl RegionPackFile {
             );
         }
         Ok(Some(output))
+    }
+}
+
+fn normalize_source_spatial_shape(
+    dimensions: &[u64],
+    chunks: &[u64],
+) -> Option<(Vec<u64>, Vec<u64>)> {
+    // ECMWF spatial files carry a leading singleton time dimension. Each
+    // RegionPack frame contains exactly that one time slice, so normalize the
+    // retained compressed chunks to the equivalent one-dimensional array used
+    // by the direct official decoder.
+    if dimensions == [1, O1280_POINT_COUNT] && chunks == [1, SOURCE_CHUNK_POINTS] {
+        Some((vec![O1280_POINT_COUNT], vec![SOURCE_CHUNK_POINTS]))
+    } else {
+        None
     }
 }
 
@@ -802,6 +819,18 @@ mod tests {
         assert!(
             parse_artifact_key("ecmwf_ifs9km_omdata/2026090112/../202609020000.regionpack")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn source_singleton_time_dimension_is_normalized_for_direct_decoding() {
+        assert_eq!(
+            normalize_source_spatial_shape(&[1, O1280_POINT_COUNT], &[1, SOURCE_CHUNK_POINTS]),
+            Some((vec![O1280_POINT_COUNT], vec![SOURCE_CHUNK_POINTS]))
+        );
+        assert!(
+            normalize_source_spatial_shape(&[2, O1280_POINT_COUNT], &[1, SOURCE_CHUNK_POINTS])
+                .is_none()
         );
     }
 }
