@@ -862,7 +862,12 @@ fn source_read_block_frames(
     // on their much smaller native OM regional grids, so a complete source
     // series remains within the production memory guard and avoids rebuilding
     // ECMWF run stitching for every six output hours.
-    if matches!(scope, Scope::EcmwfIfs9km)
+    // IFS 9 km weather code expands several dependency grids together.  One
+    // native three-hour interval keeps that derived group below the memory
+    // ceiling of the 4 GiB production host without slowing every EC9 layer.
+    if variable == "weather_code" && matches!(scope, Scope::EcmwfIfs9km) {
+        configured_block_frames.min(3).min(total_frames)
+    } else if matches!(scope, Scope::EcmwfIfs9km)
         || (variable == "weather_code" && matches!(scope, Scope::Gfs))
     {
         configured_block_frames.min(total_frames)
@@ -1958,7 +1963,11 @@ mod tests {
         );
         assert_eq!(
             source_read_block_frames(Scope::EcmwfIfs9km, "weather_code", 6, 121),
-            6
+            3
+        );
+        assert_eq!(
+            source_read_block_frames(Scope::EcmwfIfs9km, "weather_code", 2, 121),
+            2
         );
     }
 
