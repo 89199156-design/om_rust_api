@@ -10306,6 +10306,11 @@ fn seed_variable_for_times(variable: &str) -> String {
         "soil_temperature_0_to_100cm" => "soil_temperature_0_to_7cm",
         "soil_moisture_0_to_100cm" => "soil_moisture_0_to_7cm",
         "evapotranspiration" => "latent_heat_flux",
+        "diffuse_radiation" | "diffuse_radiation_instant"
+            if current_weather_model() == WeatherModel::EcmwfIfs9km =>
+        {
+            "shortwave_radiation"
+        }
         "direct_radiation"
         | "shortwave_radiation_instant"
         | "direct_radiation_instant"
@@ -12694,6 +12699,14 @@ mod tests {
             assert_eq!(
                 seed_variable_for_times("relative_humidity_2m"),
                 "temperature_2m"
+            );
+            assert_eq!(
+                seed_variable_for_times("diffuse_radiation"),
+                "shortwave_radiation"
+            );
+            assert_eq!(
+                seed_variable_for_times("diffuse_radiation_instant"),
+                "shortwave_radiation"
             );
             Ok(())
         })
