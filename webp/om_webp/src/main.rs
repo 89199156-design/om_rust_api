@@ -261,7 +261,8 @@ const ECMWF_IFS025_LAYERS: &[Layer] = &[
     ),
 ];
 
-// IFS 9 km is decoded directly from the cropped immutable RegionPack batch.
+// IFS 9 km is decoded from the immutable native OM coverage materialized from
+// the private downloader's cropped RegionPack transport batch.
 // Keep the established client encoding contract and publish only fields that
 // the EC9 source actually carries; visibility, showers, and 200 m wind are
 // available here even though they are absent from the free IFS 0.25 feed.
@@ -460,7 +461,7 @@ impl Scope {
                 modified: true,
                 transformations: &[
                     "HTTP range extraction and spatial subsetting",
-                    "direct decoding of immutable RegionPack artifacts",
+                    "materialization into immutable Open-Meteo OM arrays",
                     "nearest-grid sampling to the published regular grid",
                     "temporal interpolation",
                     "unit conversion and derived-variable calculation",
@@ -1274,6 +1275,9 @@ fn compute_scope_grid(
         // every cell from their immutable, already regionalized OM products.
         Scope::Gfs => compute_grid(left, right, bottom, top),
         Scope::EcmwfIfs025 | Scope::Cams => compute_native_product_grid(scope, ready),
+        Scope::EcmwfIfs9km if ready.products.contains_key(scope.product_dir()) => {
+            compute_native_product_grid(scope, ready)
+        }
         Scope::EcmwfIfs9km => compute_ecmwf_ifs9km_grid(left, right, bottom, top),
     }
 }

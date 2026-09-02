@@ -395,7 +395,7 @@ fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<
                 .chain((240..=max_forecast_hour).step_by(6))
                 .collect()
         }
-    } else if runtime_domain.starts_with("ecmwf_ifs025") {
+    } else if runtime_domain.starts_with("ecmwf_ifs025") || runtime_domain == "ecmwf_ifs9km" {
         let start = if runtime_domain.ends_with("_ensemble") {
             3
         } else {
@@ -471,7 +471,7 @@ fn run_horizon(
     if product == "cams_global_greenhouse_gases" {
         return Ok(120);
     }
-    if ready.group == "gfs" || ready.group == "ecmwf" {
+    if matches!(ready.group.as_str(), "gfs" | "ecmwf" | "ecmwf_ifs9km") {
         return ready
             .source_run_max_forecast_hours
             .get(index)
@@ -1126,8 +1126,10 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         "gfs" => (5, 6),
         "cams" => (3, 12),
         "cams_greenhouse" => (3, 24),
-        "ecmwf" if matches!(target.hour(), 0 | 6 | 12 | 18) => (5, 6),
-        "ecmwf" => bail!("native ECMWF target must be a 00/06/12/18 UTC run"),
+        "ecmwf" | "ecmwf_ifs9km" if matches!(target.hour(), 0 | 6 | 12 | 18) => (5, 6),
+        "ecmwf" | "ecmwf_ifs9km" => {
+            bail!("native ECMWF target must be a 00/06/12/18 UTC run")
+        }
         _ => bail!("unsupported native group: {group}"),
     };
     if ready.source_runs.len() != expected_runs {
@@ -1150,7 +1152,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
     if group == "cams_greenhouse" && parsed.iter().any(|run| run.hour() != 0) {
         bail!("native CAMS greenhouse runs must use the daily 00 UTC cycle");
     }
-    let expected_public_start = if group == "ecmwf" {
+    let expected_public_start = if matches!(group, "ecmwf" | "ecmwf_ifs9km") {
         match ready.local_utc_offset_hours {
             Some(offset_hours) => {
                 if !(-23..=23).contains(&offset_hours) {
@@ -1238,6 +1240,25 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
             }
         }
     }
+    if group == "ecmwf_ifs9km" {
+        let expected_horizons: &[i64] = if matches!(target.hour(), 0 | 12) {
+            &[360, 144, 360, 144, 360]
+        } else {
+            &[144, 360, 144, 360, 144]
+        };
+        if ready.native_producer_contract != Some(1)
+            || ready.nan_fallback_depth != Some(4)
+            || ready.source_run_max_forecast_hours != expected_horizons
+            || ready
+                .products
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != ["ecmwf_ifs9km"]
+        {
+            bail!("native EC9 marker does not match the retained five-run fallback contract");
+        }
+    }
     if group == "cams" && ready.products.contains_key("cams_global_greenhouse_gases") {
         if ready.greenhouse_source_runs.len() != 3 {
             bail!("native CAMS greenhouse marker must contain three source runs");
@@ -1299,7 +1320,7 @@ fn validate_ready(ready: &NativeReady, group: &str) -> Result<()> {
         {
             bail!("native product {product} contains a negative horizon");
         }
-        if group == "ecmwf" {
+        if matches!(group, "ecmwf" | "ecmwf_ifs9km") {
             let run_count = product_ready.source_runs.len();
             let expected_runs = ready.source_runs.get(..run_count);
             let expected_horizons = ready.source_run_max_forecast_hours.get(..run_count);
@@ -1476,7 +1497,7 @@ pub fn load_native_group_products(
             load_native_product_run(&coverage_root, &ready, product, product_ready, latest, true)
                 .with_context(|| format!("load native current {product} {latest}"))?;
 
-        if group == "ecmwf" {
+        if matches!(group, "ecmwf" | "ecmwf_ifs9km") {
             for source_run in source_runs[..source_runs.len() - 1].iter().rev() {
                 let support = load_native_product_run(
                     &coverage_root,

@@ -4,7 +4,7 @@
 
 - Singapore receives OM from the separate `om_data_raw` Swift raw-model pipeline.
 - Shanghai receives OM from the separate `om_data_om` official Open-Meteo bucket downloader.
-- Shanghai ECMWF IFS 9 km consumes cropped `weather-region-pack-v1` batches from the separate private `raw_data` downloader. The API and WebP service decode those immutable compressed chunks directly and do not materialize an intermediate OM database.
+- Shanghai ECMWF IFS 9 km receives cropped `weather-region-pack-v1` batches from the separate private `raw_data` downloader. The public materializer converts the complete retained five-run batch to an immutable `openmeteo-native-v1` coverage. API and WebP consume only that native coverage; successful downstream validation releases the private transport batch for automatic cleanup.
 
 The API and WebP code must treat both as read-only inputs and expose their exact coverage/run identity. Source manifests and deployment records remain authoritative for acquisition URLs, reference times, checksums and transformations before OM publication.
 
@@ -16,7 +16,7 @@ Provider information: <https://www.ncei.noaa.gov/products/weather-climate-models
 
 ## ECMWF IFS
 
-Runtime products include deterministic IFS 0.25°, its paired ensemble precipitation probability fields, and spatially cropped deterministic IFS 9 km RegionPack batches. ECMWF attribution and applicable open-data terms must accompany derived output. The local service performs range extraction and spatial subsetting (in the private downloader), direct compressed-chunk decoding, nearest-grid sampling, retained-run/NaN fallback, temporal interpolation, derived-variable calculations and WebP encoding; ECMWF is not responsible for those modifications.
+Runtime products include deterministic IFS 0.25°, its paired ensemble precipitation probability fields, and spatially cropped deterministic IFS 9 km native OM coverages. ECMWF attribution and applicable open-data terms must accompany derived output. The local service performs range extraction and spatial subsetting (in the private downloader), RegionPack-to-OM materialization, nearest-grid sampling, retained-run/NaN fallback, temporal interpolation, derived-variable calculations and WebP encoding; ECMWF is not responsible for those modifications.
 
 Dataset information: <https://www.ecmwf.int/en/forecasts/datasets/open-data>
 

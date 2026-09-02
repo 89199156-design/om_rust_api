@@ -2,7 +2,7 @@
 
 上海和新加坡生产环境共有的 Rust 点位 API 与 WebP 生成仓库。
 
-本仓库只消费部署环境已经发布的只读数据，不执行任何上游下载，也不保存下载凭据：GFS、ECMWF IFS 0.25°、CAMS 使用 Open-Meteo Native/OM；ECMWF IFS 9 km 直接读取闭源下载仓库产出的裁剪 RegionPack，不再转换成 OM 数据库。
+本仓库不执行任何上游下载，也不保存下载凭据：GFS、ECMWF IFS 0.25°、CAMS 使用 Open-Meteo Native/OM；ECMWF IFS 9 km 由闭源下载仓库产出裁剪 RegionPack，再由本仓库的开源转换器生成不可变 Native/OM。API 与 WebP 只读取发布后的 OM，转换及下游校验成功后下载仓库即可自动回收 RegionPack。
 
 - `om_rust_api`：共有 Rust API、WebP、部署脚本和跨服务器一致性验证。
 - `om_data_raw`：仅新加坡，Swift 将官方原始模型数据生成 OM。
@@ -14,7 +14,7 @@
 
 - `om_api/`：Rust HTTP API、OM 解码、插值、小时/日聚合、派生变量、数据身份和归属接口。
 - `webp/om_webp/`：Rust WebP 渲染器与部署/校验脚本；EC9 和点位 API 共用同一开源解码、批次降级和插值逻辑。
-- `scripts/`：API 安装、原生解码库构建和官方/双服务器一致性验证。
+- `scripts/`：API/EC9 原生 OM 转换器安装、原生解码库构建和官方/双服务器一致性验证。
 - `nginx/`：API、来源归档和 WebP 的生产反向代理配置。
 
 仓库不包含下载器、Swift 生产代码、运行时天气数据、编译产物、容器镜像或服务器备份。

@@ -42,6 +42,7 @@ if [[ "$BUILD_TARGET_DIR" != /* ]]; then
 fi
 BUILD_BINARY="$BUILD_TARGET_DIR/release/om-api"
 MATERIALIZER_BUILD_BINARY="$BUILD_TARGET_DIR/release/om-native-materialize"
+EC9_MATERIALIZER_BUILD_BINARY="$BUILD_TARGET_DIR/release/om-ec9-materialize"
 if [[ "$API_DEM_ROOT" != /* ]]; then
   echo "OM_API_DEM_ROOT must be an absolute path: $API_DEM_ROOT" >&2
   exit 2
@@ -419,6 +420,7 @@ fi
 OM_BUILD_REVISION="$BUILD_REVISION" cargo build --release \
   --bin om-api \
   --bin om-native-materialize \
+  --bin om-ec9-materialize \
   --manifest-path "$APP_ROOT/om_api/Cargo.toml" \
   --target-dir "$BUILD_TARGET_DIR"
 if [ ! -f "$BUILD_BINARY" ]; then
@@ -429,8 +431,13 @@ if [ ! -f "$MATERIALIZER_BUILD_BINARY" ]; then
   echo "cargo build completed but om-native-materialize binary is missing: $MATERIALIZER_BUILD_BINARY" >&2
   exit 1
 fi
+if [ ! -f "$EC9_MATERIALIZER_BUILD_BINARY" ]; then
+  echo "cargo build completed but om-ec9-materialize binary is missing: $EC9_MATERIALIZER_BUILD_BINARY" >&2
+  exit 1
+fi
 install -m 0755 -- "$BUILD_BINARY" "$BIN_DIR/om-api"
 install -m 0755 -- "$MATERIALIZER_BUILD_BINARY" "$BIN_DIR/om-native-materialize"
+install -m 0755 -- "$EC9_MATERIALIZER_BUILD_BINARY" "$BIN_DIR/om-ec9-materialize"
 
 BUILD_INFO_TMP="$(mktemp "$BIN_DIR/.om-api.build-info.tmp.XXXXXX")"
 cleanup_build_info_tmp() {

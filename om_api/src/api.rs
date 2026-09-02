@@ -336,8 +336,8 @@ fn weather_attribution_payload() -> serde_json::Value {
                 "modified": true,
                 "transformations": [
                     "HTTP range extraction and spatial subsetting",
-                    "direct decoding of immutable RegionPack artifacts",
-                    "nearest-grid sampling",
+                    "materialization into immutable Open-Meteo OM arrays",
+                    "nearest-grid sampling to the published regular grid",
                     "temporal interpolation where requested",
                     "unit conversion and derived-variable calculation where requested",
                     "lossless WebP encoding for map layers"
@@ -566,9 +566,6 @@ async fn ecmwf_ifs9km_catalog(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
-    let product = snapshot
-        .ecmwf_ifs9km()
-        .context("ECMWF IFS 9 km RegionPack snapshot is unavailable")?;
     let hourly = ecmwf_ifs9km_public_hourly_variables();
     let daily = ecmwf_ifs9km_public_daily_variables();
     let available_variables = hourly
@@ -576,6 +573,61 @@ async fn ecmwf_ifs9km_catalog(
         .map(String::as_str)
         .chain(daily.iter().map(String::as_str))
         .collect::<std::collections::BTreeSet<_>>();
+    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+        let time_start = product
+            .entries
+            .keys()
+            .map(|key| key.valid_time_utc)
+            .min()
+            .context("EC9 native product has no first valid time")?;
+        let time_end = product
+            .entries
+            .keys()
+            .map(|key| key.valid_time_utc)
+            .max()
+            .context("EC9 native product has no final valid time")?;
+        let available_source_variables = product
+            .entries
+            .keys()
+            .map(|key| key.variable.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let grid = product
+            .entries
+            .values()
+            .find_map(|entry| entry.native_grid.as_ref())
+            .context("EC9 native product has no grid metadata")?;
+        return Ok(Json(json!({
+            "model": "ecmwf_ifs9km",
+            "runtime_format": "openmeteo-native-v1",
+            "coverage_id": product.manifest.coverage_id,
+            "latest_complete_run": product.manifest.latest_complete_run,
+            "public_start_utc": product.manifest.public_start_utc,
+            "time_start_utc": time_start,
+            "time_end_utc": time_end,
+            "grid": {
+                "name": "ECMWF IFS 9 km regular materialized grid",
+                "nominal_resolution_km": 9,
+                "bounds": {
+                    "west": grid.lon_min,
+                    "east": grid.lon_min + (grid.nx - 1) as f64 * grid.dx,
+                    "south": grid.lat_min,
+                    "north": grid.lat_min + (grid.ny - 1) as f64 * grid.dy,
+                },
+                "nx": grid.nx,
+                "ny": grid.ny,
+                "dx": grid.dx,
+                "dy": grid.dy,
+            },
+            "available_source_variables": available_source_variables,
+            "available_hourly_variables": hourly,
+            "available_daily_variables": daily,
+            "available_variables": available_variables,
+            "attribution": weather_attribution_payload()["data_sources"]["ecmwf_ifs9km"].clone(),
+        })));
+    }
+    let product = snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km snapshot is unavailable")?;
     let (time_start, time_end) = product.time_bounds()?;
     let bounds = product.bounds();
     Ok(Json(json!({

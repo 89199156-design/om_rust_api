@@ -270,6 +270,8 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                 chmod 0755 "$target_dir/release/om-api"
                 printf 'workspace-materializer-binary\n' > "$target_dir/release/om-native-materialize"
                 chmod 0755 "$target_dir/release/om-native-materialize"
+                printf 'workspace-ec9-materializer-binary\n' > "$target_dir/release/om-ec9-materialize"
+                chmod 0755 "$target_dir/release/om-ec9-materialize"
                 """,
             )
             self._write_executable(
@@ -359,7 +361,7 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
             ]
             self.assertEqual(
                 requested_binaries,
-                ["om-api", "om-native-materialize"],
+                ["om-api", "om-native-materialize", "om-ec9-materialize"],
             )
             manifest_option = cargo_arguments.index("--manifest-path")
             self.assertEqual(
@@ -377,6 +379,12 @@ test -z "$(find "$(dirname -- "$target_path")" -maxdepth 1 -name 'HSURF.om.tmp.*
                     install_root / "bin" / "om-native-materialize"
                 ).read_text(encoding="utf-8"),
                 "workspace-materializer-binary\n",
+            )
+            self.assertEqual(
+                (install_root / "bin" / "om-ec9-materialize").read_text(
+                    encoding="utf-8"
+                ),
+                "workspace-ec9-materializer-binary\n",
             )
             self.assertEqual(
                 (install_root / "source-revision").read_text(encoding="utf-8"),

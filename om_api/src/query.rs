@@ -651,7 +651,6 @@ pub const ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
     "showers",
     "snowfall",
     "snowfall_water_equivalent",
-    "snow_depth",
     "cape",
     "convective_inhibition",
     "boundary_layer_height",
@@ -801,7 +800,10 @@ pub fn ecmwf_ifs9km_public_daily_variables() -> Vec<String> {
     let mut variables = ECMWF_PUBLIC_DAILY_VARIABLES
         .iter()
         .copied()
-        .filter(|variable| !variable.starts_with("precipitation_probability_"))
+        .filter(|variable| {
+            !variable.starts_with("precipitation_probability_")
+                && !variable.starts_with("snow_depth_")
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
     variables.extend(
@@ -1974,6 +1976,69 @@ fn daily_sun_event(
     Ok(shifted_event - offset)
 }
 
+fn ecmwf_ifs9km_time_bounds(
+    snapshot: &OmDataSnapshot,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+        let first = product
+            .entries
+            .keys()
+            .map(|key| key.valid_time_utc)
+            .min()
+            .context("EC9 native product has no first valid time")?;
+        let last = product
+            .entries
+            .keys()
+            .map(|key| key.valid_time_utc)
+            .max()
+            .context("EC9 native product has no final valid time")?;
+        let public_start = product.manifest.public_start_utc.unwrap_or(first);
+        return Ok((first, last, public_start));
+    }
+    let regionpack = snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km snapshot is not available")?;
+    let (first, last) = regionpack.time_bounds()?;
+    Ok((first, last, regionpack.public_start_utc()))
+}
+
+fn ecmwf_ifs9km_nearest_coordinate(
+    snapshot: &OmDataSnapshot,
+    latitude: f64,
+    longitude: f64,
+) -> Result<(f64, f64)> {
+    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+        let entry = product
+            .entries
+            .values()
+            .find(|entry| entry.variable == "temperature_2m")
+            .or_else(|| product.entries.values().next())
+            .context("EC9 native product has no grid entry")?;
+        let (y, x) = grid_index_for_lat_lon(
+            &entry.array,
+            entry.native_grid.as_ref(),
+            latitude,
+            longitude,
+        )?;
+        return Ok((
+            f64::from(grid_latitude_for_index(
+                &entry.array,
+                entry.native_grid.as_ref(),
+                y,
+            )?),
+            f64::from(grid_longitude_for_index(
+                &entry.array,
+                entry.native_grid.as_ref(),
+                x,
+            )?),
+        ));
+    }
+    snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km snapshot is not available")?
+        .nearest_coordinate(latitude, longitude)
+}
+
 fn select_weather_dates(
     snapshot: &OmDataSnapshot,
     seed_variable: &str,
@@ -1991,10 +2056,7 @@ fn select_weather_dates(
     }
 
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
-        let (first, last) = regionpack.time_bounds()?;
+        let (first, last, _) = ecmwf_ifs9km_time_bounds(snapshot)?;
         let first_date = first.with_timezone(&timezone.offset).date_naive();
         let last_date = last.with_timezone(&timezone.offset).date_naive();
         let (requested_start, requested_end) = match (start_date, end_date) {
@@ -2493,13 +2555,10 @@ fn select_times(
     limit: Option<usize>,
 ) -> Result<Vec<DateTime<Utc>>> {
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
-        let (first, last) = regionpack.time_bounds()?;
+        let (first, last, public_start) = ecmwf_ifs9km_time_bounds(snapshot)?;
         let selected_start = start
             .map(|requested| requested.max(first))
-            .unwrap_or_else(|| regionpack.public_start_utc().max(first));
+            .unwrap_or_else(|| public_start.max(first));
         let selected_end = end.unwrap_or(last).min(last);
         let mut times = Vec::new();
         let mut time = selected_start;
@@ -7613,6 +7672,17 @@ fn read_ecmwf_ifs9km_window_grid_series(
     if times.is_empty() {
         return Ok(Vec::new());
     }
+    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+        return read_ecmwf_window_grid_series(
+            &[product],
+            decoder,
+            raw_variable,
+            raw_variable,
+            times,
+            latitudes,
+            longitudes,
+        );
+    }
     let regionpack = snapshot
         .ecmwf_ifs9km()
         .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
@@ -9899,7 +9969,7 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
 /// Port of `EcmwfVariable.interpolation` and `scalefactor` from the pinned
 /// Open-Meteo ECMWF source baseline. Unlike GFS, every non-accumulated ECMWF
 /// field defaults to Hermite interpolation.
-fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
+pub(crate) fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
     let scalefactor = if let Some((name, level)) = pressure_variable_name_and_level(variable) {
         match name {
             "temperature" => interpolate_range(2.0, 10.0, fraction_in_range(300.0, 1000.0, level)),
@@ -9988,6 +10058,17 @@ fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
     }
 }
 
+pub(crate) fn ecmwf_storage_scale_factor(variable: &str) -> f32 {
+    match ecmwf_interpolation_kind(variable) {
+        InterpolationKind::Direct => 1.0,
+        InterpolationKind::SolarBackwardsAveraged { scalefactor }
+        | InterpolationKind::Linear { scalefactor }
+        | InterpolationKind::Backwards { scalefactor }
+        | InterpolationKind::BackwardsSum { scalefactor }
+        | InterpolationKind::Hermite { scalefactor, .. } => scalefactor,
+    }
+}
+
 fn cams_interpolation_kind(variable: &str) -> InterpolationKind {
     let scalefactor = match variable {
         "pm10" | "pm2_5" | "nitrogen_dioxide" | "sulphur_dioxide" => 10.0,
@@ -10071,15 +10152,25 @@ fn product_for_variable(
             "skin_temperature" | "soil_temperature_0cm" => "surface_temperature",
             _ => variable,
         };
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
-        if !regionpack
-            .available_variables()
-            .iter()
-            .any(|available| available == raw_variable)
-        {
-            bail!("EC9 raw variable is not available: {raw_variable}");
+        if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+            if !product
+                .entries
+                .keys()
+                .any(|key| key.variable == raw_variable)
+            {
+                bail!("EC9 native variable is not available: {raw_variable}");
+            }
+        } else {
+            let regionpack = snapshot
+                .ecmwf_ifs9km()
+                .context("ECMWF IFS 9 km snapshot is not available")?;
+            if !regionpack
+                .available_variables()
+                .iter()
+                .any(|available| available == raw_variable)
+            {
+                bail!("EC9 raw variable is not available: {raw_variable}");
+            }
         }
         return Ok(("ecmwf_ifs9km", raw_variable.to_string()));
     }
@@ -10880,11 +10971,8 @@ fn resolve_request_sampling(
         None
     };
     let ecmwf9km = if current_weather_model() == WeatherModel::EcmwfIfs9km {
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
         let (model_latitude, model_longitude) =
-            regionpack.nearest_coordinate(latitude, longitude)?;
+            ecmwf_ifs9km_nearest_coordinate(snapshot, latitude, longitude)?;
         let model_elevation = if target.is_finite() { target } else { 0.0 };
         Some(ModelSampling {
             latitude: model_latitude,
@@ -11226,11 +11314,8 @@ fn weather_model_location(
 ) -> Result<Option<(f64, f64, f32)>> {
     let model = current_weather_model();
     if model == WeatherModel::EcmwfIfs9km {
-        let Some(regionpack) = snapshot.ecmwf_ifs9km() else {
-            return Ok(None);
-        };
         let (model_latitude, model_longitude) =
-            regionpack.nearest_coordinate(latitude, longitude)?;
+            ecmwf_ifs9km_nearest_coordinate(snapshot, latitude, longitude)?;
         return Ok(Some((model_latitude, model_longitude, 0.0)));
     }
     let product_name = model.primary_product();
@@ -11393,10 +11478,7 @@ fn model_latitude_for_variable(
         if let Some(sampling) = current_product_sampling("ecmwf_ifs9km") {
             return Ok(sampling.latitude as f32);
         }
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
-        return Ok(regionpack.nearest_coordinate(latitude, longitude)?.0 as f32);
+        return Ok(ecmwf_ifs9km_nearest_coordinate(snapshot, latitude, longitude)?.0 as f32);
     }
     let (product_name, raw_variable) = product_for_variable(snapshot, variable)?;
     if let Some(sampling) = current_product_sampling(product_name) {
@@ -12896,14 +12978,10 @@ fn read_weather_code_grid_series(
     };
 
     let model_latitudes = if current_weather_model() == WeatherModel::EcmwfIfs9km {
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("EC9 weather-code snapshot is not available")?;
         latitudes
             .iter()
             .map(|latitude| {
-                regionpack
-                    .nearest_coordinate(*latitude, longitudes[0])
+                ecmwf_ifs9km_nearest_coordinate(snapshot, *latitude, longitudes[0])
                     .map(|(model_latitude, _)| model_latitude as f32)
             })
             .collect::<Result<Vec<_>>>()?
@@ -13108,14 +13186,10 @@ fn read_weather_code_grid(
         )?
     };
     let model_latitudes = if current_weather_model() == WeatherModel::EcmwfIfs9km {
-        let regionpack = snapshot
-            .ecmwf_ifs9km()
-            .context("EC9 weather-code snapshot is not available")?;
         latitudes
             .iter()
             .map(|latitude| {
-                regionpack
-                    .nearest_coordinate(*latitude, longitudes[0])
+                ecmwf_ifs9km_nearest_coordinate(snapshot, *latitude, longitudes[0])
                     .map(|(model_latitude, _)| model_latitude as f32)
             })
             .collect::<Result<Vec<_>>>()?

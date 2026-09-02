@@ -19,6 +19,7 @@ pub const GFS_PRODUCTS: &[&str] = &[
 pub const CAMS_PRODUCTS: &[&str] = &["cams_global", "cams_global_greenhouse_gases"];
 pub const CAMS_GREENHOUSE_PRODUCTS: &[&str] = &["cams_global_greenhouse_gases"];
 pub const ECMWF_PRODUCTS: &[&str] = &["ecmwf_ifs025", "ecmwf_ifs025_ensemble"];
+pub const ECMWF_IFS9KM_PRODUCTS: &[&str] = &["ecmwf_ifs9km"];
 
 #[derive(Debug)]
 pub struct OmDataSnapshot {
@@ -128,7 +129,23 @@ impl OmDataSnapshot {
                 &mut historical_products,
             )?;
         }
-        let ecmwf_ifs9km = RegionPackSnapshot::load(&data_root)?.map(Arc::new);
+        // EC9 starts life as a cropped RegionPack release.  The open producer
+        // materializes that release into immutable native OM files before the
+        // private downloader is allowed to acknowledge and remove its batch.
+        // Prefer the native release and retain the RegionPack reader only as a
+        // migration/rollback path while an older deployment is still current.
+        let ecmwf_ifs9km_native = load_native_group_products(
+            &data_root,
+            "ecmwf_ifs9km",
+            ECMWF_IFS9KM_PRODUCTS,
+            &mut products,
+            &mut historical_products,
+        )?;
+        let ecmwf_ifs9km = if ecmwf_ifs9km_native {
+            None
+        } else {
+            RegionPackSnapshot::load(&data_root)?.map(Arc::new)
+        };
         Ok(Self {
             data_root,
             products,
