@@ -84,6 +84,24 @@ fn grid() -> NativeGridMetadata {
     }
 }
 
+fn grid_marker(grid: &NativeGridMetadata) -> Value {
+    json!({
+        "grid_type": "regional_regular_lat_lon",
+        "full_nx": grid.full_nx,
+        "full_ny": grid.full_ny,
+        "x0": grid.x0,
+        "y0": grid.y0,
+        "nx": grid.nx,
+        "ny": grid.ny,
+        "lon_min": grid.lon_min,
+        "lat_min": grid.lat_min,
+        "dx": grid.dx,
+        "dy": grid.dy,
+        "dt_seconds": grid.dt_seconds,
+        "om_file_length": grid.om_file_length,
+    })
+}
+
 fn validate_revision(value: &str) -> Result<()> {
     if value.len() != 40
         || !value
@@ -460,6 +478,7 @@ pub fn build_and_publish_ec9_coverage(
         .map(|run| run.source_run.clone())
         .collect::<Vec<_>>();
     let grid = grid();
+    let grid_marker = grid_marker(&grid);
     let marker = json!({
         "schema_version": 1,
         "native_producer_contract": 1,
@@ -490,7 +509,7 @@ pub fn build_and_publish_ec9_coverage(
             PRODUCT: {
                 "coverage_id": coverage_id,
                 "runtime_domain": PRODUCT,
-                "grid": grid,
+                "grid": grid_marker,
                 "source_runs": source_runs,
                 "source_run_max_forecast_hours": horizons,
             }
@@ -564,4 +583,20 @@ pub fn build_and_publish_ec9_coverage(
         decoded_probes,
         reused: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grid, grid_marker};
+
+    #[test]
+    fn published_grid_marker_matches_native_webp_contract() {
+        let marker = grid_marker(&grid());
+        assert_eq!(
+            marker.get("grid_type").and_then(|value| value.as_str()),
+            Some("regional_regular_lat_lon")
+        );
+        assert_eq!(marker.get("nx").and_then(|value| value.as_u64()), Some(897));
+        assert_eq!(marker.get("ny").and_then(|value| value.as_u64()), Some(743));
+    }
 }
