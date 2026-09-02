@@ -6986,6 +6986,7 @@ fn ecmwf_regularize_source_run(
     raw_variable: &str,
     latitudes: &[f64],
     longitudes: &[f64],
+    support_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Option<EcmwfRegularRun>> {
     let mut entries = product
         .entries_by_source_run
@@ -6993,6 +6994,11 @@ fn ecmwf_regularize_source_run(
         .into_iter()
         .flatten()
         .filter(|entry| entry.variable == raw_variable)
+        .filter(|entry| {
+            support_window.is_none_or(|(start, end)| {
+                entry.valid_time_utc >= start && entry.valid_time_utc <= end
+            })
+        })
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return Ok(None);
@@ -7294,6 +7300,18 @@ fn build_ecmwf_regular_series(
     latitudes: &[f64],
     longitudes: &[f64],
 ) -> Result<Option<EcmwfRegularSeries>> {
+    build_ecmwf_regular_series_window(product, decoder, raw_variable, latitudes, longitudes, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ecmwf_regular_series_window(
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    raw_variable: &str,
+    latitudes: &[f64],
+    longitudes: &[f64],
+    support_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Result<Option<EcmwfRegularSeries>> {
     if !is_ecmwf_product(&product.product) {
         return Ok(None);
     }
@@ -7314,6 +7332,7 @@ fn build_ecmwf_regular_series(
             raw_variable,
             latitudes,
             longitudes,
+            support_window,
         )? {
             runs.push(run);
         }
@@ -7670,20 +7689,6 @@ fn read_ecmwf_ifs9km_window_grid_series(
     if times.is_empty() {
         return Ok(Vec::new());
     }
-    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
-        return read_ecmwf_window_grid_series(
-            &[product],
-            decoder,
-            raw_variable,
-            raw_variable,
-            times,
-            latitudes,
-            longitudes,
-        );
-    }
-    let regionpack = snapshot
-        .ecmwf_ifs9km()
-        .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
     let first_requested = *times
         .iter()
         .min()
@@ -7696,6 +7701,46 @@ fn read_ecmwf_ifs9km_window_grid_series(
     // sparse long-range boundary while keeping retained older runs bounded.
     let support_start = first_requested - Duration::hours(24);
     let support_end = last_requested + Duration::hours(24);
+    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
+        let key = EcmwfRegularCacheKey {
+            coverage_id: format!(
+                "{}:{}:{}",
+                product.manifest.coverage_id,
+                support_start.timestamp(),
+                support_end.timestamp()
+            ),
+            raw_variable: raw_variable.to_string(),
+            latitudes: latitudes.iter().map(|value| value.to_bits()).collect(),
+            longitudes: longitudes.iter().map(|value| value.to_bits()).collect(),
+        };
+        let build = || {
+            build_ecmwf_regular_series_window(
+                &product,
+                decoder,
+                raw_variable,
+                latitudes,
+                longitudes,
+                Some((support_start, support_end)),
+            )
+        };
+        let regular = if latitudes.len().saturating_mul(longitudes.len()) > 65_536 {
+            build()?.map(Arc::new)
+        } else {
+            ecmwf_cached_regular_series(key, build)?
+        }
+        .with_context(|| format!("EC9 variable is not available: {raw_variable}"))?;
+        return read_ecmwf_regular_series_grid(
+            &[regular],
+            "ecmwf_ifs9km",
+            raw_variable,
+            times,
+            latitudes,
+            longitudes,
+        );
+    }
+    let regionpack = snapshot
+        .ecmwf_ifs9km()
+        .context("ECMWF IFS 9 km RegionPack snapshot is not available")?;
     let key = EcmwfRegularCacheKey {
         coverage_id: format!(
             "{}:{}:{}",
