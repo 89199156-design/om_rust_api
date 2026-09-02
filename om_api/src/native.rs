@@ -431,7 +431,18 @@ fn validate_run_time_axis(
             == (0..=max_forecast_hour)
                 .map(|hour| meta.reference_time + Duration::hours(hour))
                 .collect::<Vec<_>>();
-    if meta.valid_times != expected_source && !is_dense_gfs {
+    // Keep the previously published EC9 coverage readable while the next
+    // producer cycle replaces it.  Those coverages intentionally reduced the
+    // hourly source prefix to the old 3h/6h lattice; the query layer can still
+    // expand that sparse metadata onto its new hourly intermediate.
+    let is_legacy_sparse_ec9 = runtime_domain == "ecmwf_ifs9km"
+        && meta.valid_times
+            == (0..=max_forecast_hour.min(144))
+                .filter(|forecast_hour| forecast_hour % 3 == 0)
+                .chain((150..=max_forecast_hour).filter(|forecast_hour| forecast_hour % 6 == 0))
+                .map(|hour| meta.reference_time + Duration::hours(hour))
+                .collect::<Vec<_>>();
+    if meta.valid_times != expected_source && !is_dense_gfs && !is_legacy_sparse_ec9 {
         bail!(
             "native run time axis does not match {} 0...{}h contract",
             runtime_domain,
@@ -1799,6 +1810,17 @@ mod tests {
                 .chain((150..=360).step_by(6))
                 .collect::<Vec<_>>()
         );
+        let reference_time = "2026-09-02T06:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let legacy_ec9 = NativeRunMeta {
+            reference_time,
+            variables: vec!["temperature_2m".to_string()],
+            valid_times: (0..=144)
+                .step_by(3)
+                .map(|hour| reference_time + Duration::hours(hour))
+                .collect(),
+            geopotential_height_source: None,
+        };
+        assert!(validate_run_time_axis("ecmwf_ifs9km", &legacy_ec9, 144).is_ok());
         for latest in ["2026080200", "2026080206", "2026080212", "2026080218"] {
             assert_eq!(
                 expected_gfs_right_support_source(parse_run(latest).unwrap()),
