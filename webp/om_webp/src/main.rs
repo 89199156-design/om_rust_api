@@ -1025,6 +1025,7 @@ fn main() -> Result<()> {
                         source_layer.variable,
                         source_times,
                         &grid,
+                        args.scope,
                         args.scope.tolerate_unavailable_layers(),
                     )?;
                     let values_v = match source_layer.variable_v {
@@ -1034,6 +1035,7 @@ fn main() -> Result<()> {
                             variable,
                             source_times,
                             &grid,
+                            args.scope,
                             args.scope.tolerate_unavailable_layers(),
                         )?),
                         None => None,
@@ -1525,20 +1527,56 @@ fn read_layer_grid_series(
     variable: &str,
     times: &[DateTime<Utc>],
     grid: &RegionGrid,
+    scope: Scope,
     tolerate_unavailable: bool,
 ) -> Result<Vec<Vec<f32>>> {
     // Read every requested output frame once for this source dependency. The
     // caller groups layers that share a source and encodes the returned frames
     // in small blocks, avoiding both repeated native ECMWF regularization and
     // the unbounded multi-dependency request cache used by the point API.
-    let values = read_variable_grid_series(
-        snapshot,
-        decoder,
-        variable,
-        times,
-        &grid.latitudes,
-        &grid.longitudes,
-    );
+    // EC9 stitches five retained runs on an hourly intermediate. Building that
+    // intermediate for all 743 rows at once can exceed a 4 GiB production
+    // host even with one renderer worker. Process latitude strips instead;
+    // each returned frame remains in the same row-major order, while the peak
+    // retained-run working set is bounded independently of the full region.
+    let latitude_block_rows = source_spatial_block_rows(scope, grid.latitudes.len());
+    let values = if latitude_block_rows < grid.latitudes.len() {
+        (|| -> Result<Vec<Vec<f32>>> {
+            let mut series = (0..times.len())
+                .map(|_| Vec::with_capacity(grid.len()))
+                .collect::<Vec<_>>();
+            for latitude_block in grid.latitudes.chunks(latitude_block_rows) {
+                let block = read_variable_grid_series(
+                    snapshot,
+                    decoder,
+                    variable,
+                    times,
+                    latitude_block,
+                    &grid.longitudes,
+                )?;
+                if block.len() != times.len() {
+                    bail!("regional EC9 source block returned the wrong time count");
+                }
+                let expected_points = latitude_block.len() * grid.longitudes.len();
+                for (frame, block_frame) in series.iter_mut().zip(block) {
+                    if block_frame.len() != expected_points {
+                        bail!("regional EC9 source block returned the wrong grid size");
+                    }
+                    frame.extend(block_frame);
+                }
+            }
+            Ok(series)
+        })()
+    } else {
+        read_variable_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            &grid.latitudes,
+            &grid.longitudes,
+        )
+    };
     match values {
         Ok(mut series) => {
             for values in &mut series {
@@ -1555,6 +1593,14 @@ fn read_layer_grid_series(
             Ok(vec![vec![f32::NAN; grid.len()]; times.len()])
         }
         Err(error) => Err(error),
+    }
+}
+
+fn source_spatial_block_rows(scope: Scope, total_rows: usize) -> usize {
+    if matches!(scope, Scope::EcmwfIfs9km) {
+        total_rows.min(64)
+    } else {
+        total_rows
     }
 }
 
@@ -1969,6 +2015,9 @@ mod tests {
             source_read_block_frames(Scope::EcmwfIfs9km, "weather_code", 2, 121),
             2
         );
+        assert_eq!(source_spatial_block_rows(Scope::EcmwfIfs9km, 743), 64);
+        assert_eq!(source_spatial_block_rows(Scope::EcmwfIfs9km, 32), 32);
+        assert_eq!(source_spatial_block_rows(Scope::Gfs, 743), 743);
     }
 
     #[test]
