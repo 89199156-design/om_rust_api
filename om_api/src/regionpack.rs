@@ -435,22 +435,27 @@ impl RegionPackSnapshot {
     }
 
     fn discover_variables(&self) -> Result<Vec<String>> {
-        let newest = self
-            .runs_oldest_to_newest
-            .last()
-            .context("EC9 snapshot has no source runs")?;
-        let frame = newest
-            .frames
-            .values()
-            // The analysis (lead-zero) frame intentionally omits accumulated
-            // fields such as precipitation, showers, and radiation. A later
-            // forecast frame carries the complete EC9 variable inventory.
-            .next_back()
-            .context("EC9 newest run has no frames")?;
-        let header = frame.header(self.bounds)?;
-        let mut variables = header.variables.keys().cloned().collect::<Vec<_>>();
-        variables.sort();
-        Ok(variables)
+        let mut variables = BTreeSet::new();
+        for run in &self.runs_oldest_to_newest {
+            let frame = run
+                .frames
+                .values()
+                // The analysis (lead-zero) frame intentionally omits accumulated
+                // fields such as precipitation, showers, and radiation. A later
+                // forecast frame carries the complete inventory for this run.
+                .next_back()
+                .with_context(|| format!("EC9 source run {} has no frames", run.source_run))?;
+            let header = frame.header(self.bounds)?;
+            variables.extend(header.variables.keys().cloned());
+        }
+        if variables.is_empty() {
+            bail!("EC9 snapshot has no variables");
+        }
+        // IFS 00Z/12Z long cycles expose more fields than 06Z/18Z short
+        // cycles.  The retained-run union is intentional: a variable absent
+        // from the latest short cycle (for example snow_depth) is served from
+        // the newest older run that structurally covers the requested time.
+        Ok(variables.into_iter().collect())
     }
 }
 

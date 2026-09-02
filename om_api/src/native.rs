@@ -2485,11 +2485,22 @@ mod tests {
                 &run_root.join("wind_gusts_10m.om"),
                 [2, 3, stored_time_count as u64],
             );
+            let is_long_cycle = run.ends_with("00") || run.ends_with("12");
+            if is_long_cycle {
+                write_fake_om(
+                    &run_root.join("snow_depth.om"),
+                    [2, 3, forecast_hours.len() as u64],
+                );
+            }
             fs::write(
                 run_root.join("meta.json"),
                 serde_json::to_vec(&json!({
                     "reference_time": reference,
-                    "variables": ["wind_gusts_10m"],
+                    "variables": if is_long_cycle {
+                        vec!["wind_gusts_10m", "snow_depth"]
+                    } else {
+                        vec!["wind_gusts_10m"]
+                    },
                     "valid_times": forecast_hours
                         .iter()
                         .map(|hour| reference + Duration::hours(*hour))
@@ -2604,7 +2615,12 @@ mod tests {
         assert_eq!(current.manifest.coverage_plan.len(), 353);
         assert_eq!(
             current.native_handles.len(),
-            source_runs.len() + gust_support_runs.len()
+            source_runs.len()
+                + gust_support_runs.len()
+                + source_runs
+                    .iter()
+                    .filter(|run| run.ends_with("00") || run.ends_with("12"))
+                    .count()
         );
         assert!(gust_support_runs
             .iter()
@@ -2612,6 +2628,19 @@ mod tests {
                 .iter()
                 .all(|entry| entry.interpolation_support)));
         assert!(!history.contains_key("ecmwf_ifs025"));
+
+        let latest_public_run = current.entries_by_source_run.get("2026073006").unwrap();
+        assert!(!latest_public_run
+            .iter()
+            .any(|entry| entry.variable == "snow_depth"));
+        let previous_long_run = current.entries_by_source_run.get("2026073000").unwrap();
+        assert!(previous_long_run
+            .iter()
+            .any(|entry| entry.variable == "snow_depth"));
+        assert!(current
+            .entries
+            .keys()
+            .any(|key| key.variable == "snow_depth"));
 
         let mut transitional_marker = marker;
         transitional_marker

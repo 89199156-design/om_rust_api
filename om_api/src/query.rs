@@ -651,6 +651,7 @@ pub const ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES: &[&str] = &[
     "showers",
     "snowfall",
     "snowfall_water_equivalent",
+    "snow_depth",
     "cape",
     "convective_inhibition",
     "boundary_layer_height",
@@ -800,10 +801,7 @@ pub fn ecmwf_ifs9km_public_daily_variables() -> Vec<String> {
     let mut variables = ECMWF_PUBLIC_DAILY_VARIABLES
         .iter()
         .copied()
-        .filter(|variable| {
-            !variable.starts_with("precipitation_probability_")
-                && !variable.starts_with("snow_depth_")
-        })
+        .filter(|variable| !variable.starts_with("precipitation_probability_"))
         .map(str::to_string)
         .collect::<Vec<_>>();
     variables.extend(
@@ -11505,6 +11503,43 @@ fn model_latitude_for_variable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ec9_catalog_keeps_long_cycle_snow_depth() {
+        assert!(ecmwf_ifs9km_public_hourly_variables().contains(&"snow_depth".to_string()));
+        let daily = ecmwf_ifs9km_public_daily_variables();
+        assert!(daily.contains(&"snow_depth_max".to_string()));
+        assert!(daily.contains(&"snow_depth_mean".to_string()));
+        assert!(daily.contains(&"snow_depth_min".to_string()));
+    }
+
+    #[test]
+    fn ec9_missing_short_cycle_variable_uses_newest_covering_long_cycle() {
+        let time = Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap();
+        let series = Arc::new(EcmwfRegularSeries {
+            runs: vec![
+                EcmwfRegularRun {
+                    source_run: "2026090100".to_string(),
+                    start: time,
+                    frames: vec![vec![0.01]],
+                },
+                EcmwfRegularRun {
+                    source_run: "2026090112".to_string(),
+                    start: time,
+                    frames: vec![vec![0.03]],
+                },
+            ],
+            public_start_utc: Some(time),
+            // The 18Z release is the published generation, but its upstream
+            // inventory does not contain snow_depth at all.
+            latest_source_run: Some("2026090118".to_string()),
+        });
+
+        assert_eq!(
+            ecmwf_one_level_generation_value(&[series], Some("2026090118"), Some(time), time, 0,),
+            0.03
+        );
+    }
 
     #[test]
     fn gfs_only_short_circuits_ecmwf_soil_layer_depths() {
