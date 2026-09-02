@@ -6799,6 +6799,10 @@ struct EcmwfRegularCacheKey {
 #[derive(Debug)]
 struct EcmwfRegularSeries {
     runs: Vec<EcmwfRegularRun>,
+    /// Cadence of the dense intermediate. IFS025 is normalised to three-hour
+    /// steps, while operational IFS 9 km keeps its native hourly prefix and
+    /// fills only the sparse forecast tail onto an hourly axis.
+    dt_seconds: i64,
     public_start_utc: Option<DateTime<Utc>>,
     latest_source_run: Option<String>,
 }
@@ -6937,6 +6941,7 @@ fn ecmwf_first_stage_point(
     values: &mut [f32],
     kind: InterpolationKind,
     start: DateTime<Utc>,
+    dt_seconds: i64,
     latitude: f32,
     longitude: f32,
     require_full_hermite_support: bool,
@@ -6959,7 +6964,7 @@ fn ecmwf_first_stage_point(
             interpolate_solar_backwards_with_dt_in_place(
                 values,
                 start,
-                3 * 3600,
+                dt_seconds,
                 latitude as f64,
                 longitude as f64,
             )
@@ -6988,6 +6993,11 @@ fn ecmwf_regularize_source_run(
     longitudes: &[f64],
     support_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Option<EcmwfRegularRun>> {
+    let cadence_hours = if product.product == "ecmwf_ifs9km" {
+        1
+    } else {
+        3
+    };
     let mut entries = product
         .entries_by_source_run
         .get(source_run)
@@ -7015,8 +7025,11 @@ fn ecmwf_regularize_source_run(
         .map(|entry| logical_hour(entry))
         .max()
         .unwrap();
-    if min_hour < 0 || min_hour % 3 != 0 || max_hour % 3 != 0 {
-        bail!("ECMWF native forecast hours are not aligned to the 3-hour conversion axis");
+    if min_hour < 0 || min_hour % cadence_hours != 0 || max_hour % cadence_hours != 0 {
+        bail!(
+            "ECMWF native forecast hours are not aligned to the {}-hour conversion axis",
+            cadence_hours
+        );
     }
     let base = entries[0].valid_time_utc - Duration::hours(logical_hour(entries[0]));
     if entries
@@ -7026,7 +7039,7 @@ fn ecmwf_regularize_source_run(
         bail!("ECMWF logical source run has inconsistent reference times: {source_run}");
     }
     let start = base + Duration::hours(min_hour);
-    let count = usize::try_from((max_hour - min_hour) / 3 + 1)?;
+    let count = usize::try_from((max_hour - min_hour) / cadence_hours + 1)?;
     let grid_len = latitudes.len() * longitudes.len();
     let mut frames = vec![vec![f32::NAN; grid_len]; count];
     let mut entry_index = 0;
@@ -7065,11 +7078,11 @@ fn ecmwf_regularize_source_run(
                 contiguous_end - entry_index,
             )?;
             for (entry, values) in entries[entry_index..contiguous_end].iter().zip(decoded) {
-                let index = usize::try_from((logical_hour(entry) - min_hour) / 3)?;
+                let index = usize::try_from((logical_hour(entry) - min_hour) / cadence_hours)?;
                 frames[index] = values;
             }
         } else {
-            let index = usize::try_from((logical_hour(first) - min_hour) / 3)?;
+            let index = usize::try_from((logical_hour(first) - min_hour) / cadence_hours)?;
             frames[index] = read_entry_grid(product, first, decoder, latitudes, longitudes)?;
         }
         entry_index = contiguous_end;
@@ -7093,6 +7106,7 @@ fn ecmwf_regularize_source_run(
             &mut values,
             kind,
             start,
+            cadence_hours * 3600,
             latitudes[point / width] as f32,
             longitudes[point % width] as f32,
             is_gust,
@@ -7343,6 +7357,11 @@ fn build_ecmwf_regular_series_window(
     runs.sort_by(|left, right| left.source_run.cmp(&right.source_run));
     Ok(Some(EcmwfRegularSeries {
         runs,
+        dt_seconds: if product.product == "ecmwf_ifs9km" {
+            3600
+        } else {
+            3 * 3600
+        },
         public_start_utc: product.manifest.public_start_utc,
         latest_source_run: product.manifest.latest_complete_run.clone(),
     }))
@@ -7351,8 +7370,9 @@ fn build_ecmwf_regular_series_window(
 fn ecmwf_latest_support_start(
     run_start: DateTime<Utc>,
     public_start_utc: DateTime<Utc>,
+    dt_seconds: i64,
 ) -> DateTime<Utc> {
-    let regular_step_seconds = 3 * 3600;
+    let regular_step_seconds = dt_seconds.max(1);
     let elapsed_seconds = (public_start_utc - run_start).num_seconds().max(0);
     let containing_frame_seconds =
         elapsed_seconds.div_euclid(regular_step_seconds) * regular_step_seconds;
@@ -7365,12 +7385,13 @@ fn ecmwf_run_is_eligible(
     latest_source_run: Option<&str>,
     public_start_utc: Option<DateTime<Utc>>,
     time: DateTime<Utc>,
+    dt_seconds: i64,
 ) -> bool {
     if latest_source_run != Some(source_run) {
         return true;
     }
     public_start_utc
-        .map(|boundary| time >= ecmwf_latest_support_start(run_start, boundary))
+        .map(|boundary| time >= ecmwf_latest_support_start(run_start, boundary, dt_seconds))
         .unwrap_or(true)
 }
 
@@ -7399,12 +7420,17 @@ fn ecmwf_cached_regular_series(
     Ok(Some(built))
 }
 
-fn ecmwf_structural_value(run: &EcmwfRegularRun, time: DateTime<Utc>, point: usize) -> Option<f32> {
+fn ecmwf_structural_value(
+    run: &EcmwfRegularRun,
+    time: DateTime<Utc>,
+    point: usize,
+    dt_seconds: i64,
+) -> Option<f32> {
     let elapsed = (time - run.start).num_seconds();
-    if elapsed < 0 || elapsed % (3 * 3600) != 0 {
+    if elapsed < 0 || elapsed % dt_seconds != 0 {
         return None;
     }
-    let index = usize::try_from(elapsed / (3 * 3600)).ok()?;
+    let index = usize::try_from(elapsed / dt_seconds).ok()?;
     run.frames
         .get(index)
         .and_then(|frame| frame.get(point))
@@ -7441,10 +7467,11 @@ fn ecmwf_one_level_native_value(
                 latest_source_run,
                 public_start_utc,
                 time,
+                3 * 3600,
             ) {
                 return None;
             }
-            ecmwf_structural_value(run, time, point)
+            ecmwf_structural_value(run, time, point, 3 * 3600)
         });
         if let Some(value) = value {
             if primary_value.is_none() {
@@ -7479,10 +7506,11 @@ fn ecmwf_coverage_native_value(
             latest_source_run,
             public_start_utc,
             time,
+            series.dt_seconds,
         ) {
             continue;
         }
-        let Some(value) = ecmwf_structural_value(run, time, point) else {
+        let Some(value) = ecmwf_structural_value(run, time, point, series.dt_seconds) else {
             continue;
         };
         if value.is_finite() {
@@ -7560,9 +7588,14 @@ fn read_ecmwf_regular_series_grid(
 ) -> Result<Vec<Vec<f32>>> {
     let mut runs = regular_series
         .iter()
-        .flat_map(|regular| regular.runs.iter())
+        .flat_map(|regular| {
+            regular
+                .runs
+                .iter()
+                .map(move |run| (run, regular.dt_seconds))
+        })
         .collect::<Vec<_>>();
-    runs.sort_by(|left, right| right.source_run.cmp(&left.source_run));
+    runs.sort_by(|left, right| right.0.source_run.cmp(&left.0.source_run));
     if runs.is_empty() {
         return Ok(vec![
             vec![f32::NAN; latitudes.len() * longitudes.len()];
@@ -7580,19 +7613,25 @@ fn read_ecmwf_regular_series_grid(
                 .find(|regular| regular.latest_source_run.as_deref() == Some(latest))
         })
         .and_then(|regular| regular.public_start_utc);
-    let regular_start = runs.iter().map(|run| run.start).min().unwrap();
+    let regular_dt_seconds = regular_series
+        .iter()
+        .map(|regular| regular.dt_seconds)
+        .min()
+        .unwrap_or(3 * 3600)
+        .max(1);
+    let regular_start = runs.iter().map(|(run, _)| run.start).min().unwrap();
     let regular_end = runs
         .iter()
-        .filter_map(|run| {
+        .filter_map(|(run, dt_seconds)| {
             run.frames
                 .len()
                 .checked_sub(1)
-                .map(|last| run.start + Duration::hours(last as i64 * 3))
+                .map(|last| run.start + Duration::seconds(last as i64 * *dt_seconds))
         })
         .max()
         .unwrap();
-    let regular_times = (0..=((regular_end - regular_start).num_hours() / 3))
-        .map(|index| regular_start + Duration::hours(index * 3))
+    let regular_times = (0..=((regular_end - regular_start).num_seconds() / regular_dt_seconds))
+        .map(|index| regular_start + Duration::seconds(index * regular_dt_seconds))
         .collect::<Vec<_>>();
     let kind = ecmwf_interpolation_kind(raw_variable);
     let output_dt_seconds = series_dt_seconds(times);
@@ -7805,7 +7844,7 @@ fn build_ecmwf_ifs9km_regular_series(
             .filter_map(|(valid_time, file)| {
                 let forecast_seconds = (*valid_time - run.reference_time).num_seconds();
                 (forecast_seconds >= 0
-                    && forecast_seconds % (3 * 3600) == 0
+                    && forecast_seconds % 3600 == 0
                     && *valid_time >= support_start
                     && *valid_time <= support_end)
                     .then_some((*valid_time, file))
@@ -7816,11 +7855,11 @@ fn build_ecmwf_ifs9km_regular_series(
         };
         let first_time = *first_time;
         let last_time = selected.last().expect("selected EC9 frame exists").0;
-        let count = usize::try_from((last_time - first_time).num_hours() / 3 + 1)?;
+        let count = usize::try_from((last_time - first_time).num_hours() + 1)?;
         let mut frames = vec![vec![f32::NAN; grid_len]; count];
         let mut variable_found = false;
         for (valid_time, file) in selected {
-            let index = usize::try_from((valid_time - first_time).num_hours() / 3)?;
+            let index = usize::try_from((valid_time - first_time).num_hours())?;
             if let Some(values) = file.decode(decoder, regionpack.bounds(), raw_variable, &plan)? {
                 variable_found = true;
                 frames[index] = values;
@@ -7837,6 +7876,7 @@ fn build_ecmwf_ifs9km_regular_series(
                 &mut values,
                 kind,
                 first_time,
+                3600,
                 latitudes[point / width] as f32,
                 longitudes[point % width] as f32,
                 is_gust,
@@ -7857,6 +7897,7 @@ fn build_ecmwf_ifs9km_regular_series(
     }
     Ok(Some(EcmwfRegularSeries {
         runs,
+        dt_seconds: 3600,
         public_start_utc: Some(regionpack.public_start_utc()),
         latest_source_run: Some(regionpack.latest_complete_run().to_string()),
     }))
@@ -11579,6 +11620,7 @@ mod tests {
                     frames: vec![vec![0.03]],
                 },
             ],
+            dt_seconds: 3600,
             public_start_utc: Some(time),
             // The 18Z release is the published generation, but its upstream
             // inventory does not contain snow_depth at all.
@@ -12327,6 +12369,26 @@ mod tests {
     }
 
     #[test]
+    fn ec9_first_stage_preserves_native_hourly_temperature_frames() {
+        let start = Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap();
+        let mut values = vec![28.5, 28.8, 28.0, 28.4, 28.5, 28.6, 29.0];
+        let expected = values.clone();
+
+        ecmwf_first_stage_point(
+            &mut values,
+            ecmwf_interpolation_kind("temperature_2m"),
+            start,
+            3600,
+            20.0,
+            134.0,
+            false,
+            false,
+        );
+
+        assert_eq!(values, expected);
+    }
+
+    #[test]
     fn ecmwf_gust_terminal_tail_uses_c_as_missing_d_only_at_true_horizon() {
         let start = Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0).unwrap();
         let kind = InterpolationKind::Hermite {
@@ -12334,7 +12396,7 @@ mod tests {
             bounds: Some((0.0, 10e9)),
         };
         let mut values = vec![3.1, f32::NAN, 3.5, f32::NAN, 2.1];
-        ecmwf_first_stage_point(&mut values, kind, start, 0.0, 70.0, true, true);
+        ecmwf_first_stage_point(&mut values, kind, start, 3 * 3600, 0.0, 70.0, true, true);
 
         assert!(values[1].is_nan());
         assert_eq!(values[3], 2.8);
@@ -12368,7 +12430,7 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 7, 31, 0, 0, 0).unwrap();
         let public_start = start + Duration::hours(16);
         assert_eq!(
-            ecmwf_latest_support_start(start, public_start),
+            ecmwf_latest_support_start(start, public_start, 3 * 3600),
             start + Duration::hours(12)
         );
         assert!(!ecmwf_run_is_eligible(
@@ -12376,14 +12438,16 @@ mod tests {
             start,
             Some("2026073100"),
             Some(public_start),
-            start + Duration::hours(11)
+            start + Duration::hours(11),
+            3 * 3600,
         ));
         assert!(ecmwf_run_is_eligible(
             "2026073100",
             start,
             Some("2026073100"),
             Some(public_start),
-            start + Duration::hours(12)
+            start + Duration::hours(12),
+            3 * 3600,
         ));
 
         let probability_times = [9, 12, 15, 18]
@@ -12530,6 +12594,7 @@ mod tests {
                     frames: vec![vec![f32::NAN]],
                 },
             ],
+            dt_seconds: 3 * 3600,
             public_start_utc: None,
             latest_source_run: Some("2026080206".to_string()),
         });
@@ -12539,6 +12604,7 @@ mod tests {
                 start,
                 frames: vec![vec![20.0]],
             }],
+            dt_seconds: 3 * 3600,
             public_start_utc: None,
             latest_source_run: Some("2026080200".to_string()),
         });
@@ -12571,6 +12637,7 @@ mod tests {
                     start,
                     frames: vec![vec![value]],
                 }],
+                dt_seconds: 3 * 3600,
                 public_start_utc: None,
                 latest_source_run: Some(source_run.to_string()),
             })
@@ -14305,7 +14372,16 @@ mod output_tests {
         };
         let raw = vec![0.93, 0.22, 2.17, f32::NAN, -1.64, f32::NAN, -1.01];
         let mut staged = raw.clone();
-        ecmwf_first_stage_point(&mut staged, kind, start, 31.25, 121.5, false, false);
+        ecmwf_first_stage_point(
+            &mut staged,
+            kind,
+            start,
+            3 * 3600,
+            31.25,
+            121.5,
+            false,
+            false,
+        );
         assert_eq!(staged, vec![0.95, 0.2, 2.15, 0.3, -1.65, -1.55, -1.0]);
 
         let regular_times = (0..staged.len())
@@ -14468,6 +14544,7 @@ mod output_tests {
                     frames: vec![vec![30.0]],
                 },
             ],
+            dt_seconds: 3 * 3600,
             public_start_utc: None,
             latest_source_run: Some("2026080306".to_string()),
         });
@@ -14556,6 +14633,7 @@ mod output_tests {
                         start: Utc.with_ymd_and_hms(2026, 7, 23, 0, 0, 0).unwrap(),
                         frames: vec![vec![20.0]],
                     }],
+                    dt_seconds: 3 * 3600,
                     public_start_utc: None,
                     latest_source_run: Some("2026072300".to_string()),
                 }))

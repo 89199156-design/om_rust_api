@@ -395,7 +395,12 @@ fn expected_forecast_hours(runtime_domain: &str, max_forecast_hour: i64) -> Vec<
                 .chain((240..=max_forecast_hour).step_by(6))
                 .collect()
         }
-    } else if runtime_domain.starts_with("ecmwf_ifs025") || runtime_domain == "ecmwf_ifs9km" {
+    } else if runtime_domain == "ecmwf_ifs9km" {
+        (0..=max_forecast_hour.min(90))
+            .chain((93..=max_forecast_hour.min(144)).step_by(3))
+            .chain((150..=max_forecast_hour).step_by(6))
+            .collect()
+    } else if runtime_domain.starts_with("ecmwf_ifs025") {
         let start = if runtime_domain.ends_with("_ensemble") {
             3
         } else {
@@ -1786,6 +1791,13 @@ mod tests {
         assert_eq!(
             expected_forecast_hours("ecmwf_ifs025_ensemble", 144),
             (3..=144).step_by(3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expected_forecast_hours("ecmwf_ifs9km", 360),
+            (0..=90)
+                .chain((93..=144).step_by(3))
+                .chain((150..=360).step_by(6))
+                .collect::<Vec<_>>()
         );
         for latest in ["2026080200", "2026080206", "2026080212", "2026080218"] {
             assert_eq!(

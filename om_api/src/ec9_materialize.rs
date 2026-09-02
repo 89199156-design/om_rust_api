@@ -142,7 +142,12 @@ fn selected_frames(
         .iter()
         .filter(|(valid_time, _)| {
             let forecast_hours = (**valid_time - run.reference_time).num_hours();
-            forecast_hours >= 0 && forecast_hours % 3 == 0
+            // Preserve the source schedule exactly.  Current IFS operational
+            // runs are hourly through f090, three-hourly through f144 and
+            // (for 00Z/12Z) six-hourly afterwards.  Discarding the native
+            // hourly frames and reconstructing them from a three-hour lattice
+            // changes even direct fields such as temperature_2m.
+            forecast_hours >= 0
         })
         .map(|(valid_time, file)| (*valid_time, file))
         .collect()
@@ -464,7 +469,7 @@ pub fn build_and_publish_ec9_coverage(
             "created_at": Utc::now().to_rfc3339(),
             "crs_wkt": "GEOGCRS[\"WGS 84\"]",
             "reference_time": run.reference_time,
-            "temporal_resolution_seconds": 10800,
+            "temporal_resolution_seconds": 3600,
             "valid_times": valid_times,
             "variables": written,
         });
@@ -502,8 +507,8 @@ pub fn build_and_publish_ec9_coverage(
             "source_order": "newest_to_oldest",
             "structural_fallback": "first_covering_run",
             "nan_fallback": "continue_to_all_older_retained_runs",
-            "source_cadence": "3h_to_f144_then_6h",
-            "public_cadence": "hourly_interpolated"
+            "source_cadence": "hourly_to_f090_then_3h_to_f144_then_6h",
+            "public_cadence": "hourly_with_sparse_tail_interpolated"
         },
         "products": {
             PRODUCT: {
