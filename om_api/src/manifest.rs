@@ -75,8 +75,10 @@ pub struct BundleEntry {
     pub native_grid: Option<NativeGridMetadata>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NativeGridMetadata {
+    #[serde(default)]
+    pub grid_type: Option<String>,
     pub nx: u64,
     pub ny: u64,
     pub lon_min: f64,
@@ -93,6 +95,14 @@ pub struct NativeGridMetadata {
     pub x0: Option<u64>,
     #[serde(default)]
     pub y0: Option<u64>,
+    #[serde(default)]
+    pub o1280_row_start: Option<u64>,
+    #[serde(default)]
+    pub o1280_row_offsets: Option<Vec<u64>>,
+    #[serde(default)]
+    pub o1280_first_columns: Option<Vec<u64>>,
+    #[serde(default)]
+    pub o1280_column_counts: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

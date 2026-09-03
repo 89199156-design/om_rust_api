@@ -2005,30 +2005,9 @@ fn ecmwf_ifs9km_nearest_coordinate(
     latitude: f64,
     longitude: f64,
 ) -> Result<(f64, f64)> {
-    if let Some(product) = snapshot.product("ecmwf_ifs9km") {
-        let entry = product
-            .entries
-            .values()
-            .find(|entry| entry.variable == "temperature_2m")
-            .or_else(|| product.entries.values().next())
-            .context("EC9 native product has no grid entry")?;
-        let (y, x) = grid_index_for_lat_lon(
-            &entry.array,
-            entry.native_grid.as_ref(),
-            latitude,
-            longitude,
-        )?;
-        return Ok((
-            f64::from(grid_latitude_for_index(
-                &entry.array,
-                entry.native_grid.as_ref(),
-                y,
-            )?),
-            f64::from(grid_longitude_for_index(
-                &entry.array,
-                entry.native_grid.as_ref(),
-                x,
-            )?),
+    if snapshot.product("ecmwf_ifs9km").is_some() {
+        return Ok(crate::regionpack::o1280_nearest_coordinate(
+            latitude, longitude,
         ));
     }
     snapshot
@@ -5741,6 +5720,11 @@ fn read_direct_with_rounding(
             &[longitude],
         )?;
         let mut value = frames.remove(0).remove(0);
+        if variable == "pressure_msl" {
+            // The ECPDS IFS database intentionally stores MSL pressure in Pa;
+            // the forecast API exposes hPa.
+            value *= 0.01;
+        }
         if !round_values {
             // The retained source chunks already carry their native scale. The
             // two-stage ECMWF path quantises derived hourly values by design;
@@ -6188,6 +6172,13 @@ fn read_direct_grid_series_uncached(
         let mut values = read_ecmwf_ifs9km_window_grid_series(
             snapshot, decoder, variable, times, latitudes, longitudes,
         )?;
+        if variable == "pressure_msl" {
+            for frame in &mut values {
+                for value in frame {
+                    *value *= 0.01;
+                }
+            }
+        }
         if round_values {
             for frame in &mut values {
                 for value in frame {
@@ -7088,7 +7079,7 @@ fn ecmwf_regularize_source_run(
         entry_index = contiguous_end;
     }
 
-    let kind = ecmwf_interpolation_kind(raw_variable);
+    let kind = ecmwf_interpolation_kind_for_product(&product.product, raw_variable);
     let is_gust = raw_variable == "wind_gusts_10m";
     let allow_missing_terminal_hermite_d = is_gust
         && product
@@ -7633,7 +7624,7 @@ fn read_ecmwf_regular_series_grid(
     let regular_times = (0..=((regular_end - regular_start).num_seconds() / regular_dt_seconds))
         .map(|index| regular_start + Duration::seconds(index * regular_dt_seconds))
         .collect::<Vec<_>>();
-    let kind = ecmwf_interpolation_kind(raw_variable);
+    let kind = ecmwf_interpolation_kind_for_product(product_name, raw_variable);
     let output_dt_seconds = series_dt_seconds(times);
     let grid_len = latitudes.len() * longitudes.len();
     let width = longitudes.len();
@@ -7868,7 +7859,7 @@ fn build_ecmwf_ifs9km_regular_series(
         if !variable_found {
             continue;
         }
-        let kind = ecmwf_interpolation_kind(raw_variable);
+        let kind = ecmwf_ifs9km_interpolation_kind(raw_variable);
         let is_gust = raw_variable == "wind_gusts_10m";
         for point in 0..grid_len {
             let mut values = frames.iter().map(|frame| frame[point]).collect::<Vec<_>>();
@@ -7952,6 +7943,80 @@ fn read_native_entry_grid_time_range(
     time_index: u64,
     time_count: usize,
 ) -> Result<Vec<Vec<f32>>> {
+    if latitudes.is_empty() || longitudes.is_empty() {
+        bail!("native OM grid request has no coordinates");
+    }
+    if entry
+        .native_grid
+        .as_ref()
+        .and_then(|grid| grid.grid_type.as_deref())
+        == Some("o1280_reduced_gaussian_crop")
+    {
+        let mut point_indices = Vec::with_capacity(latitudes.len() * longitudes.len());
+        for latitude in latitudes {
+            for longitude in longitudes {
+                let (y, x) = grid_index_for_lat_lon(
+                    &entry.array,
+                    entry.native_grid.as_ref(),
+                    *latitude,
+                    *longitude,
+                )?;
+                ensure_in_selection(entry, y, x)?;
+                point_indices.push(x);
+            }
+        }
+        let x0 = *point_indices
+            .iter()
+            .min()
+            .context("packed EC9 grid has no locations")?;
+        let x1 = *point_indices
+            .iter()
+            .max()
+            .context("packed EC9 grid has no locations")?;
+        let time_count_u64 = u64::try_from(time_count)?;
+        if entry.array.chunks.len() != 3
+            || entry.selection_ranges.len() != 2
+            || time_index + time_count_u64 > entry.array.dimensions[2]
+        {
+            bail!("packed EC9 OM time-slab dimensions do not match entry type");
+        }
+        let width = x1 - x0 + 1;
+        let metadata = build_v3_array_metadata_blob(
+            entry.variable_path.as_deref().unwrap_or(&entry.variable),
+            entry.array.data_type,
+            entry.array.compression,
+            &entry.array.dimensions,
+            &entry.array.chunks,
+            entry
+                .array
+                .lut_size
+                .context("array metadata missing lut_size")?,
+            entry
+                .array
+                .lut_offset
+                .context("array metadata missing lut_offset")?,
+            entry.array.scale_factor.unwrap_or(1.0),
+            entry.array.add_offset.unwrap_or(0.0),
+        );
+        let reader = entry_range_reader(product, entry)?;
+        let slab = decoder.decode_grid(
+            &metadata,
+            &reader,
+            &[0, x0, time_index],
+            &[1, width, time_count_u64],
+        )?;
+        if slab.len() != usize::try_from(width * time_count_u64)? {
+            bail!("decoded packed EC9 OM time slab has the wrong element count");
+        }
+        let mut output = vec![Vec::with_capacity(point_indices.len()); time_count];
+        for x in point_indices {
+            let point_start = usize::try_from((x - x0) * time_count_u64)?;
+            for time_offset in 0..time_count {
+                output[time_offset].push(slab[point_start + time_offset]);
+            }
+        }
+        return Ok(output);
+    }
     let y_indices = latitudes
         .iter()
         .map(|latitude| {
@@ -9948,6 +10013,9 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
     if is_cams_variable(variable) {
         return cams_interpolation_kind(variable);
     }
+    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+        return ecmwf_ifs9km_interpolation_kind(variable);
+    }
     if current_weather_model().is_ecmwf() {
         return ecmwf_interpolation_kind(variable);
     }
@@ -10050,6 +10118,128 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
     }
 }
 
+fn ecmwf_interpolation_kind_for_product(product: &str, variable: &str) -> InterpolationKind {
+    if product == "ecmwf_ifs9km" {
+        ecmwf_ifs9km_interpolation_kind(variable)
+    } else {
+        ecmwf_interpolation_kind(variable)
+    }
+}
+
+/// Port of `EcmwfEcdpsIfsVariable.scalefactor` and `.interpolation` from the
+/// pinned Open-Meteo source.  IFS 9 km is delivered by ECPDS and has a
+/// different storage contract from the 0.25-degree ECMWF products.
+pub(crate) fn ecmwf_ifs9km_interpolation_kind(variable: &str) -> InterpolationKind {
+    match variable {
+        "temperature_2m"
+        | "surface_temperature"
+        | "soil_temperature_0_to_7cm"
+        | "soil_temperature_7_to_28cm"
+        | "soil_temperature_28_to_100cm"
+        | "soil_temperature_100_to_255cm"
+        | "dew_point_2m" => InterpolationKind::Hermite {
+            scalefactor: 20.0,
+            bounds: None,
+        },
+        "temperature_2m_min" | "temperature_2m_max" => {
+            InterpolationKind::Backwards { scalefactor: 20.0 }
+        }
+        "wind_u_component_10m"
+        | "wind_v_component_10m"
+        | "wind_u_component_100m"
+        | "wind_v_component_100m"
+        | "wind_u_component_200m"
+        | "wind_v_component_200m"
+        | "ocean_u_current"
+        | "ocean_v_current" => InterpolationKind::Hermite {
+            scalefactor: 20.0,
+            bounds: None,
+        },
+        "wind_gusts_10m" => InterpolationKind::Hermite {
+            scalefactor: 10.0,
+            bounds: Some((0.0, 10e9)),
+        },
+        "cloud_cover" | "cloud_cover_low" | "cloud_cover_mid" | "cloud_cover_high" => {
+            InterpolationKind::Hermite {
+                scalefactor: 1.0,
+                bounds: Some((0.0, 100.0)),
+            }
+        }
+        "pressure_msl" => InterpolationKind::Hermite {
+            // ECPDS keeps pressure in pascal for historical compatibility.
+            scalefactor: 0.1,
+            bounds: None,
+        },
+        "snowfall_water_equivalent" | "precipitation" | "runoff" | "showers" => {
+            InterpolationKind::BackwardsSum { scalefactor: 10.0 }
+        }
+        "shortwave_radiation" | "shortwave_radiation_clear_sky" | "direct_radiation" => {
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 }
+        }
+        "snow_depth" => InterpolationKind::Linear { scalefactor: 100.0 },
+        "visibility" => InterpolationKind::Linear { scalefactor: 0.05 },
+        "roughness_length" | "albedo" => InterpolationKind::Linear { scalefactor: 1.0 },
+        "k_index" => InterpolationKind::Linear { scalefactor: 100.0 },
+        "soil_moisture_0_to_7cm"
+        | "soil_moisture_7_to_28cm"
+        | "soil_moisture_28_to_100cm"
+        | "soil_moisture_100_to_255cm" => InterpolationKind::Hermite {
+            scalefactor: 1000.0,
+            bounds: None,
+        },
+        "boundary_layer_height" => InterpolationKind::Hermite {
+            scalefactor: 0.2,
+            bounds: Some((0.0, 10e9)),
+        },
+        "total_column_integrated_water_vapour" | "snow_density" => InterpolationKind::Hermite {
+            scalefactor: 10.0,
+            bounds: None,
+        },
+        "sea_surface_temperature" => InterpolationKind::Hermite {
+            scalefactor: 20.0,
+            bounds: None,
+        },
+        "sea_water_salinity" => InterpolationKind::Hermite {
+            scalefactor: 50.0,
+            bounds: Some((0.0, 10e9)),
+        },
+        "cape" => InterpolationKind::Hermite {
+            scalefactor: 0.1,
+            bounds: Some((0.0, 10e9)),
+        },
+        "potential_evapotranspiration" => InterpolationKind::BackwardsSum { scalefactor: 10.0 },
+        "convective_inhibition" => InterpolationKind::Hermite {
+            scalefactor: 1.0,
+            bounds: Some((0.0, 10e9)),
+        },
+        "precipitation_type" => InterpolationKind::Backwards { scalefactor: 1.0 },
+        "sea_ice_thickness" => InterpolationKind::Hermite {
+            scalefactor: 100.0,
+            bounds: Some((0.0, 10e9)),
+        },
+        "sea_level_height_msl" => InterpolationKind::Hermite {
+            scalefactor: 100.0,
+            bounds: None,
+        },
+        "lightning_density" => InterpolationKind::Hermite {
+            scalefactor: 10.0,
+            bounds: Some((0.0, 10e9)),
+        },
+        _ => InterpolationKind::Direct,
+    }
+}
+
+pub(crate) fn ecmwf_ifs9km_storage_scale_factor(variable: &str) -> f32 {
+    match ecmwf_ifs9km_interpolation_kind(variable) {
+        InterpolationKind::Direct => 1.0,
+        InterpolationKind::SolarBackwardsAveraged { scalefactor }
+        | InterpolationKind::Linear { scalefactor }
+        | InterpolationKind::Backwards { scalefactor }
+        | InterpolationKind::BackwardsSum { scalefactor }
+        | InterpolationKind::Hermite { scalefactor, .. } => scalefactor,
+    }
+}
+
 /// Port of `EcmwfVariable.interpolation` and `scalefactor` from the pinned
 /// Open-Meteo ECMWF source baseline. Unlike GFS, every non-accumulated ECMWF
 /// field defaults to Hermite interpolation.
@@ -10139,17 +10329,6 @@ pub(crate) fn ecmwf_interpolation_kind(variable: &str) -> InterpolationKind {
             scalefactor,
             bounds: None,
         },
-    }
-}
-
-pub(crate) fn ecmwf_storage_scale_factor(variable: &str) -> f32 {
-    match ecmwf_interpolation_kind(variable) {
-        InterpolationKind::Direct => 1.0,
-        InterpolationKind::SolarBackwardsAveraged { scalefactor }
-        | InterpolationKind::Linear { scalefactor }
-        | InterpolationKind::Backwards { scalefactor }
-        | InterpolationKind::BackwardsSum { scalefactor }
-        | InterpolationKind::Hermite { scalefactor, .. } => scalefactor,
     }
 }
 
@@ -10743,6 +10922,49 @@ fn grid_index_for_lat_lon(
             || array.dimensions[1] != grid.nx
         {
             bail!("native OM array dimensions do not match grid contract");
+        }
+        if grid.grid_type.as_deref() == Some("o1280_reduced_gaussian_crop") {
+            let row_start = grid
+                .o1280_row_start
+                .context("packed EC9 grid has no source row origin")?;
+            let row_offsets = grid
+                .o1280_row_offsets
+                .as_deref()
+                .context("packed EC9 grid has no row offsets")?;
+            let first_columns = grid
+                .o1280_first_columns
+                .as_deref()
+                .context("packed EC9 grid has no first-column topology")?;
+            let column_counts = grid
+                .o1280_column_counts
+                .as_deref()
+                .context("packed EC9 grid has no row widths")?;
+            if grid.ny != 1
+                || first_columns.len() != column_counts.len()
+                || row_offsets.len() != column_counts.len() + 1
+                || row_offsets.first() != Some(&0)
+                || row_offsets.last() != Some(&grid.nx)
+                || row_offsets
+                    .windows(2)
+                    .zip(column_counts)
+                    .any(|(offsets, count)| offsets[1] - offsets[0] != *count)
+            {
+                bail!("packed EC9 grid topology is inconsistent");
+            }
+            let (source_row, source_column) =
+                crate::regionpack::o1280_nearest_index(latitude, longitude);
+            let relative_row = source_row
+                .checked_sub(row_start)
+                .and_then(|row| usize::try_from(row).ok())
+                .filter(|row| *row < column_counts.len())
+                .context("point is outside packed EC9 latitude rows")?;
+            let first = first_columns[relative_row];
+            let count = column_counts[relative_row];
+            let column_offset = source_column
+                .checked_sub(first)
+                .filter(|offset| *offset < count)
+                .context("point is outside packed EC9 longitude columns")?;
+            return Ok((0, row_offsets[relative_row] + column_offset));
         }
         // A regional OM bundle keeps only a rectangular subset, but its cell
         // selection must remain bit-for-bit identical to the original global
@@ -11752,6 +11974,21 @@ mod tests {
     }
 
     #[test]
+    fn ec9_uses_the_ecpds_variable_contract() {
+        assert_eq!(ecmwf_ifs9km_storage_scale_factor("dew_point_2m"), 20.0);
+        assert_eq!(ecmwf_ifs9km_storage_scale_factor("pressure_msl"), 0.1);
+        assert_eq!(ecmwf_ifs9km_storage_scale_factor("visibility"), 0.05);
+        assert!(matches!(
+            ecmwf_ifs9km_interpolation_kind("direct_radiation"),
+            InterpolationKind::SolarBackwardsAveraged { scalefactor: 1.0 }
+        ));
+        assert!(matches!(
+            ecmwf_ifs9km_interpolation_kind("precipitation_type"),
+            InterpolationKind::Backwards { scalefactor: 1.0 }
+        ));
+    }
+
+    #[test]
     fn combined_soil_layer_preserves_official_float_weight_order() {
         let value = weighted_soil_layer_0_to_100cm(0.354, 0.356, 0.343);
         assert_eq!(
@@ -12014,6 +12251,7 @@ mod tests {
             full_ny: Some(451),
             x0: Some(623),
             y0: Some(223),
+            ..crate::manifest::NativeGridMetadata::default()
         };
 
         assert_eq!(
@@ -12027,6 +12265,36 @@ mod tests {
             grid_index_for_lat_lon(&array, Some(&grid), 16.8, 75.0).unwrap(),
             (44, 15)
         );
+    }
+
+    #[test]
+    fn packed_ec9_grid_maps_the_official_o1280_cell_to_its_compact_location() {
+        let array = ArrayMetadata {
+            data_type: 20,
+            compression: 0,
+            dimensions: vec![1, 3, 2],
+            chunks: vec![1, 3, 2],
+            lut_offset: None,
+            lut_size: None,
+            scale_factor: Some(1.0),
+            add_offset: Some(0.0),
+        };
+        let grid = crate::manifest::NativeGridMetadata {
+            grid_type: Some("o1280_reduced_gaussian_crop".to_string()),
+            nx: 3,
+            ny: 1,
+            o1280_row_start: Some(995),
+            o1280_row_offsets: Some(vec![0, 3]),
+            o1280_first_columns: Some(vec![1488]),
+            o1280_column_counts: Some(vec![3]),
+            ..crate::manifest::NativeGridMetadata::default()
+        };
+
+        assert_eq!(
+            grid_index_for_lat_lon(&array, Some(&grid), 20.0, 134.0).unwrap(),
+            (0, 1)
+        );
+        assert!(grid_index_for_lat_lon(&array, Some(&grid), 21.0, 134.0).is_err());
     }
 
     #[test]
@@ -12091,6 +12359,7 @@ mod tests {
             full_ny: Some(1536),
             x0: Some(2125),
             y0: Some(759),
+            ..crate::manifest::NativeGridMetadata::default()
         };
         let global_array = ArrayMetadata {
             data_type: 20,

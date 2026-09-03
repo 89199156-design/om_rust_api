@@ -169,6 +169,20 @@ pub(crate) struct RegionPackSamplingPlan {
     offsets_by_chunk: BTreeMap<u64, Vec<usize>>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct O1280RegionTopology {
+    pub(crate) row_start: u64,
+    pub(crate) row_offsets: Vec<u64>,
+    pub(crate) first_columns: Vec<u64>,
+    pub(crate) column_counts: Vec<u64>,
+}
+
+impl O1280RegionTopology {
+    pub(crate) fn location_count(&self) -> u64 {
+        *self.row_offsets.last().unwrap_or(&0)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     source_chunk_index: u64,
@@ -383,7 +397,6 @@ impl RegionPackSnapshot {
         if latitudes.is_empty() || longitudes.is_empty() {
             bail!("EC9 sampling coordinates must not be empty");
         }
-        let source_latitudes = o1280_latitudes();
         let row_starts = o1280_row_starts();
         let mut samples = Vec::with_capacity(latitudes.len() * longitudes.len());
         let mut offsets_by_chunk = BTreeMap::<u64, BTreeSet<usize>>::new();
@@ -392,9 +405,6 @@ impl RegionPackSnapshot {
             {
                 bail!("EC9 latitude is outside the downloaded region: {latitude}");
             }
-            let row = nearest_descending(source_latitudes, latitude);
-            let points = row_point_count(row);
-            let step = 360.0 / points as f64;
             for &longitude in longitudes {
                 let normalized = longitude.rem_euclid(360.0);
                 if !longitude.is_finite()
@@ -403,7 +413,14 @@ impl RegionPackSnapshot {
                 {
                     bail!("EC9 longitude is outside the downloaded region: {longitude}");
                 }
-                let column = ((normalized / step).round() as u64) % points;
+                // Mirror Open-Meteo's GaussianGrid.findPointXY exactly.  The
+                // public API deliberately uses an f32, equally-spaced
+                // latitude approximation and compares the two staggered
+                // neighbouring rows.  Selecting only the nearest true
+                // Gaussian latitude can choose another source cell near a
+                // triangular row boundary.
+                let (row, column, sample_latitude, sample_longitude) =
+                    official_o1280_point(latitude, normalized);
                 let global_index = row_starts[row] + column;
                 let source_chunk_index = global_index / SOURCE_CHUNK_POINTS;
                 let offset = usize::try_from(global_index % SOURCE_CHUNK_POINTS)?;
@@ -414,8 +431,8 @@ impl RegionPackSnapshot {
                 samples.push(Sample {
                     source_chunk_index,
                     offset,
-                    latitude: source_latitudes[row],
-                    longitude: column as f64 * step,
+                    latitude: sample_latitude,
+                    longitude: sample_longitude,
                 });
             }
         }
@@ -426,6 +443,90 @@ impl RegionPackSnapshot {
                 .map(|(chunk, offsets)| (chunk, offsets.into_iter().collect()))
                 .collect(),
         })
+    }
+
+    /// Build a compact, lossless regional view of every retained O1280 source
+    /// point.  Rows remain in native north-to-south order and each row keeps
+    /// its contiguous west-to-east source columns.
+    pub(crate) fn native_region_plan(
+        &self,
+    ) -> Result<(RegionPackSamplingPlan, O1280RegionTopology)> {
+        let row_starts = o1280_row_starts();
+        let source_latitudes = o1280_latitudes();
+        let mut samples = Vec::new();
+        let mut offsets_by_chunk = BTreeMap::<u64, BTreeSet<usize>>::new();
+        let mut selected_rows = Vec::new();
+        let mut row_offsets = vec![0_u64];
+        let mut first_columns = Vec::new();
+        let mut column_counts = Vec::new();
+
+        for (row, latitude) in source_latitudes.iter().copied().enumerate() {
+            if latitude < self.bounds.south - 1.0e-10 || latitude > self.bounds.north + 1.0e-10 {
+                continue;
+            }
+            let points = row_point_count(row);
+            let step = 360.0 / points as f64;
+            let first = (self.bounds.west / step - 1.0e-10).ceil().max(0.0) as u64;
+            let last = (self.bounds.east / step + 1.0e-10)
+                .floor()
+                .min(points as f64 - 1.0) as u64;
+            if first > last {
+                continue;
+            }
+            selected_rows.push(row);
+            first_columns.push(first);
+            let count = last - first + 1;
+            column_counts.push(count);
+            row_offsets.push(row_offsets.last().copied().unwrap_or(0) + count);
+
+            let official_dy = 180.0_f32 / 2_560.5_f32;
+            let sample_latitude =
+                (1_280.0_f32 - row as f32 - 1.0_f32) * official_dy + official_dy / 2.0;
+            for column in first..=last {
+                let global_index = row_starts[row] + column;
+                let source_chunk_index = global_index / SOURCE_CHUNK_POINTS;
+                let offset = usize::try_from(global_index % SOURCE_CHUNK_POINTS)?;
+                offsets_by_chunk
+                    .entry(source_chunk_index)
+                    .or_default()
+                    .insert(offset);
+                samples.push(Sample {
+                    source_chunk_index,
+                    offset,
+                    latitude: sample_latitude as f64,
+                    longitude: (column as f32 * (360.0_f32 / points as f32)) as f64,
+                });
+            }
+        }
+        let row_start = *selected_rows
+            .first()
+            .context("EC9 regional topology contains no source rows")?;
+        if selected_rows
+            .iter()
+            .enumerate()
+            .any(|(offset, row)| *row != row_start + offset)
+        {
+            bail!("EC9 regional topology source rows are not contiguous");
+        }
+        let topology = O1280RegionTopology {
+            row_start: u64::try_from(row_start)?,
+            row_offsets,
+            first_columns,
+            column_counts,
+        };
+        if topology.location_count() != u64::try_from(samples.len())? {
+            bail!("EC9 regional topology point count is inconsistent");
+        }
+        Ok((
+            RegionPackSamplingPlan {
+                samples,
+                offsets_by_chunk: offsets_by_chunk
+                    .into_iter()
+                    .map(|(chunk, offsets)| (chunk, offsets.into_iter().collect()))
+                    .collect(),
+            },
+            topology,
+        ))
     }
 
     pub(crate) fn nearest_coordinate(&self, latitude: f64, longitude: f64) -> Result<(f64, f64)> {
@@ -651,6 +752,18 @@ impl RegionPackFile {
         }
         Ok(Some(output))
     }
+
+    pub(crate) fn variable_scale_factor(
+        &self,
+        expected_bounds: RegionBounds,
+        variable: &str,
+    ) -> Result<Option<f32>> {
+        Ok(self
+            .header(expected_bounds)?
+            .variables
+            .get(variable)
+            .map(|metadata| metadata.scale_factor))
+    }
 }
 
 fn normalize_source_spatial_shape(
@@ -770,6 +883,58 @@ fn row_point_count(row: usize) -> u64 {
     20 + 4 * pole_distance
 }
 
+/// Port of `GaussianGrid.findPointXY` and `getCoordinates` from the pinned
+/// Open-Meteo source.  Keep every intermediate in f32: its rounding is part
+/// of the externally visible nearest-cell and coordinate contract.
+fn official_o1280_point(latitude: f64, longitude: f64) -> (usize, u64, f64, f64) {
+    let latitude = latitude as f32;
+    let longitude = longitude as f32;
+    let latitude_lines = (O1280_LATITUDE_COUNT / 2) as f32;
+    let dy = 180.0_f32 / (2.0_f32 * latitude_lines + 0.5_f32);
+    let y = (latitude_lines - 1.0_f32 - ((latitude - dy / 2.0_f32) / dy)) as i32;
+    let y = y.clamp(0, O1280_LATITUDE_COUNT as i32 - 2) as usize;
+    let upper = y + 1;
+
+    let points = row_point_count(y);
+    let upper_points = row_point_count(upper);
+    let dx = 360.0_f32 / points as f32;
+    let upper_dx = 360.0_f32 / upper_points as f32;
+    let x_unwrapped = (longitude / dx).round() as i64;
+    let upper_x_unwrapped = (longitude / upper_dx).round() as i64;
+
+    let point_latitude = (latitude_lines - y as f32 - 1.0_f32) * dy + dy / 2.0_f32;
+    let point_longitude = x_unwrapped as f32 * dx;
+    let upper_latitude = (latitude_lines - upper as f32 - 1.0_f32) * dy + dy / 2.0_f32;
+    let upper_longitude = upper_x_unwrapped as f32 * upper_dx;
+    let distance = (point_latitude - latitude).powi(2) + (point_longitude - longitude).powi(2);
+    let upper_distance =
+        (upper_latitude - latitude).powi(2) + (upper_longitude - longitude).powi(2);
+
+    let (row, unwrapped, sample_latitude, sample_longitude) = if distance < upper_distance {
+        (y, x_unwrapped, point_latitude, point_longitude)
+    } else {
+        (upper, upper_x_unwrapped, upper_latitude, upper_longitude)
+    };
+    let count = row_point_count(row) as i64;
+    let column = unwrapped.rem_euclid(count) as u64;
+    let longitude = if sample_longitude >= 180.0_f32 {
+        sample_longitude - 360.0_f32
+    } else {
+        sample_longitude
+    };
+    (row, column, sample_latitude as f64, longitude as f64)
+}
+
+pub(crate) fn o1280_nearest_coordinate(latitude: f64, longitude: f64) -> (f64, f64) {
+    let (_, _, latitude, longitude) = official_o1280_point(latitude, longitude.rem_euclid(360.0));
+    (latitude, longitude)
+}
+
+pub(crate) fn o1280_nearest_index(latitude: f64, longitude: f64) -> (u64, u64) {
+    let (row, column, _, _) = official_o1280_point(latitude, longitude.rem_euclid(360.0));
+    (row as u64, column)
+}
+
 fn o1280_row_starts() -> &'static [u64] {
     static ROW_STARTS: OnceLock<Vec<u64>> = OnceLock::new();
     ROW_STARTS.get_or_init(|| {
@@ -784,6 +949,7 @@ fn o1280_row_starts() -> &'static [u64] {
     })
 }
 
+#[cfg(test)]
 fn nearest_descending(values: &[f64], target: f64) -> usize {
     let insertion = values.partition_point(|value| *value > target);
     if insertion == 0 {
@@ -815,6 +981,15 @@ mod tests {
         );
         let row = nearest_descending(o1280_latitudes(), 31.2304);
         assert!((o1280_latitudes()[row] - 31.2304).abs() < 0.1);
+    }
+
+    #[test]
+    fn o1280_public_nearest_cell_matches_open_meteo_f32_geometry() {
+        let (row, column, latitude, longitude) = official_o1280_point(20.0, 134.0);
+        assert_eq!(row, 995);
+        assert_eq!(column, 1489);
+        assert_eq!(latitude as f32, 19.999998_f32);
+        assert_eq!(longitude as f32, 134.01001_f32);
     }
 
     #[test]

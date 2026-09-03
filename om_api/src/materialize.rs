@@ -152,6 +152,7 @@ fn gfs013_contract() -> DomainContract {
             full_ny: Some(1536),
             x0: Some(2125),
             y0: Some(759),
+            ..NativeGridMetadata::default()
         },
     }
 }
@@ -172,6 +173,7 @@ fn gfs025_contract() -> DomainContract {
             full_ny: Some(721),
             x0: Some(996),
             y0: Some(356),
+            ..NativeGridMetadata::default()
         },
     }
 }

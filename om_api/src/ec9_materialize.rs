@@ -2,16 +2,18 @@
 //!
 //! RegionPack is a transport/archive format owned by the private downloader.
 //! The public API and WebP renderer must not keep that archive alive.  This
-//! module decodes the retained five-run stack onto the published 9 km regular
-//! grid, writes native time-series OM arrays, validates them, and atomically
-//! publishes the native marker.  Only after downstream validation may the
-//! downloader acknowledge and remove the source batch.
+//! module decodes the retained five-run stack onto a compact copy of the
+//! cropped native O1280 topology, writes time-series OM arrays, validates
+//! them, and atomically publishes the native marker. Only after downstream
+//! validation may the downloader acknowledge and remove the source batch.
 
 use crate::manifest::NativeGridMetadata;
 use crate::native::{load_native_group_products, read_native_array_metadata};
 use crate::official::{build_v3_array_metadata_blob, BundleRangeReader, OfficialDecoder};
-use crate::query::ecmwf_storage_scale_factor;
-use crate::regionpack::{RegionPackRun, RegionPackSamplingPlan, RegionPackSnapshot};
+use crate::query::ecmwf_ifs9km_storage_scale_factor;
+use crate::regionpack::{
+    O1280RegionTopology, RegionPackRun, RegionPackSamplingPlan, RegionPackSnapshot,
+};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use rayon::prelude::*;
@@ -26,12 +28,9 @@ use std::sync::Arc;
 const GROUP: &str = "ecmwf_ifs9km";
 const PRODUCT: &str = "ecmwf_ifs9km";
 const RUNTIME_FORMAT: &str = "openmeteo-native-v1";
-const MATERIALIZATION_REVISION: &str = "regionpack-to-native-v1";
+const MATERIALIZATION_REVISION: &str = "regionpack-to-native-v2-ecpds-semantics";
 const DATA_TYPE_FLOAT_ARRAY: u8 = 20;
 const COMPRESSION_PFOR_DELTA2D_INT16: u8 = 0;
-const NX: u64 = 897;
-const NY: u64 = 743;
-const STEP: f64 = 0.078125;
 
 #[derive(Debug, Clone)]
 pub struct Ec9BuildOptions {
@@ -67,39 +66,29 @@ impl BundleRangeReader for FullFileRangeReader {
     }
 }
 
-fn grid() -> NativeGridMetadata {
+fn grid(topology: &O1280RegionTopology) -> NativeGridMetadata {
     NativeGridMetadata {
-        nx: NX,
-        ny: NY,
+        grid_type: Some("o1280_reduced_gaussian_crop".to_string()),
+        nx: topology.location_count(),
+        ny: 1,
         lon_min: 70.0,
         lat_min: 0.0,
-        dx: STEP,
-        dy: STEP,
+        // Rendering remains on the established nominal 9 km regular grid;
+        // point storage itself is the compact native O1280 topology below.
+        dx: 0.078125,
+        dy: 0.078125,
         dt_seconds: 3600,
         om_file_length: 361,
-        full_nx: Some(4_608),
-        full_ny: Some(2_305),
-        x0: Some(3_200),
-        y0: Some(1_152),
+        o1280_row_start: Some(topology.row_start),
+        o1280_row_offsets: Some(topology.row_offsets.clone()),
+        o1280_first_columns: Some(topology.first_columns.clone()),
+        o1280_column_counts: Some(topology.column_counts.clone()),
+        ..NativeGridMetadata::default()
     }
 }
 
 fn grid_marker(grid: &NativeGridMetadata) -> Value {
-    json!({
-        "grid_type": "regional_regular_lat_lon",
-        "full_nx": grid.full_nx,
-        "full_ny": grid.full_ny,
-        "x0": grid.x0,
-        "y0": grid.y0,
-        "nx": grid.nx,
-        "ny": grid.ny,
-        "lon_min": grid.lon_min,
-        "lat_min": grid.lat_min,
-        "dx": grid.dx,
-        "dy": grid.dy,
-        "dt_seconds": grid.dt_seconds,
-        "om_file_length": grid.om_file_length,
-    })
+    serde_json::to_value(grid).expect("EC9 native grid metadata is serializable")
 }
 
 fn validate_revision(value: &str) -> Result<()> {
@@ -153,14 +142,6 @@ fn selected_frames(
         .collect()
 }
 
-fn build_coordinates() -> (Vec<f64>, Vec<f64>) {
-    let latitudes = (0..NY).map(|index| index as f64 * STEP).collect::<Vec<_>>();
-    let longitudes = (0..NX)
-        .map(|index| 70.0 + index as f64 * STEP)
-        .collect::<Vec<_>>();
-    (latitudes, longitudes)
-}
-
 fn ensure_free_space(path: &Path, minimum: u64) -> Result<()> {
     if minimum == 0 {
         bail!("EC9 native minimum free-space reserve must be positive");
@@ -203,6 +184,7 @@ fn write_variable(
     frames: &[(DateTime<Utc>, &Arc<crate::regionpack::RegionPackFile>)],
     snapshot: &RegionPackSnapshot,
     plan: &RegionPackSamplingPlan,
+    grid: &NativeGridMetadata,
     variable: &str,
     destination: &Path,
     data_root: &Path,
@@ -211,16 +193,29 @@ fn write_variable(
 ) -> Result<bool> {
     ensure_free_space(data_root, minimum_free_bytes)?;
     let n_time = u64::try_from(frames.len())?;
-    let location_count = usize::try_from(NX * NY)?;
+    let location_count = usize::try_from(grid.nx * grid.ny)?;
     let n_time_usize = usize::try_from(n_time)?;
     let mut dense = vec![f32::NAN; location_count * n_time_usize];
     let mut found = false;
+    let expected_scale_factor = ecmwf_ifs9km_storage_scale_factor(variable);
+    let mut source_scale_factor = None;
     for (time_index, (_, file)) in frames.iter().enumerate() {
+        if let Some(scale_factor) = file.variable_scale_factor(snapshot.bounds(), variable)? {
+            if scale_factor != expected_scale_factor {
+                bail!(
+                    "EC9 source scale factor for {variable} changed: source={scale_factor} expected={expected_scale_factor}"
+                );
+            }
+            if source_scale_factor.is_some_and(|previous| previous != scale_factor) {
+                bail!("EC9 source scale factor for {variable} changes within one run");
+            }
+            source_scale_factor = Some(scale_factor);
+        }
         let Some(values) = file.decode(decoder, snapshot.bounds(), variable, plan)? else {
             continue;
         };
         if values.len() != location_count {
-            bail!("decoded EC9 frame has the wrong regular-grid size");
+            bail!("decoded EC9 frame has the wrong compact-grid size");
         }
         found = true;
         for (location, value) in values.into_iter().enumerate() {
@@ -237,18 +232,22 @@ fn write_variable(
             variable
         );
     }
-    let chunks = vec![1, (1024 / n_time).clamp(1, NX), n_time];
-    let dimensions = vec![NY, NX, n_time];
+    // A compact location axis preserves every cropped reduced-Gaussian point
+    // without padding each row to the equatorial width.
+    let chunks = vec![1, 64_u64.min(grid.nx), n_time];
+    let dimensions = vec![grid.ny, grid.nx, n_time];
+    let source_scale_factor = source_scale_factor
+        .with_context(|| format!("EC9 source has no scale factor for {variable}"))?;
     let mut writer = decoder.create_array_writer(
         destination,
         dimensions,
         chunks,
-        ecmwf_storage_scale_factor(variable),
+        source_scale_factor,
         0.0,
         DATA_TYPE_FLOAT_ARRAY,
         COMPRESSION_PFOR_DELTA2D_INT16,
     )?;
-    writer.write_f32_block(&dense, &[NY, NX, n_time])?;
+    writer.write_f32_block(&dense, &[grid.ny, grid.nx, n_time])?;
     writer.finish(variable)?;
     Ok(true)
 }
@@ -257,11 +256,12 @@ fn validate_file(
     path: &Path,
     variable: &str,
     expected_time: u64,
+    grid: &NativeGridMetadata,
     decoder: &OfficialDecoder,
 ) -> Result<u64> {
     let file = Arc::new(File::open(path)?);
     let array = read_native_array_metadata(&file)?;
-    if array.dimensions != [NY, NX, expected_time]
+    if array.dimensions != [grid.ny, grid.nx, expected_time]
         || array.chunks.len() != 3
         || array.data_type != DATA_TYPE_FLOAT_ARRAY
         || array.compression != COMPRESSION_PFOR_DELTA2D_INT16
@@ -281,7 +281,7 @@ fn validate_file(
             .context("EC9 OM array has no scale factor")?,
         array.add_offset.unwrap_or(0.0),
     );
-    for (y, x) in [(0, 0), (NY / 2, NX / 2), (NY - 1, NX - 1)] {
+    for (y, x) in [(0, 0), (0, grid.nx / 2), (grid.ny - 1, grid.nx - 1)] {
         let values = decoder.decode_grid(
             &metadata,
             &FullFileRangeReader { file: file.clone() },
@@ -419,8 +419,9 @@ pub fn build_and_publish_ec9_coverage(
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir_all(&staging)?;
-    let (latitudes, longitudes) = build_coordinates();
-    let plan = Arc::new(snapshot.sampling_plan(&latitudes, &longitudes)?);
+    let (plan, topology) = snapshot.native_region_plan()?;
+    let plan = Arc::new(plan);
+    let grid = grid(&topology);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.workers)
         .thread_name(|index| format!("ec9-native-{index}"))
@@ -449,6 +450,7 @@ pub fn build_and_publish_ec9_coverage(
                         &frames,
                         snapshot.as_ref(),
                         plan.as_ref(),
+                        &grid,
                         variable,
                         &path,
                         &options.data_root,
@@ -482,7 +484,6 @@ pub fn build_and_publish_ec9_coverage(
         .iter()
         .map(|run| run.source_run.clone())
         .collect::<Vec<_>>();
-    let grid = grid();
     let grid_marker = grid_marker(&grid);
     let marker = json!({
         "schema_version": 1,
@@ -541,6 +542,7 @@ pub fn build_and_publish_ec9_coverage(
                 &root.join(format!("{variable}.om")),
                 variable,
                 expected_time,
+                &grid,
                 decoder,
             )?;
         }
@@ -593,15 +595,28 @@ pub fn build_and_publish_ec9_coverage(
 #[cfg(test)]
 mod tests {
     use super::{grid, grid_marker};
+    use crate::regionpack::O1280RegionTopology;
 
     #[test]
     fn published_grid_marker_matches_native_webp_contract() {
-        let marker = grid_marker(&grid());
+        let topology = O1280RegionTopology {
+            row_start: 995,
+            row_offsets: vec![0, 3, 5],
+            first_columns: vec![1488, 1490],
+            column_counts: vec![3, 2],
+        };
+        let marker = grid_marker(&grid(&topology));
         assert_eq!(
             marker.get("grid_type").and_then(|value| value.as_str()),
-            Some("regional_regular_lat_lon")
+            Some("o1280_reduced_gaussian_crop")
         );
-        assert_eq!(marker.get("nx").and_then(|value| value.as_u64()), Some(897));
-        assert_eq!(marker.get("ny").and_then(|value| value.as_u64()), Some(743));
+        assert_eq!(marker.get("nx").and_then(|value| value.as_u64()), Some(5));
+        assert_eq!(marker.get("ny").and_then(|value| value.as_u64()), Some(1));
+        assert_eq!(
+            marker
+                .get("o1280_row_start")
+                .and_then(|value| value.as_u64()),
+            Some(995)
+        );
     }
 }

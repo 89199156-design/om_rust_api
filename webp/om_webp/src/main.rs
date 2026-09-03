@@ -1282,9 +1282,9 @@ fn compute_scope_grid(
         // every cell from their immutable, already regionalized OM products.
         Scope::Gfs => compute_grid(left, right, bottom, top),
         Scope::EcmwfIfs025 | Scope::Cams => compute_native_product_grid(scope, ready),
-        Scope::EcmwfIfs9km if ready.products.contains_key(scope.product_dir()) => {
-            compute_native_product_grid(scope, ready)
-        }
+        // EC9 is stored losslessly as a compact reduced-Gaussian topology.
+        // WebP remains a regular render product, so its output grid is not the
+        // storage array's one-dimensional packed axis.
         Scope::EcmwfIfs9km => compute_ecmwf_ifs9km_grid(left, right, bottom, top),
     }
 }
