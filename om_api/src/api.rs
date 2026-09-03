@@ -337,10 +337,10 @@ fn weather_attribution_payload() -> serde_json::Value {
                 "transformations": [
                     "HTTP range extraction and spatial subsetting",
                     "materialization into immutable Open-Meteo OM arrays",
-                    "nearest-grid sampling to the published regular grid",
+                    "native O1280 reduced-Gaussian cell preservation and nearest-cell sampling",
                     "temporal interpolation where requested",
                     "unit conversion and derived-variable calculation where requested",
-                    "lossless WebP encoding for map layers"
+                    "regular-grid resampling and lossless WebP encoding for map layers"
                 ],
                 "disclaimer": "ECMWF has no liability in respect of this service or its transformed outputs."
             },
@@ -596,15 +596,8 @@ async fn ecmwf_ifs9km_catalog(
             .values()
             .find_map(|entry| entry.native_grid.as_ref())
             .context("EC9 native product has no grid metadata")?;
-        return Ok(Json(json!({
-            "model": "ecmwf_ifs9km",
-            "runtime_format": "openmeteo-native-v1",
-            "coverage_id": product.manifest.coverage_id,
-            "latest_complete_run": product.manifest.latest_complete_run,
-            "public_start_utc": product.manifest.public_start_utc,
-            "time_start_utc": time_start,
-            "time_end_utc": time_end,
-            "grid": {
+        let grid_payload = if grid.grid_type.as_deref() == Some("o1280_reduced_gaussian_crop") {
+            json!({
                 "name": "O1280 reduced Gaussian regional compact grid",
                 "nominal_resolution_km": 9,
                 "bounds": {
@@ -615,7 +608,32 @@ async fn ecmwf_ifs9km_catalog(
                 },
                 "storage_locations": grid.nx * grid.ny,
                 "storage_row_count": grid.o1280_column_counts.as_ref().map(Vec::len),
-            },
+            })
+        } else {
+            json!({
+                "name": "ECMWF IFS 9 km regular materialized grid (legacy)",
+                "nominal_resolution_km": 9,
+                "bounds": {
+                    "west": grid.lon_min,
+                    "east": grid.lon_min + (grid.nx - 1) as f64 * grid.dx,
+                    "south": grid.lat_min,
+                    "north": grid.lat_min + (grid.ny - 1) as f64 * grid.dy,
+                },
+                "nx": grid.nx,
+                "ny": grid.ny,
+                "dx": grid.dx,
+                "dy": grid.dy,
+            })
+        };
+        return Ok(Json(json!({
+            "model": "ecmwf_ifs9km",
+            "runtime_format": "openmeteo-native-v1",
+            "coverage_id": product.manifest.coverage_id,
+            "latest_complete_run": product.manifest.latest_complete_run,
+            "public_start_utc": product.manifest.public_start_utc,
+            "time_start_utc": time_start,
+            "time_end_utc": time_end,
+            "grid": grid_payload,
             "available_source_variables": available_source_variables,
             "available_hourly_variables": hourly,
             "available_daily_variables": daily,
