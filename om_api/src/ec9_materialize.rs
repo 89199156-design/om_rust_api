@@ -358,6 +358,52 @@ fn cleanup_old_coverages(data_root: &Path, current: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_managed_coverage_id(value: &str) -> bool {
+    let Some(value) = value.strip_prefix("ec9-native-") else {
+        return false;
+    };
+    let mut parts = value.split('-');
+    let (Some(run), Some(start), Some(revision), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    run.len() == 10
+        && run.bytes().all(|byte| byte.is_ascii_digit())
+        && start.len() == 8
+        && start.bytes().all(|byte| byte.is_ascii_digit())
+        && revision.len() == 12
+        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cleanup_stale_staging(staging_parent: &Path, current: &Path) -> Result<Vec<String>> {
+    let current_name = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("EC9 staging path is not UTF-8")?;
+    let mut removed = Vec::new();
+    for entry in fs::read_dir(staging_parent)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((coverage, pid)) = name.rsplit_once(".incoming.") else {
+            continue;
+        };
+        if name == current_name
+            || !is_managed_coverage_id(coverage)
+            || pid.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        fs::remove_dir_all(entry.path())
+            .with_context(|| format!("remove stale EC9 staging {}", entry.path().display()))?;
+        removed.push(name);
+    }
+    removed.sort();
+    Ok(removed)
+}
+
 pub fn build_and_publish_ec9_coverage(
     options: &Ec9BuildOptions,
     decoder: &OfficialDecoder,
@@ -415,6 +461,9 @@ pub fn build_and_publish_ec9_coverage(
     let staging_parent = options.data_root.join("staging");
     fs::create_dir_all(&staging_parent)?;
     let staging = staging_parent.join(format!("{}.incoming.{}", coverage_id, std::process::id()));
+    for stale in cleanup_stale_staging(&staging_parent, &staging)? {
+        eprintln!("removed stale EC9 native staging: {stale}");
+    }
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
     }
@@ -594,8 +643,9 @@ pub fn build_and_publish_ec9_coverage(
 
 #[cfg(test)]
 mod tests {
-    use super::{grid, grid_marker};
+    use super::{cleanup_stale_staging, grid, grid_marker};
     use crate::regionpack::O1280RegionTopology;
+    use std::fs;
 
     #[test]
     fn published_grid_marker_matches_native_webp_contract() {
@@ -618,5 +668,38 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(995)
         );
+    }
+
+    #[test]
+    fn stale_ec9_staging_cleanup_is_strictly_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root
+            .path()
+            .join("ec9-native-2026090300-20260902-abcdef123456.incoming.22");
+        let stale = root
+            .path()
+            .join("ec9-native-2026090300-20260902-abcdef123456.incoming.11");
+        let unrelated = root.path().join("ecmwf-native-2026090300.incoming.11");
+        let invalid_pid = root
+            .path()
+            .join("ec9-native-2026090300-20260902-abcdef123456.incoming.old");
+        let invalid_coverage = root.path().join("ec9-native-not-a-release.incoming.11");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::create_dir_all(&invalid_pid).unwrap();
+        fs::create_dir_all(&invalid_coverage).unwrap();
+
+        let removed = cleanup_stale_staging(root.path(), &current).unwrap();
+
+        assert_eq!(
+            removed,
+            ["ec9-native-2026090300-20260902-abcdef123456.incoming.11"]
+        );
+        assert!(current.is_dir());
+        assert!(!stale.exists());
+        assert!(unrelated.is_dir());
+        assert!(invalid_pid.is_dir());
+        assert!(invalid_coverage.is_dir());
     }
 }
