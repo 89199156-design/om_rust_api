@@ -32,6 +32,9 @@ GEFS05_STATIC_PATH="$MODEL_STATIC_ROOT/static/ncep_gefs05/HSURF.om"
 ECMWF025_ENSEMBLE_STATIC_URL="${OM_ECMWF025_ENSEMBLE_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ecmwf_ifs025_ensemble/static/HSURF.om}"
 ECMWF025_ENSEMBLE_STATIC_SHA256="${OM_ECMWF025_ENSEMBLE_STATIC_SHA256:-c137997ccae161da2f79bd4ae3e00e03aa0a94cf351d5fd69b88a03191c1e2be}"
 ECMWF025_ENSEMBLE_STATIC_PATH="$MODEL_STATIC_ROOT/static/ecmwf_ifs025_ensemble/HSURF.om"
+ECMWF_IFS9KM_STATIC_URL="${OM_ECMWF_IFS9KM_STATIC_URL:-https://openmeteo.s3.amazonaws.com/data/ecmwf_ifs/static/HSURF.om}"
+ECMWF_IFS9KM_STATIC_SHA256="${OM_ECMWF_IFS9KM_STATIC_SHA256:-2e8279f8bd12052ba5be5a0bcba2293dc4316097e434d6691f9e6711249e1fd3}"
+ECMWF_IFS9KM_STATIC_PATH="$MODEL_STATIC_ROOT/static/ecmwf_ifs/HSURF.om"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -397,6 +400,9 @@ install_verified_static_asset \
 install_verified_static_asset \
   "ECMWF025 ensemble" "$ECMWF025_ENSEMBLE_STATIC_URL" \
   "$ECMWF025_ENSEMBLE_STATIC_SHA256" "$ECMWF025_ENSEMBLE_STATIC_PATH"
+install_verified_static_asset \
+  "ECMWF IFS 9 km" "$ECMWF_IFS9KM_STATIC_URL" \
+  "$ECMWF_IFS9KM_STATIC_SHA256" "$ECMWF_IFS9KM_STATIC_PATH"
 
 install_corresponding_source_archive
 

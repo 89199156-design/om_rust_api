@@ -935,6 +935,11 @@ pub(crate) fn o1280_nearest_index(latitude: f64, longitude: f64) -> (u64, u64) {
     (row as u64, column)
 }
 
+pub(crate) fn o1280_nearest_global_index(latitude: f64, longitude: f64) -> u64 {
+    let (row, column, _, _) = official_o1280_point(latitude, longitude.rem_euclid(360.0));
+    o1280_row_starts()[row] + column
+}
+
 fn o1280_row_starts() -> &'static [u64] {
     static ROW_STARTS: OnceLock<Vec<u64>> = OnceLock::new();
     ROW_STARTS.get_or_init(|| {
@@ -990,6 +995,12 @@ mod tests {
         assert_eq!(column, 1489);
         assert_eq!(latitude as f32, 19.999998_f32);
         assert_eq!(longitude as f32, 134.01001_f32);
+        assert_eq!(o1280_nearest_global_index(20.0, 134.0), 1_999_449);
+
+        assert_eq!(
+            o1280_nearest_global_index(43.97187805175781, 77.9817886352539),
+            867_775
+        );
     }
 
     #[test]

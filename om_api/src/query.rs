@@ -57,6 +57,12 @@ const ECMWF025_ENSEMBLE_STATIC_CHUNKS: &[u64] = &[20, 20];
 const ECMWF025_ENSEMBLE_STATIC_LUT_OFFSET: u64 = 430_151;
 const ECMWF025_ENSEMBLE_STATIC_LUT_SIZE: u64 = 3_486;
 const ECMWF025_ENSEMBLE_STATIC_FILE_SIZE: u64 = 433_744;
+const ECMWF_IFS9KM_STATIC_ELEVATION_PATH: &str = "static/ecmwf_ifs/HSURF.om";
+const ECMWF_IFS9KM_STATIC_DIMENSIONS: &[u64] = &[1, 6_599_680];
+const ECMWF_IFS9KM_STATIC_CHUNKS: &[u64] = &[1, 400];
+const ECMWF_IFS9KM_STATIC_LUT_OFFSET: u64 = 2_461_191;
+const ECMWF_IFS9KM_STATIC_LUT_SIZE: u64 = 21_156;
+const ECMWF_IFS9KM_STATIC_FILE_SIZE: u64 = 2_482_560;
 type ElevationCache = HashMap<(PathBuf, u64, u64), f32>;
 static ELEVATION_CACHE: OnceLock<Mutex<ElevationCache>> = OnceLock::new();
 
@@ -92,7 +98,7 @@ impl WeatherModel {
         match self {
             Self::Gfs => Some(GFS013_STATIC_SPEC),
             Self::EcmwfIfs025 => Some(ECMWF025_STATIC_SPEC),
-            Self::EcmwfIfs9km => None,
+            Self::EcmwfIfs9km => Some(ECMWF_IFS9KM_STATIC_SPEC),
         }
     }
 
@@ -11276,6 +11282,15 @@ const ECMWF025_ENSEMBLE_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
     file_size: ECMWF025_ENSEMBLE_STATIC_FILE_SIZE,
 };
 
+const ECMWF_IFS9KM_STATIC_SPEC: StaticElevationSpec = StaticElevationSpec {
+    relative_path: ECMWF_IFS9KM_STATIC_ELEVATION_PATH,
+    dimensions: ECMWF_IFS9KM_STATIC_DIMENSIONS,
+    chunks: ECMWF_IFS9KM_STATIC_CHUNKS,
+    lut_offset: ECMWF_IFS9KM_STATIC_LUT_OFFSET,
+    lut_size: ECMWF_IFS9KM_STATIC_LUT_SIZE,
+    file_size: ECMWF_IFS9KM_STATIC_FILE_SIZE,
+};
+
 fn resolve_request_sampling(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -11403,12 +11418,31 @@ fn resolve_request_sampling(
     let ecmwf9km = if current_weather_model() == WeatherModel::EcmwfIfs9km {
         let (model_latitude, model_longitude) =
             ecmwf_ifs9km_nearest_coordinate(snapshot, latitude, longitude)?;
-        let model_elevation = if target.is_finite() { target } else { 0.0 };
+        let global_index = crate::regionpack::o1280_nearest_global_index(latitude, longitude);
+        let model_elevation = elevation_numeric(
+            read_static_elevation_grid(
+                snapshot,
+                decoder,
+                ECMWF_IFS9KM_STATIC_SPEC,
+                0,
+                global_index,
+                1,
+                1,
+            )?
+            .into_iter()
+            .next()
+            .context("EC9 static elevation point is missing")?,
+        );
+        let target_elevation = if target.is_nan() {
+            model_elevation
+        } else {
+            target
+        };
         Some(ModelSampling {
             latitude: model_latitude,
             longitude: model_longitude,
             model_elevation,
-            target_elevation: target,
+            target_elevation,
         })
     } else {
         None
@@ -11746,7 +11780,25 @@ fn weather_model_location(
     if model == WeatherModel::EcmwfIfs9km {
         let (model_latitude, model_longitude) =
             ecmwf_ifs9km_nearest_coordinate(snapshot, latitude, longitude)?;
-        return Ok(Some((model_latitude, model_longitude, 0.0)));
+        let Some(decoder) = decoder else {
+            return Ok(None);
+        };
+        let global_index = crate::regionpack::o1280_nearest_global_index(latitude, longitude);
+        let model_elevation = elevation_numeric(
+            read_static_elevation_grid(
+                snapshot,
+                decoder,
+                ECMWF_IFS9KM_STATIC_SPEC,
+                0,
+                global_index,
+                1,
+                1,
+            )?
+            .into_iter()
+            .next()
+            .context("EC9 static elevation point is missing")?,
+        );
+        return Ok(Some((model_latitude, model_longitude, model_elevation)));
     }
     let product_name = model.primary_product();
     let spec = model
@@ -12020,6 +12072,19 @@ mod tests {
             &[361, 720, 313, 2],
             GEFS05_STATIC_DIMENSIONS,
         ));
+    }
+
+    #[test]
+    fn ec9_static_elevation_contract_matches_official_o1280_asset() {
+        assert_eq!(
+            ECMWF_IFS9KM_STATIC_SPEC.relative_path,
+            "static/ecmwf_ifs/HSURF.om"
+        );
+        assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.dimensions, &[1, 6_599_680]);
+        assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.chunks, &[1, 400]);
+        assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.lut_offset, 2_461_191);
+        assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.lut_size, 21_156);
+        assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.file_size, 2_482_560);
     }
 
     #[test]
