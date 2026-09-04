@@ -5787,6 +5787,13 @@ fn surface_pressure(temperature: f32, pressure_msl: f32, elevation: f32) -> f32 
     pressure_msl / factor
 }
 
+fn pascal_to_hectopascal(value: f32) -> f32 {
+    // Match Open-Meteo's GenericReader.scale implementation exactly. In f32,
+    // division by 100 and multiplication by 0.01 can land on opposite sides
+    // of a later 0.1 hPa rounding boundary for derived surface pressure.
+    value / 100.0
+}
+
 fn surface_pressure_elevation(sampling: ModelSampling) -> f32 {
     if sampling.target_elevation.is_finite() {
         sampling.target_elevation
@@ -5903,8 +5910,10 @@ fn read_direct_with_rounding(
         let mut value = frames.remove(0).remove(0);
         if variable == "pressure_msl" {
             // The ECPDS IFS database intentionally stores MSL pressure in Pa;
-            // the forecast API exposes hPa.
-            value *= 0.01;
+            // the forecast API exposes hPa. Open-Meteo performs this as an
+            // f32 division by 100, whose rounding is observable by downstream
+            // surface-pressure derivation.
+            value = pascal_to_hectopascal(value);
         }
         if !round_values {
             // The retained source chunks already carry their native scale. The
@@ -6356,7 +6365,7 @@ fn read_direct_grid_series_uncached(
         if variable == "pressure_msl" {
             for frame in &mut values {
                 for value in frame {
-                    *value *= 0.01;
+                    *value = pascal_to_hectopascal(*value);
                 }
             }
         }
@@ -13298,6 +13307,30 @@ mod tests {
         assert_eq!(
             json_value_for_variable("surface_pressure", rounded_inputs),
             serde_json::json!(997.8)
+        );
+    }
+
+    #[test]
+    fn ec9_pascal_conversion_matches_swift_division_before_surface_pressure() {
+        let pressure_pa = 100_590.0_f32;
+        let official_hpa = pascal_to_hectopascal(pressure_pa);
+        let reciprocal_multiply_hpa = pressure_pa * 0.01;
+
+        assert_ne!(official_hpa.to_bits(), reciprocal_multiply_hpa.to_bits());
+        assert_eq!(official_hpa, 1005.9);
+        assert_eq!(
+            json_value_for_variable(
+                "surface_pressure",
+                surface_pressure(30.5285, official_hpa, 232.0),
+            ),
+            serde_json::json!(980.1)
+        );
+        assert_eq!(
+            json_value_for_variable(
+                "surface_pressure",
+                surface_pressure(30.5285, reciprocal_multiply_hpa, 232.0),
+            ),
+            serde_json::json!(980.0)
         );
     }
 
