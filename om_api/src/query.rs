@@ -5906,6 +5906,10 @@ fn read_direct_with_rounding(
             // the forecast API exposes hPa.
             value *= 0.01;
         }
+        // Derived variables call this point reader directly. Keep their raw
+        // inputs on the same target elevation as the batched public-series
+        // path before either derivation or output rounding.
+        value = apply_elevation_correction("ecmwf_ifs9km", variable, value);
         if !round_values {
             // The retained source chunks already carry their native scale. The
             // two-stage ECMWF path quantises derived hourly values by design;
