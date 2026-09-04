@@ -339,6 +339,24 @@ class Official200PointCompareTests(unittest.TestCase):
         )
         self.assertNotIn("daily=", url)
 
+    def test_local_url_round_trips_native_float32_coordinates(self) -> None:
+        point = {
+            "latitude": 29.982425689697266,
+            "longitude": 80.03496551513672,
+        }
+
+        url = compare.local_url(
+            "http://127.0.0.1:8088",
+            "ec9",
+            point,
+            hourly=("temperature_2m",),
+            daily=(),
+        )
+        query = compare.urllib.parse.parse_qs(compare.urllib.parse.urlparse(url).query)
+
+        self.assertEqual(query["latitude"], ["29.9824257"])
+        self.assertEqual(query["longitude"], ["80.0349655"])
+
     def test_local_url_freezes_saved_daily_snapshot_range(self) -> None:
         url = compare.local_url(
             "http://127.0.0.1:8088",
@@ -735,6 +753,181 @@ class Official200PointCompareTests(unittest.TestCase):
 
         self.assertEqual(numeric_difference["reason"], "json_value")
         self.assertEqual(reverse_difference["reason"], "json_value")
+
+    def test_hourly_weather_code_can_record_proven_rolling_cin_effect(self) -> None:
+        official = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                "time": ["2026-09-08T05:00"],
+                "cloud_cover": [89],
+                "precipitation": [0.2],
+                "snowfall": [0.0],
+                "cape": [1370],
+                "showers": [0.2],
+                "convective_inhibition": [1],
+                "boundary_layer_height": [1565],
+                "weather_code": [95],
+            },
+        }
+        local = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                "time": ["2026-09-08T05:00"],
+                "cloud_cover": [89],
+                "precipitation": [0.2],
+                "snowfall": [0.0],
+                "cape": [1370],
+                "showers": [0.2],
+                "convective_inhibition": [None],
+                "boundary_layer_height": [1565],
+                "weather_code": [51],
+            },
+        }
+        accepted: list[dict[str, object]] = []
+
+        difference, hourly_count, daily_count = compare.first_period_difference(
+            "hourly",
+            (
+                "weather_code",
+                "cloud_cover",
+                "precipitation",
+                "snowfall",
+                "cape",
+                "showers",
+                "convective_inhibition",
+                "boundary_layer_height",
+            ),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+            accepted_differences=accepted,
+        )
+
+        self.assertIsNone(difference)
+        self.assertEqual(hourly_count, 8)
+        self.assertEqual(daily_count, 0)
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(
+            accepted[0]["reason"],
+            "official_weather_code_derived_from_rolling_value_over_local_nan",
+        )
+        self.assertEqual(
+            accepted[0]["evidence"]["rolling_nan_dependencies"],
+            [
+                {
+                    "variable": "convective_inhibition",
+                    "official": 1,
+                    "local": None,
+                }
+            ],
+        )
+        self.assertEqual(accepted[0]["evidence"]["recomputed_official"], 95)
+        self.assertEqual(accepted[0]["evidence"]["recomputed_local"], 51)
+        self.assertEqual(
+            accepted[1]["reason"], "official_rolling_value_over_local_nan"
+        )
+
+    def test_hourly_weather_code_rolling_nan_policy_requires_causal_match(self) -> None:
+        official = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                "time": ["2026-09-08T05:00"],
+                "cloud_cover": [89],
+                "precipitation": [0.2],
+                "snowfall": [0.0],
+                "cape": [1370],
+                "showers": [0.2],
+                "convective_inhibition": [1],
+                "boundary_layer_height": [1565],
+                "weather_code": [99],
+            },
+        }
+        local = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                **official["hourly"],
+                "convective_inhibition": [None],
+                "weather_code": [51],
+            },
+        }
+
+        difference, _, _ = compare.first_period_difference(
+            "hourly",
+            ("weather_code",),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+        )
+
+        self.assertEqual(difference["reason"], "json_value")
+
+    def test_daily_weather_code_can_record_proven_hourly_rolling_cin_effect(self) -> None:
+        official = {
+            "latitude": 29.982425689697266,
+            "hourly": {
+                "time": ["2026-09-14T07:00", "2026-09-14T08:00"],
+                "cloud_cover": [95, 30],
+                "precipitation": [1.4, 0.0],
+                "snowfall": [0.0, 0.0],
+                "cape": [790, 0],
+                "showers": [1.1, 0.0],
+                "convective_inhibition": [0, 12],
+                "boundary_layer_height": [840, 100],
+                "weather_code": [95, 1],
+            },
+            "daily": {"time": ["2026-09-14"], "weather_code": [95]},
+        }
+        local = {
+            "latitude": 29.982425689697266,
+            "hourly": {
+                **official["hourly"],
+                "convective_inhibition": [None, None],
+                "weather_code": [80, 1],
+            },
+            "daily": {"time": ["2026-09-14"], "weather_code": [80]},
+        }
+        accepted: list[dict[str, object]] = []
+
+        difference, hourly_count, daily_count = compare.first_period_difference(
+            "daily",
+            ("weather_code",),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+            accepted_differences=accepted,
+        )
+
+        self.assertIsNone(difference)
+        self.assertEqual(hourly_count, 0)
+        # The final daily item is outside the normal comparison scope. Add a
+        # second day so the first one is actually compared.
+        self.assertEqual(daily_count, 0)
+        self.assertEqual(accepted, [])
+
+        official["daily"]["time"].append("2026-09-15")
+        official["daily"]["weather_code"].append(1)
+        local["daily"]["time"].append("2026-09-15")
+        local["daily"]["weather_code"].append(1)
+        difference, _, daily_count = compare.first_period_difference(
+            "daily",
+            ("weather_code",),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+            accepted_differences=accepted,
+        )
+
+        self.assertIsNone(difference)
+        self.assertEqual(daily_count, 1)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(
+            accepted[0]["reason"],
+            "official_daily_weather_code_derived_from_rolling_value_over_local_nan",
+        )
+        self.assertEqual(
+            accepted[0]["evidence"]["causal_hourly_differences"][0]["time"],
+            "2026-09-14T07:00",
+        )
 
     def test_validate_model_checkpoints_progress_and_throttles(self) -> None:
         original = compare.MODEL_SPECS["gfs"]

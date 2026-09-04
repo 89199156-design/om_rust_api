@@ -2285,7 +2285,16 @@ fn aggregate_daily_weather_values(
         }
         DailyWeatherAggregation::Sum(_) if complete => values.iter().sum(),
         DailyWeatherAggregation::RadiationSum(_) if complete => {
-            values.iter().sum::<f32>() * (step_hours * 3600) as f32 / 1_000_000.0
+            // Match GenericDailyCalculator.radiationSum exactly: Swift
+            // converts every Float32 frame from W/m² to MJ/m² before the
+            // sequential daily sum. Factoring the conversion out of the sum
+            // is mathematically equivalent but not Float32-equivalent and can
+            // cross the public two-decimal boundary.
+            let model_dt_seconds = (step_hours * 3600) as f32;
+            values
+                .iter()
+                .map(|value| *value * model_dt_seconds / 1_000_000.0)
+                .sum()
         }
         DailyWeatherAggregation::PrecipitationHours(_) => values
             .iter()
@@ -14950,6 +14959,39 @@ mod output_tests {
         assert_eq!(
             json_array_for_daily_variable("shortwave_radiation_sum", aggregation, vec![12.345]),
             serde_json::json!([12.35])
+        );
+    }
+
+    #[test]
+    fn daily_radiation_converts_each_float32_frame_before_summing() {
+        // Regression for EC9 p070 on 2026-09-16. The first value represents
+        // an unrounded interpolated frame; the other frames are the public
+        // hourly values from the immutable official snapshot. Summing first
+        // yields 15.1949987 (15.19), while the official per-frame conversion
+        // yields 15.1949997 and therefore 15.20 at the JSON boundary.
+        let values = vec![
+            332.832_92, 422.0, 487.0, 522.0, 521.0, 483.0, 410.0, 325.0, 178.0, 31.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0, 146.0, 358.0,
+        ];
+        let aggregation = DailyWeatherAggregation::RadiationSum("shortwave_radiation");
+        let official_order = aggregate_daily_weather_values(aggregation, &values, 1);
+        let factored_order = values.iter().sum::<f32>() * 3600.0 / 1_000_000.0;
+
+        assert_eq!(
+            official_order.to_bits(),
+            15.194_999_694_824_219_f32.to_bits()
+        );
+        assert_eq!(
+            factored_order.to_bits(),
+            15.194_998_741_149_902_f32.to_bits()
+        );
+        assert_eq!(
+            json_array_for_daily_variable(
+                "shortwave_radiation_sum",
+                aggregation,
+                vec![official_order],
+            ),
+            serde_json::json!([15.2])
         );
     }
 

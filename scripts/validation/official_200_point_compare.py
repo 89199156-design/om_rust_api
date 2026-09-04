@@ -1519,8 +1519,12 @@ def local_url(
         hourly = tuple(spec["local_hourly"])
         daily = tuple(spec["daily"]) if model != "cams" else ()
     params: dict[str, Any] = {
-        "latitude": f"{point['latitude']:.4f}",
-        "longitude": f"{point['longitude']:.4f}",
+        # Nine significant decimal digits round-trip every IEEE-754 Float32.
+        # Four fixed decimals can move an exact native-grid coordinate across
+        # a 90 m Copernicus DEM pixel boundary and create a false elevation
+        # correction mismatch.
+        "latitude": format(float(point["latitude"]), ".9g"),
+        "longitude": format(float(point["longitude"]), ".9g"),
         "timezone": "GMT",
         "timeformat": "iso8601",
         "cell_selection": "nearest",
@@ -1550,6 +1554,350 @@ def local_url(
         + "?"
         + urllib.parse.urlencode(params, safe=",")
     )
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _ec9_public_weather_code(
+    period: dict[str, Any], index: int, latitude: Any
+) -> int | None:
+    """Re-evaluate the EC9 WMO code from the public inputs used by the API.
+
+    This intentionally mirrors the currently validated EC9 rule only far
+    enough to prove whether a rolling finite optional input explains a WMO
+    difference.  It is not used to validate ordinary weather-code equality.
+    """
+
+    def value(name: str) -> Any:
+        values = period.get(name)
+        if not isinstance(values, list) or index >= len(values):
+            return None
+        return values[index]
+
+    cloud_cover = value("cloud_cover")
+    precipitation = value("precipitation")
+    snowfall = value("snowfall")
+    cape = value("cape")
+    showers = value("showers")
+    cin = value("convective_inhibition")
+    pbl = value("boundary_layer_height")
+    if not all(_finite_number(item) for item in (cloud_cover, precipitation, snowfall)):
+        return None
+    if not _finite_number(latitude):
+        return None
+
+    cloud_cover = float(cloud_cover)
+    precipitation = float(precipitation)
+    snowfall = float(snowfall)
+    cape = float(cape) if _finite_number(cape) else None
+    showers = float(showers) if _finite_number(showers) else None
+    cin = float(cin) if _finite_number(cin) else None
+    pbl = float(pbl) if _finite_number(pbl) else None
+
+    if cape is not None:
+        if cape <= 10.0 or (cin is not None and cin > 250.0):
+            thunderstorm_probability = 0.0
+        else:
+            abs_latitude = abs(float(latitude))
+            latitude_factor = (
+                1.0
+                if abs_latitude >= 30.0
+                else 0.8 + 0.2 * (abs_latitude / 30.0)
+            )
+            max_cape = 2500.0 + 1500.0 * (
+                1.0 - min(abs_latitude, 30.0) / 30.0
+            )
+            accumulated = max(0.0, min((cape - 300.0) / (max_cape - 300.0), 1.0)) * 0.25
+            total_weight = 0.25
+            if cin is not None:
+                cin_score = (
+                    1.0
+                    if cin <= 15.0
+                    else max(0.0, min(1.0 - (cin - 15.0) / 135.0, 1.0))
+                )
+                accumulated += cin_score * 0.15
+                total_weight += 0.15
+            reference_precipitation = 2.0 + 3.0 * (
+                1.0 - min(abs_latitude, 30.0) / 30.0
+            )
+            if showers is not None and showers > 0.0:
+                accumulated += max(
+                    0.0, min(showers / reference_precipitation, 1.0)
+                ) * 0.25
+                total_weight += 0.25
+            else:
+                fallback_reference = reference_precipitation * 1.6
+                accumulated += max(
+                    0.0, min(precipitation / fallback_reference, 1.0)
+                ) * 0.25 * 0.6
+                total_weight += 0.25 * 0.6
+            if pbl is not None:
+                accumulated += max(0.0, min((pbl - 300.0) / 1200.0, 1.0)) * 0.075
+                total_weight += 0.075
+            thunderstorm_probability = accumulated / total_weight * 100.0
+            if (
+                showers is not None
+                and cin is not None
+                and showers > 0.1
+                and cape > 300.0
+                and cin < 50.0
+            ):
+                thunderstorm_probability = min(
+                    thunderstorm_probability * 1.3, 100.0
+                )
+            if (showers if showers is not None else precipitation) <= 0.0:
+                thunderstorm_probability *= 0.7
+            if cin is not None and cin > 100.0:
+                thunderstorm_probability *= 0.3
+            cloud_factor = (
+                1.0
+                if cloud_cover >= 60.0
+                else 0.6 + 0.4 * ((cloud_cover - 30.0) / 30.0)
+            )
+            thunderstorm_probability = max(
+                0.0,
+                min(
+                    thunderstorm_probability * cloud_factor * latitude_factor,
+                    100.0,
+                ),
+            )
+        if thunderstorm_probability > 85.0:
+            return 96
+        if thunderstorm_probability > 60.0:
+            return 95
+
+    if (showers if showers is not None else 0.0) > 0.0 or (cape or 0.0) >= 800.0:
+        if 0.01 <= snowfall < 0.8:
+            return 85
+        if snowfall >= 0.8:
+            return 86
+        if 1.3 <= precipitation < 2.5:
+            return 80
+        if 2.5 <= precipitation < 7.6:
+            return 81
+        if precipitation >= 7.6:
+            return 82
+    if 0.01 <= snowfall < 0.2:
+        return 71
+    if 0.2 <= snowfall < 0.8:
+        return 73
+    if snowfall >= 0.8:
+        return 75
+    if 0.01 <= precipitation < 0.5:
+        return 51
+    if 0.5 <= precipitation < 1.0:
+        return 53
+    if 1.0 <= precipitation < 1.3:
+        return 55
+    if 1.3 <= precipitation < 2.5:
+        return 61
+    if 2.5 <= precipitation < 7.6:
+        return 63
+    if precipitation >= 7.6:
+        return 65
+    if 0.0 <= cloud_cover < 20.0:
+        return 0
+    if 20.0 <= cloud_cover < 50.0:
+        return 1
+    if 50.0 <= cloud_cover < 80.0:
+        return 2
+    if cloud_cover >= 80.0:
+        return 3
+    return None
+
+
+def _ec9_weather_code_rolling_nan_evidence(
+    official: dict[str, Any],
+    local: dict[str, Any],
+    official_index: int,
+    local_index: int,
+) -> dict[str, Any] | None:
+    official_period = official.get("hourly")
+    local_period = local.get("hourly")
+    if not isinstance(official_period, dict) or not isinstance(local_period, dict):
+        return None
+    dependency_names = (
+        "cape",
+        "showers",
+        "convective_inhibition",
+        "boundary_layer_height",
+    )
+    required_equal_names = (
+        "cloud_cover",
+        "precipitation",
+        "snowfall",
+    )
+    for name in required_equal_names:
+        official_values = official_period.get(name)
+        local_values = local_period.get(name)
+        if (
+            not isinstance(official_values, list)
+            or not isinstance(local_values, list)
+            or official_index >= len(official_values)
+            or local_index >= len(local_values)
+            or official_values[official_index] != local_values[local_index]
+        ):
+            return None
+    rolling_dependencies: list[dict[str, Any]] = []
+    for name in dependency_names:
+        official_values = official_period.get(name)
+        local_values = local_period.get(name)
+        if (
+            not isinstance(official_values, list)
+            or not isinstance(local_values, list)
+            or official_index >= len(official_values)
+            or local_index >= len(local_values)
+        ):
+            return None
+        official_value = official_values[official_index]
+        local_value = local_values[local_index]
+        if official_value == local_value:
+            continue
+        if _finite_number(official_value) and local_value is None:
+            rolling_dependencies.append(
+                {
+                    "variable": name,
+                    "official": official_value,
+                    "local": local_value,
+                }
+            )
+            continue
+        return None
+    if not rolling_dependencies:
+        return None
+    official_code = _ec9_public_weather_code(
+        official_period, official_index, official.get("latitude")
+    )
+    local_code = _ec9_public_weather_code(
+        local_period, local_index, local.get("latitude")
+    )
+    official_values = official_period.get("weather_code")
+    local_values = local_period.get("weather_code")
+    if (
+        not isinstance(official_values, list)
+        or not isinstance(local_values, list)
+        or official_code != official_values[official_index]
+        or local_code != local_values[local_index]
+        or official_code == local_code
+    ):
+        return None
+    return {
+        "rolling_nan_dependencies": rolling_dependencies,
+        "recomputed_official": official_code,
+        "recomputed_local": local_code,
+        "matching_required_inputs": list(required_equal_names),
+    }
+
+
+def _ec9_daily_weather_code_rolling_nan_evidence(
+    official: dict[str, Any],
+    local: dict[str, Any],
+    official_daily_index: int,
+    local_daily_index: int,
+) -> dict[str, Any] | None:
+    official_daily = official.get("daily")
+    local_daily = local.get("daily")
+    official_hourly = official.get("hourly")
+    local_hourly = local.get("hourly")
+    if not all(
+        isinstance(item, dict)
+        for item in (official_daily, local_daily, official_hourly, local_hourly)
+    ):
+        return None
+    official_dates = official_daily.get("time")
+    local_dates = local_daily.get("time")
+    official_daily_codes = official_daily.get("weather_code")
+    local_daily_codes = local_daily.get("weather_code")
+    if not all(
+        isinstance(item, list)
+        for item in (
+            official_dates,
+            local_dates,
+            official_daily_codes,
+            local_daily_codes,
+        )
+    ):
+        return None
+    date = official_dates[official_daily_index]
+    if date != local_dates[local_daily_index]:
+        return None
+    official_times = official_hourly.get("time")
+    local_times = local_hourly.get("time")
+    official_codes = official_hourly.get("weather_code")
+    local_codes = local_hourly.get("weather_code")
+    if not all(
+        isinstance(item, list)
+        for item in (official_times, local_times, official_codes, local_codes)
+    ):
+        return None
+    local_index_by_time = {time_value: index for index, time_value in enumerate(local_times)}
+    official_day_indices = [
+        index
+        for index, time_value in enumerate(official_times)
+        if isinstance(time_value, str) and time_value.startswith(f"{date}T")
+    ]
+    if not official_day_indices:
+        return None
+    local_day_indices: list[int] = []
+    causal_hours: list[dict[str, Any]] = []
+    for official_hourly_index in official_day_indices:
+        time_value = official_times[official_hourly_index]
+        local_hourly_index = local_index_by_time.get(time_value)
+        if local_hourly_index is None:
+            return None
+        local_day_indices.append(local_hourly_index)
+        official_code = official_codes[official_hourly_index]
+        local_code = local_codes[local_hourly_index]
+        if official_code == local_code:
+            continue
+        evidence = _ec9_weather_code_rolling_nan_evidence(
+            official, local, official_hourly_index, local_hourly_index
+        )
+        if evidence is None:
+            return None
+        causal_hours.append(
+            {
+                "time": time_value,
+                "official": official_code,
+                "local": local_code,
+                "evidence": evidence,
+            }
+        )
+    if not causal_hours:
+        return None
+    official_finite_codes = [
+        int(official_codes[index])
+        for index in official_day_indices
+        if _finite_number(official_codes[index])
+    ]
+    local_finite_codes = [
+        int(local_codes[index])
+        for index in local_day_indices
+        if _finite_number(local_codes[index])
+    ]
+    if not official_finite_codes or not local_finite_codes:
+        return None
+    official_max = max(official_finite_codes)
+    local_max = max(local_finite_codes)
+    if (
+        official_max != official_daily_codes[official_daily_index]
+        or local_max != local_daily_codes[local_daily_index]
+        or official_max == local_max
+    ):
+        return None
+    return {
+        "aggregation": "maximum_of_hourly_weather_code",
+        "date": date,
+        "recomputed_official": official_max,
+        "recomputed_local": local_max,
+        "causal_hourly_differences": causal_hours,
+    }
 
 
 def first_period_difference(
@@ -1708,6 +2056,56 @@ def first_period_difference(
                             "time": time_value,
                             "official": official_value,
                             "local": local_value,
+                        }
+                    )
+                continue
+            rolling_weather_code_evidence = None
+            if (
+                allow_official_finite_local_nan
+                and period == "hourly"
+                and variable in {"weather_code", "weathercode"}
+            ):
+                rolling_weather_code_evidence = _ec9_weather_code_rolling_nan_evidence(
+                    official, local, index, local_index
+                )
+            if rolling_weather_code_evidence is not None:
+                if accepted_differences is not None:
+                    accepted_differences.append(
+                        {
+                            "period": period,
+                            "variable": variable,
+                            "reason": "official_weather_code_derived_from_rolling_value_over_local_nan",
+                            "index": index,
+                            "time": time_value,
+                            "official": official_value,
+                            "local": local_value,
+                            "evidence": rolling_weather_code_evidence,
+                        }
+                    )
+                continue
+            rolling_daily_weather_code_evidence = None
+            if (
+                allow_official_finite_local_nan
+                and period == "daily"
+                and variable in {"weather_code", "weathercode"}
+            ):
+                rolling_daily_weather_code_evidence = (
+                    _ec9_daily_weather_code_rolling_nan_evidence(
+                        official, local, index, local_index
+                    )
+                )
+            if rolling_daily_weather_code_evidence is not None:
+                if accepted_differences is not None:
+                    accepted_differences.append(
+                        {
+                            "period": period,
+                            "variable": variable,
+                            "reason": "official_daily_weather_code_derived_from_rolling_value_over_local_nan",
+                            "index": index,
+                            "time": time_value,
+                            "official": official_value,
+                            "local": local_value,
+                            "evidence": rolling_daily_weather_code_evidence,
                         }
                     )
                 continue
@@ -2025,8 +2423,12 @@ def validate_model(
         "accepted_official_rolling_values_over_local_nan": 0,
         "accepted_difference_policy": {
             "models": ["ec9"],
-            "period": "hourly",
-            "condition": "official finite JSON number and local null",
+            "period": "hourly plus causally derived hourly/daily weather_code",
+            "conditions": [
+                "official finite JSON number and local null",
+                "weather_code recomputes to both observed values using otherwise equal public inputs",
+                "daily weather_code is the proven maximum of those hourly codes",
+            ],
             "reason": "official rolling OM retains an older finite forecast value when newer runs are NaN",
             "recording": "per-point immutable receipt and per-request response metadata",
         },
@@ -2272,8 +2674,8 @@ def validate_model(
                     accepted_differences=period_accepted,
                 )
                 for accepted in period_accepted:
-                    accepted["classification"] = (
-                        "accepted_official_rolling_value_over_local_nan"
+                    accepted["classification"] = accepted["reason"].replace(
+                        "official_", "accepted_official_", 1
                     )
                     accepted["point"] = point
                     accepted["local_model_run"] = local.get("model_run")
