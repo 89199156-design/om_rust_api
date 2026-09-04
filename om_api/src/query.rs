@@ -2369,6 +2369,27 @@ fn read_daily_series_uncached(
             snapshot, decoder, times, latitude, longitude,
         );
     }
+    if current_weather_model() == WeatherModel::EcmwfIfs9km && is_ec9_native_daily_series(variable)
+    {
+        let decoder = decoder.context("official OM decoder is required for EC9 RegionPack data")?;
+        return read_direct_grid_series(
+            snapshot,
+            decoder,
+            variable,
+            times,
+            &[latitude],
+            &[longitude],
+            false,
+        )?
+        .into_iter()
+        .map(|mut frame| {
+            if frame.len() != 1 {
+                bail!("daily EC9 point decode returned {} values", frame.len());
+            }
+            Ok(frame.remove(0))
+        })
+        .collect();
+    }
     if let Some(decoder) = decoder {
         // Use the same retained-run selection as the hourly point endpoint.
         // In particular, GFS hours before the latest complete run must prefer
@@ -2385,6 +2406,33 @@ fn read_daily_series_uncached(
         .iter()
         .map(|time| read_daily_hour(snapshot, decoder, variable, *time, latitude, longitude))
         .collect()
+}
+
+fn is_ec9_native_daily_series(variable: &str) -> bool {
+    matches!(
+        variable,
+        "temperature_2m"
+            | "precipitation"
+            | "showers"
+            | "snowfall_water_equivalent"
+            | "shortwave_radiation"
+            | "wind_gusts_10m"
+            | "visibility"
+            | "pressure_msl"
+            | "cape"
+            | "cloud_cover"
+            | "dew_point_2m"
+            | "relative_humidity_2m"
+            | "soil_moisture_0_to_7cm"
+            | "soil_moisture_7_to_28cm"
+            | "soil_moisture_28_to_100cm"
+            | "soil_moisture_100_to_255cm"
+            | "soil_temperature_0_to_7cm"
+            | "soil_temperature_7_to_28cm"
+            | "soil_temperature_28_to_100cm"
+            | "soil_temperature_100_to_255cm"
+            | "snow_depth"
+    )
 }
 
 fn read_daily_hour(
@@ -12501,6 +12549,7 @@ mod tests {
             )
         })
         .unwrap();
+        assert_eq!(selected_latitude.to_bits(), 13.647_903_f32.to_bits());
 
         let calculate = |latitude| {
             weather_code(
@@ -13403,7 +13452,11 @@ fn read_weather_code_grid_series(
     let cape = read_optional_direct_grid_series_unrounded(
         snapshot, decoder, "cape", times, latitudes, longitudes,
     )?;
-    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    // Open-Meteo's ECMWF readers intentionally pass nil for gusts, lifted
+    // index, visibility and categorical freezing rain when deriving WMO
+    // codes. ECPDS EC9 still supplies showers, CAPE, CIN and PBL height.
+    let ecmwf = current_weather_model().is_ecmwf();
+    let ecmwf_ifs025 = current_weather_model() == WeatherModel::EcmwfIfs025;
     let gusts = if ecmwf {
         None
     } else {
@@ -13452,7 +13505,7 @@ fn read_weather_code_grid_series(
             longitudes,
         )?
     };
-    let cin = if ecmwf {
+    let cin = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct_grid_series_unrounded(
@@ -13464,7 +13517,7 @@ fn read_weather_code_grid_series(
             longitudes,
         )?
     };
-    let pbl = if ecmwf {
+    let pbl = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct_grid_series_unrounded(
@@ -13612,7 +13665,8 @@ fn read_weather_code_grid(
     };
     let cape =
         read_optional_direct_grid_rounded(snapshot, decoder, "cape", time, latitudes, longitudes)?;
-    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    let ecmwf = current_weather_model().is_ecmwf();
+    let ecmwf_ifs025 = current_weather_model() == WeatherModel::EcmwfIfs025;
     let gusts = if ecmwf {
         None
     } else {
@@ -13661,7 +13715,7 @@ fn read_weather_code_grid(
             longitudes,
         )?
     };
-    let cin = if ecmwf {
+    let cin = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct_grid_rounded(
@@ -13673,7 +13727,7 @@ fn read_weather_code_grid(
             longitudes,
         )?
     };
-    let pbl = if ecmwf {
+    let pbl = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct_grid_rounded(
@@ -13781,7 +13835,8 @@ fn read_weather_code(
         )?)
     };
     let cape = read_optional_direct(snapshot, decoder, "cape", time, latitude, longitude)?;
-    let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
+    let ecmwf = current_weather_model().is_ecmwf();
+    let ecmwf_ifs025 = current_weather_model() == WeatherModel::EcmwfIfs025;
     let gusts = if ecmwf {
         None
     } else {
@@ -13816,7 +13871,7 @@ fn read_weather_code(
     } else {
         read_optional_direct(snapshot, decoder, "lifted_index", time, latitude, longitude)?
     };
-    let cin = if ecmwf {
+    let cin = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct(
@@ -13828,7 +13883,7 @@ fn read_weather_code(
             longitude,
         )?
     };
-    let pbl = if ecmwf {
+    let pbl = if ecmwf_ifs025 {
         None
     } else {
         read_optional_direct(
