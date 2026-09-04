@@ -2850,14 +2850,19 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let relative_humidity = read_direct(
-                snapshot,
-                decoder,
-                "relative_humidity_2m",
-                time,
-                latitude,
-                longitude,
-            )?;
+            let dewpoint = if current_weather_model() == WeatherModel::EcmwfIfs9km {
+                read_direct(snapshot, decoder, "dew_point_2m", time, latitude, longitude)?
+            } else {
+                let relative_humidity = read_direct(
+                    snapshot,
+                    decoder,
+                    "relative_humidity_2m",
+                    time,
+                    latitude,
+                    longitude,
+                )?;
+                dew_point(temperature, relative_humidity)
+            };
             let shortwave_radiation = read_direct(
                 snapshot,
                 decoder,
@@ -2884,9 +2889,13 @@ pub fn read_variable_value(
             return Ok(et0_evapotranspiration(
                 temperature,
                 wind_speed,
-                dew_point(temperature, relative_humidity),
+                dewpoint,
                 shortwave_radiation,
-                sampling.target_elevation,
+                if current_weather_model() == WeatherModel::EcmwfIfs9km {
+                    sampling.model_elevation
+                } else {
+                    sampling.target_elevation
+                },
                 extraterrestrial,
                 3600,
             ));
@@ -4391,15 +4400,39 @@ pub fn read_variable_grid_series(
                 longitudes,
                 false,
             )?;
-            let humidity = read_direct_grid_series(
-                snapshot,
-                decoder,
-                "relative_humidity_2m",
-                times,
-                latitudes,
-                longitudes,
-                false,
-            )?;
+            let dewpoint = if current_weather_model() == WeatherModel::EcmwfIfs9km {
+                read_direct_grid_series(
+                    snapshot,
+                    decoder,
+                    "dew_point_2m",
+                    times,
+                    latitudes,
+                    longitudes,
+                    false,
+                )?
+            } else {
+                let humidity = read_direct_grid_series(
+                    snapshot,
+                    decoder,
+                    "relative_humidity_2m",
+                    times,
+                    latitudes,
+                    longitudes,
+                    false,
+                )?;
+                temperature
+                    .iter()
+                    .zip(humidity)
+                    .map(|(temperature, humidity)| {
+                        temperature
+                            .iter()
+                            .copied()
+                            .zip(humidity)
+                            .map(|(temperature, humidity)| dew_point(temperature, humidity))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
             let shortwave = read_direct_grid_series(
                 snapshot,
                 decoder,
@@ -4420,31 +4453,38 @@ pub fn read_variable_grid_series(
             let elevation = if let Some(sampling) =
                 current_product_sampling(current_weather_model().primary_product())
             {
-                vec![sampling.target_elevation; latitudes.len() * longitudes.len()]
+                vec![
+                    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+                        sampling.model_elevation
+                    } else {
+                        sampling.target_elevation
+                    };
+                    latitudes.len() * longitudes.len()
+                ]
             } else {
                 read_weather_surface_elevation_grid(snapshot, decoder, latitudes, longitudes)?
             };
             let width = longitudes.len();
             Ok(temperature
                 .into_iter()
-                .zip(humidity)
+                .zip(dewpoint)
                 .zip(shortwave)
                 .zip(wind)
                 .zip(times)
-                .map(|((((temperature, humidity), shortwave), wind), time)| {
+                .map(|((((temperature, dewpoint), shortwave), wind), time)| {
                     temperature
                         .into_iter()
-                        .zip(humidity)
+                        .zip(dewpoint)
                         .zip(shortwave)
                         .zip(wind)
                         .zip(elevation.iter().copied())
                         .enumerate()
                         .map(
-                            |(index, ((((temperature, humidity), shortwave), wind), elevation))| {
+                            |(index, ((((temperature, dewpoint), shortwave), wind), elevation))| {
                                 et0_evapotranspiration(
                                     temperature,
                                     wind,
-                                    dew_point(temperature, humidity),
+                                    dewpoint,
                                     shortwave,
                                     elevation,
                                     extra_terrestrial_radiation_backwards(
