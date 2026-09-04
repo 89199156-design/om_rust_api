@@ -6304,16 +6304,16 @@ fn read_direct_grid_series_uncached(
                 }
             }
         }
+        for frame in &mut values {
+            for value in frame {
+                *value = apply_elevation_correction("ecmwf_ifs9km", variable, *value);
+            }
+        }
         if round_values {
             for frame in &mut values {
                 for value in frame {
                     *value = round_variable_output_value(variable, *value);
                 }
-            }
-        }
-        for frame in &mut values {
-            for value in frame {
-                *value = apply_elevation_correction("ecmwf_ifs9km", variable, *value);
             }
         }
         return Ok(values);
@@ -12085,6 +12085,36 @@ mod tests {
         assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.lut_offset, 2_461_191);
         assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.lut_size, 21_156);
         assert_eq!(ECMWF_IFS9KM_STATIC_SPEC.file_size, 2_482_560);
+    }
+
+    #[test]
+    fn ec9_temperature_is_elevation_corrected_before_public_rounding() {
+        let sampling = RequestSampling {
+            gfs013: None,
+            gfs025: None,
+            gefs025: None,
+            gefs05: None,
+            ecmwf025: None,
+            ecmwf025_ensemble: None,
+            ecmwf9km: Some(ModelSampling {
+                latitude: 43.97187805175781,
+                longitude: 77.9817886352539,
+                model_elevation: 1168.0,
+                target_elevation: 1461.0,
+            }),
+            response_elevation: 1461.0,
+        };
+        let corrected = with_weather_model(WeatherModel::EcmwfIfs9km, || {
+            with_request_sampling(sampling, || {
+                Ok(round_variable_output_value(
+                    "temperature_2m",
+                    apply_elevation_correction("ecmwf_ifs9km", "temperature_2m", 14.55),
+                ))
+            })
+        })
+        .unwrap();
+
+        assert_eq!(corrected, 12.6);
     }
 
     #[test]
