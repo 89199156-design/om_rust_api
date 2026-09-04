@@ -2180,6 +2180,16 @@ fn daily_weather_value(
     latitude: f64,
     longitude: f64,
 ) -> Result<f32> {
+    // GenericDailyCalculator operates on the already-selected model reader,
+    // whose modelLat/modelLon are the actual nearest/land/sea grid cell.  The
+    // hourly path does the same through request sampling.  Daily EC9 used to
+    // pass the user's off-grid coordinate into solar temporal interpolation,
+    // which could cross a 0.01 MJ/m² rounding boundary even though every
+    // published hourly value matched.  Keep every daily seed series on the
+    // same selected model coordinate as the hourly response.
+    let (model_latitude, model_longitude) = daily_model_coordinates(latitude, longitude);
+    let model_latitude_f64 = f64::from(model_latitude);
+    let model_longitude_f64 = f64::from(model_longitude);
     let local_start = date
         .and_hms_opt(0, 0, 0)
         .context("invalid daily local start")?;
@@ -2203,8 +2213,7 @@ fn daily_weather_value(
 
     if matches!(aggregation, DailyWeatherAggregation::DaylightDuration) {
         let display_midnight = start + Duration::seconds(timezone.offset.local_minus_utc() as i64);
-        let (latitude, _) = daily_model_coordinates(latitude, longitude);
-        return Ok(daylight_duration(display_midnight, latitude));
+        return Ok(daylight_duration(display_midnight, model_latitude));
     }
 
     if let DailyWeatherAggregation::DominantWindDirection {
@@ -2217,10 +2226,22 @@ fn daily_weather_value(
             1
         };
         let times = daily_sample_times(start, end, step_hours);
-        let speed_values =
-            read_daily_series(snapshot, decoder, speed, &times, latitude, longitude)?;
-        let direction_values =
-            read_daily_series(snapshot, decoder, direction, &times, latitude, longitude)?;
+        let speed_values = read_daily_series(
+            snapshot,
+            decoder,
+            speed,
+            &times,
+            model_latitude_f64,
+            model_longitude_f64,
+        )?;
+        let direction_values = read_daily_series(
+            snapshot,
+            decoder,
+            direction,
+            &times,
+            model_latitude_f64,
+            model_longitude_f64,
+        )?;
         if speed_values
             .iter()
             .chain(&direction_values)
@@ -2245,7 +2266,14 @@ fn daily_weather_value(
         1
     };
     let times = daily_sample_times(start, end, step_hours);
-    let values = read_daily_series(snapshot, decoder, source, &times, latitude, longitude)?;
+    let values = read_daily_series(
+        snapshot,
+        decoder,
+        source,
+        &times,
+        model_latitude_f64,
+        model_longitude_f64,
+    )?;
 
     Ok(aggregate_daily_weather_values(
         aggregation,
@@ -12206,6 +12234,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(corrected, 12.6);
+    }
+
+    #[test]
+    fn ec9_daily_aggregation_uses_the_selected_model_coordinate() {
+        // Regression for fixed EC9 p070 (2026-09-16): the request coordinate
+        // 18.1094/138.0504 selects 18.1019325/138.0233765.  Feeding the
+        // request coordinate into solar interpolation produced 15.19 MJ/m²,
+        // while Open-Meteo's selected-reader coordinate produces 15.20.
+        let sampling = RequestSampling {
+            gfs013: None,
+            gfs025: None,
+            gefs025: None,
+            gefs05: None,
+            ecmwf025: None,
+            ecmwf025_ensemble: None,
+            ecmwf9km: Some(ModelSampling {
+                latitude: 18.101_932_525_634_766,
+                longitude: 138.023_376_464_843_75,
+                model_elevation: 0.0,
+                target_elevation: 0.0,
+            }),
+            response_elevation: 0.0,
+        };
+
+        let coordinates = with_weather_model(WeatherModel::EcmwfIfs9km, || {
+            with_request_sampling(sampling, || Ok(daily_model_coordinates(18.1094, 138.0504)))
+        })
+        .unwrap();
+
+        assert_eq!(
+            coordinates.0.to_bits(),
+            18.101_932_525_634_766_f32.to_bits()
+        );
+        assert_eq!(
+            coordinates.1.to_bits(),
+            138.023_376_464_843_75_f32.to_bits()
+        );
     }
 
     #[test]
