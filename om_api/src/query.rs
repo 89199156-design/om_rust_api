@@ -303,6 +303,12 @@ fn derives_diffuse_radiation(model: WeatherModel) -> bool {
     model == WeatherModel::EcmwfIfs025
 }
 
+fn ecmwf_ifs9km_diffuse_radiation(shortwave: f32, direct: f32) -> f32 {
+    // Match EcmwfEcpdsReader: the public API exposes the arithmetic difference
+    // even when independent quantisation makes direct slightly larger.
+    shortwave - direct
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GridSelectionMode {
     Land,
@@ -3152,7 +3158,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            return Ok((shortwave - direct).max(0.0));
+            return Ok(ecmwf_ifs9km_diffuse_radiation(shortwave, direct));
         }
         "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
             let shortwave = read_direct(
@@ -4161,7 +4167,7 @@ pub fn read_variable_grid_series(
                     longitudes,
                     false,
                 )?,
-                |shortwave, direct| (shortwave - direct).max(0.0),
+                ecmwf_ifs9km_diffuse_radiation,
             ))
         }
         "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
@@ -15069,6 +15075,11 @@ mod output_tests {
         assert!(!derives_diffuse_radiation(WeatherModel::Gfs));
         assert!(derives_diffuse_radiation(WeatherModel::EcmwfIfs025));
         assert!(!derives_diffuse_radiation(WeatherModel::EcmwfIfs9km));
+    }
+
+    #[test]
+    fn ecmwf_ifs9km_diffuse_radiation_preserves_official_negative_difference() {
+        assert_eq!(ecmwf_ifs9km_diffuse_radiation(0.0, 3.0), -3.0);
     }
 
     #[test]

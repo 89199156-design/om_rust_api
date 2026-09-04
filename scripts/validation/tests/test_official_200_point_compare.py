@@ -648,6 +648,94 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(difference["reason"], "json_value")
         self.assertEqual(difference["time"], "2026-08-10")
 
+    def test_hourly_comparison_can_record_official_rolling_value_over_local_nan(
+        self,
+    ) -> None:
+        official = {
+            "hourly": {
+                "time": ["2026-09-04T02:00", "2026-09-04T03:00"],
+                "convective_inhibition": [29, 11],
+            }
+        }
+        local = {
+            "hourly": {
+                "time": ["2026-09-04T02:00", "2026-09-04T03:00"],
+                "convective_inhibition": [29, None],
+            }
+        }
+        accepted: list[dict[str, object]] = []
+
+        difference, hourly_count, daily_count = compare.first_period_difference(
+            "hourly",
+            ("convective_inhibition",),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+            accepted_differences=accepted,
+        )
+
+        self.assertIsNone(difference)
+        self.assertEqual(hourly_count, 2)
+        self.assertEqual(daily_count, 0)
+        self.assertEqual(
+            accepted,
+            [
+                {
+                    "period": "hourly",
+                    "variable": "convective_inhibition",
+                    "reason": "official_rolling_value_over_local_nan",
+                    "index": 1,
+                    "time": "2026-09-04T03:00",
+                    "official": 11,
+                    "local": None,
+                }
+            ],
+        )
+
+    def test_hourly_rolling_nan_policy_does_not_accept_other_differences(self) -> None:
+        official = {
+            "hourly": {
+                "time": ["2026-09-04T03:00"],
+                "convective_inhibition": [11],
+            }
+        }
+        local_numeric = {
+            "hourly": {
+                "time": ["2026-09-04T03:00"],
+                "convective_inhibition": [12],
+            }
+        }
+        local_finite_over_official_nan = {
+            "hourly": {
+                "time": ["2026-09-04T03:00"],
+                "convective_inhibition": [11],
+            }
+        }
+        official_nan = {
+            "hourly": {
+                "time": ["2026-09-04T03:00"],
+                "convective_inhibition": [None],
+            }
+        }
+
+        numeric_difference, _, _ = compare.first_period_difference(
+            "hourly",
+            ("convective_inhibition",),
+            official,
+            local_numeric,
+            allow_official_finite_local_nan=True,
+        )
+        reverse_difference, _, _ = compare.first_period_difference(
+            "hourly",
+            ("convective_inhibition",),
+            official_nan,
+            local_finite_over_official_nan,
+            allow_official_finite_local_nan=True,
+        )
+
+        self.assertEqual(numeric_difference["reason"], "json_value")
+        self.assertEqual(reverse_difference["reason"], "json_value")
+
     def test_validate_model_checkpoints_progress_and_throttles(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
         compare.MODEL_SPECS["gfs"] = {

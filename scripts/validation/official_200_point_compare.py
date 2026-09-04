@@ -1557,6 +1557,9 @@ def first_period_difference(
     variables: tuple[str, ...],
     official: dict[str, Any],
     local: dict[str, Any],
+    *,
+    allow_official_finite_local_nan: bool = False,
+    accepted_differences: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, int, int]:
     hourly_count = 0
     daily_count = 0
@@ -1677,27 +1680,46 @@ def first_period_difference(
                 hourly_count,
                 daily_count,
             )
-        index = next(
-            (
-                official_index
-                for official_index in comparable_indices
-                for time_value in (official_times[official_index],)
-                if official_values[official_index]
-                != local_values[local_index_by_time[time_value]]
-            ),
-            None,
-        )
-        if index is not None:
-            local_index = local_index_by_time[official_times[index]]
+        for index in comparable_indices:
+            time_value = official_times[index]
+            local_index = local_index_by_time[time_value]
+            official_value = official_values[index]
+            local_value = local_values[local_index]
+            if official_value == local_value:
+                continue
+            official_is_finite_number = (
+                isinstance(official_value, (int, float))
+                and not isinstance(official_value, bool)
+                and math.isfinite(float(official_value))
+            )
+            if (
+                allow_official_finite_local_nan
+                and period == "hourly"
+                and official_is_finite_number
+                and local_value is None
+            ):
+                if accepted_differences is not None:
+                    accepted_differences.append(
+                        {
+                            "period": period,
+                            "variable": variable,
+                            "reason": "official_rolling_value_over_local_nan",
+                            "index": index,
+                            "time": time_value,
+                            "official": official_value,
+                            "local": local_value,
+                        }
+                    )
+                continue
             return (
                 {
                     "period": period,
                     "variable": variable,
                     "reason": "json_value",
                     "index": index,
-                    "time": official_times[index],
-                    "official": official_values[index],
-                    "local": local_values[local_index],
+                    "time": time_value,
+                    "official": official_value,
+                    "local": local_value,
                 },
                 hourly_count,
                 daily_count,
@@ -2000,6 +2022,14 @@ def validate_model(
         "daily_values_compared": 0,
         "hourly_values_exempted_after_raw_model_end": 0,
         "daily_values_exempted_on_final_day": 0,
+        "accepted_official_rolling_values_over_local_nan": 0,
+        "accepted_difference_policy": {
+            "models": ["ec9"],
+            "period": "hourly",
+            "condition": "official finite JSON number and local null",
+            "reason": "official rolling OM retains an older finite forecast value when newer runs are NaN",
+            "recording": "per-point immutable receipt and per-request response metadata",
+        },
         "comparison": "strict_common_raw_model_axis_official_json_values",
         "time_scope_policy": {
             "hourly": "ignore_only_consecutive_official_tail_after_local_raw_model_end",
@@ -2021,6 +2051,7 @@ def validate_model(
         "current_point_daily_values_compared": 0,
         "current_point_hourly_values_exempted_after_raw_model_end": 0,
         "current_point_daily_values_exempted_on_final_day": 0,
+        "current_point_accepted_official_rolling_values_over_local_nan": 0,
         "attempt_id": attempt_id,
         "point_delay_seconds": point_delay_seconds,
         "request_delay_seconds": request_delay_seconds,
@@ -2073,6 +2104,9 @@ def validate_model(
             report["daily_values_exempted_on_final_day"] += receipt.get(
                 "daily_values_exempted_on_final_day", 0
             )
+            report["accepted_official_rolling_values_over_local_nan"] += receipt.get(
+                "accepted_official_rolling_values_over_local_nan", 0
+            )
             request_units_completed += len(plan)
             update_progress_estimate(
                 report,
@@ -2087,6 +2121,9 @@ def validate_model(
         report["current_point_daily_values_compared"] = 0
         report["current_point_hourly_values_exempted_after_raw_model_end"] = 0
         report["current_point_daily_values_exempted_on_final_day"] = 0
+        report[
+            "current_point_accepted_official_rolling_values_over_local_nan"
+        ] = 0
         write_json(report_path, report)
         print(
             json.dumps(
@@ -2105,6 +2142,7 @@ def validate_model(
         daily_count = 0
         hourly_exempted = 0
         daily_exempted = 0
+        accepted_rolling_nan: list[dict[str, Any]] = []
         local_elapsed_seconds = 0.0
         response_parts: list[dict[str, Any]] = []
         for request_index, request_part in enumerate(plan):
@@ -2222,10 +2260,26 @@ def validate_model(
             local = normalize_rows(json.loads(raw), 1)[0]
             difference = None
             part_comparison: dict[str, Any] = {}
+            request_accepted: list[dict[str, Any]] = []
             for period, variables in periods:
+                period_accepted: list[dict[str, Any]] = []
                 difference, hourly_part, daily_part = first_period_difference(
-                    period, variables, official, local
+                    period,
+                    variables,
+                    official,
+                    local,
+                    allow_official_finite_local_nan=model == "ec9",
+                    accepted_differences=period_accepted,
                 )
+                for accepted in period_accepted:
+                    accepted["classification"] = (
+                        "accepted_official_rolling_value_over_local_nan"
+                    )
+                    accepted["point"] = point
+                    accepted["local_model_run"] = local.get("model_run")
+                    accepted["request_index"] = request_index
+                accepted_rolling_nan.extend(period_accepted)
+                request_accepted.extend(period_accepted)
                 hourly_count += hourly_part
                 daily_count += daily_part
                 if difference is None:
@@ -2236,6 +2290,9 @@ def validate_model(
                     part_comparison[period] = {
                         "values_compared": compared,
                         "values_exempted": exempted,
+                        "accepted_official_rolling_values_over_local_nan": len(
+                            period_accepted
+                        ),
                     }
                     if period == "hourly":
                         hourly_exempted += exempted
@@ -2251,6 +2308,9 @@ def validate_model(
             report["current_point_daily_values_exempted_on_final_day"] = (
                 daily_exempted
             )
+            report[
+                "current_point_accepted_official_rolling_values_over_local_nan"
+            ] = len(accepted_rolling_nan)
             local_elapsed_seconds += elapsed
             part_metadata = {
                 "index": request_index,
@@ -2264,6 +2324,7 @@ def validate_model(
                 "local_response_headers": headers,
                 "resources_before_request": resource_snapshot,
                 "comparison": part_comparison,
+                "accepted_differences": request_accepted,
             }
             response_parts.append(part_metadata)
             report["local_requests_completed"] += 1
@@ -2334,6 +2395,10 @@ def validate_model(
             "daily_values_compared": daily_count,
             "hourly_values_exempted_after_raw_model_end": hourly_exempted,
             "daily_values_exempted_on_final_day": daily_exempted,
+            "accepted_official_rolling_values_over_local_nan": len(
+                accepted_rolling_nan
+            ),
+            "accepted_differences": accepted_rolling_nan,
             "status": "passed",
         }
         write_once(receipt_path, pretty_bytes(receipt))
@@ -2342,12 +2407,18 @@ def validate_model(
         report["daily_values_compared"] += daily_count
         report["hourly_values_exempted_after_raw_model_end"] += hourly_exempted
         report["daily_values_exempted_on_final_day"] += daily_exempted
+        report["accepted_official_rolling_values_over_local_nan"] += len(
+            accepted_rolling_nan
+        )
         report["current_point"] = None
         report["current_request"] = None
         report["current_point_hourly_values_compared"] = 0
         report["current_point_daily_values_compared"] = 0
         report["current_point_hourly_values_exempted_after_raw_model_end"] = 0
         report["current_point_daily_values_exempted_on_final_day"] = 0
+        report[
+            "current_point_accepted_official_rolling_values_over_local_nan"
+        ] = 0
         write_json(report_path, report)
         print(
             json.dumps(
