@@ -1,12 +1,12 @@
-# GFS / ECMWF / CAMS 官方 API 300 点验证
+# GFS / ECMWF 0.25° / ECMWF 9 km / CAMS 官方 API 200 点验证
 
 入口：`scripts/validation/official_200_point_compare.py`
 
-验证器使用固定随机种子生成可复现的 300 个随机点：
+验证器使用固定随机种子生成可复现的 200 个随机点：
 
-- 100 个随机共同原生网格点；
-- 100 个随机网格邻近非网格点；
-- 100 个区域内均匀随机非网格点。
+- 70 个随机原生网格点（ECMWF 9 km 使用其 O1280 reduced Gaussian 网格，其余模型使用共同规则网格）；
+- 70 个随机网格邻近非网格点；
+- 60 个区域内均匀随机非网格点。
 
 所有请求使用 `cell_selection=nearest`，以明确覆盖精确网格读取与非网格点选择。GFS
 和 ECMWF 会直接比较双方共同支持的全部地面小时变量与全部官方日聚合变量，其中包括
@@ -26,17 +26,17 @@ CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQ
 
 ```bash
 python scripts/validation/official_200_point_compare.py capture \
-  --output D:/Projects/weather_validation_artifacts/official-300/<批次标识>
+  --output D:/Projects/weather_validation_artifacts/official-200/<批次标识>
 ```
 
-每个模型按 100 个坐标一组，仅发出 3 次多点 POST；每次请求同时包含完整小时字段
+每个模型按 100 个坐标一组，仅发出 2 次多点 POST；每次请求同时包含完整小时字段
 和完整日聚合字段。成功后每批原始响应、无密钥请求体、合并响应和对应 SHA-256
 元数据会被不可变地保存在 `<输出目录>/<模型>/official/`。后续修复和复验必须使用
 `validate`，不得删除或重新抓取官方快照：
 
 ```bash
 python scripts/validation/official_200_point_compare.py validate \
-  --official-snapshot-root D:/Projects/weather_validation_artifacts/official-300/<批次标识> \
+  --official-snapshot-root D:/Projects/weather_validation_artifacts/official-200/<批次标识> \
   --output D:/Projects/weather_validation_artifacts/singapore/<批次标识> \
   --local-base http://127.0.0.1:8088 \
   --local-ssh-host singapore
@@ -64,14 +64,13 @@ python scripts/validation/official_200_point_compare.py validate \
 报告分别统计实际比较值与因上述规则豁免的值，二者不得混计。
 
 可先加 `--point-limit 1` 对当前生产 API 做冒烟测试；报告状态会是 `partial`，不会被
-误报为 300 点通过。正式一致性验证必须直接访问生产 API，并使用默认的 300 点。
+误报为 200 点通过。正式一致性验证必须直接访问生产 API，并使用默认的 200 点。
 
 ## 生产批次冻结
 
 数据批次与官方 API 对齐后，只通过 1Panel 面板停用当前生产探测任务
-`weather_gfs_probe_cycle`、`weather_ecmwf_probe_cycle` 和
-`weather_cams_ecpds_probe_cycle`，并在面板确认没有任务正在执行。不得通过命令修改
-1Panel 配置、创建配置备份或用批次锁文件冻结生产现场。
+`weather_gfs_probe_cycle`、`weather_ecmwf_probe_cycle`、
+`weather_ecmwf_ifs9km_probe_cycle` 和 `weather_cams_ecpds_probe_cycle`，并确认没有任务正在执行。
 
 若差异来自 API 计算，部署修正后的同一 Git 修订后复验。若差异来自下载或数据处理，
 必须先校验并复用服务器已保留的目标批次；只有文件缺失、校验失败或覆盖范围不完整时

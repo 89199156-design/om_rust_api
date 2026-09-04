@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Snapshot once, then compare 300 points against the official APIs.
+"""Snapshot once, then compare 200 points against the official APIs.
 
 The official response for each model is captured by bounded multi-location POSTs.
 Validation then requests the local API one point at a time and stops at the
@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import random
 import shlex
+import struct
 import subprocess
 import sys
 import time
@@ -48,10 +49,10 @@ except ImportError:
     from ecmwf_variable_catalog import HOURLY_VARIABLES as ECMWF_HOURLY
 
 
-SCHEMA_VERSION = 2
-POINT_COUNT = 300
+SCHEMA_VERSION = 3
+POINT_COUNT = 200
 OFFICIAL_BATCH_SIZE = 100
-USER_AGENT = "om-weather-server-official-300-point-validation/1.0"
+USER_AGENT = "om-weather-server-official-200-point-validation/1.0"
 # A single-point response with every public surface field is small, while each
 # HTTP round trip makes the API repeat model lookup and time-axis work.  Keep
 # hourly and daily requests separate, but normally fit each period into one
@@ -125,6 +126,38 @@ GFS_SURFACE = (
 )
 GFS_HOURLY = GFS_SURFACE
 ECMWF_SURFACE_HOURLY = tuple(variable for variable in ECMWF_HOURLY if "hPa" not in variable)
+EC9_HOURLY = tuple(
+    variable
+    for variable in ECMWF_SURFACE_HOURLY
+    if variable
+    not in {
+        "precipitation_probability",
+        "precipitation_type",
+        "runoff",
+        "snow_depth_water_equivalent",
+    }
+) + (
+    "showers",
+    "convective_inhibition",
+    "boundary_layer_height",
+    "visibility",
+    "wind_speed_200m",
+    "wind_direction_200m",
+)
+EC9_DAILY = tuple(
+    variable
+    for variable in ECMWF_DAILY
+    if not variable.startswith("precipitation_probability_")
+) + (
+    "showers_sum",
+    "visibility_max",
+    "visibility_min",
+    "visibility_mean",
+    "wind_direction_200m_dominant",
+    "wind_speed_200m_max",
+    "wind_speed_200m_mean",
+    "wind_speed_200m_min",
+)
 GFS_DAILY = (
     "temperature_2m_max",
     "temperature_2m_min",
@@ -226,6 +259,16 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": ECMWF_SURFACE_HOURLY,
         "local_hourly": ECMWF_SURFACE_HOURLY,
         "daily": tuple(ECMWF_DAILY),
+    },
+    "ec9": {
+        "public_endpoint": "https://api.open-meteo.com/v1/ecmwf",
+        "customer_endpoint": "https://customer-api.open-meteo.com/v1/ecmwf",
+        "local_path": "/v1/ecmwf-ifs9km",
+        "model_parameter": ("models", ["ecmwf_ifs"]),
+        "forecast_days": 15,
+        "official_hourly": EC9_HOURLY,
+        "local_hourly": EC9_HOURLY,
+        "daily": EC9_DAILY,
     },
     "cams": {
         "public_endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
@@ -465,7 +508,7 @@ def wait_for_safe_local_resources(
 
 @contextlib.contextmanager
 def validation_lock(output: Path):
-    lock_path = output / ".official-300-validation.lock"
+    lock_path = output / ".official-200-validation.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     fcntl_module = None
@@ -635,17 +678,18 @@ def write_json(path: Path, value: Any, *, immutable: bool = False) -> None:
 def validation_manifest(models: list[str]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_300_point_validation_manifest",
+        "type": "official_200_point_validation_manifest",
         "models": models,
         "point_count_per_model": POINT_COUNT,
         "random_seed": 20260729,
         "sampling_cohorts": {
-            "random_exact_common_native_grid": 100,
-            "random_offgrid_near_native_grid": 100,
-            "random_offgrid_uniform_crop": 100,
+            "random_exact_common_native_grid": 70,
+            "random_offgrid_near_native_grid": 70,
+            "random_offgrid_uniform_crop": 60,
         },
         "cell_selection": "nearest",
         "points": sample_points(),
+        "points_by_model": {model: sample_points(model=model) for model in models},
         "official_capture_policy": "bounded_multi_location_posts_per_model_then_immutable_reuse",
         "first_difference_stops": True,
         "gfs_precipitation_probability_daily": [
@@ -693,7 +737,52 @@ def ensure_validation_manifest(path: Path, requested_models: list[str]) -> None:
     write_once(path, pretty_bytes(validation_manifest(existing_models)))
 
 
-def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
+def _f32(value: float) -> float:
+    return struct.unpack("!f", struct.pack("!f", value))[0]
+
+
+def _ec9_o1280_nearest_coordinate(latitude: float, longitude: float) -> tuple[float, float]:
+    """Match Open-Meteo GaussianGrid f32 nearest-cell coordinates."""
+    latitude_f32 = _f32(latitude)
+    longitude_f32 = _f32(longitude % 360.0)
+    latitude_lines = _f32(1280.0)
+    dy = _f32(_f32(180.0) / _f32(_f32(2.0 * latitude_lines) + _f32(0.5)))
+    y_expression = _f32(
+        _f32(latitude_lines - _f32(1.0))
+        - _f32(_f32(latitude_f32 - _f32(dy / _f32(2.0))) / dy)
+    )
+    y = max(0, min(2558, int(y_expression)))
+    upper = y + 1
+
+    def row_point_count(row: int) -> int:
+        return 20 + 4 * min(row, 2559 - row)
+
+    def candidate(row: int) -> tuple[float, float, float]:
+        points = row_point_count(row)
+        dx = _f32(_f32(360.0) / _f32(float(points)))
+        unwrapped = round(_f32(longitude_f32 / dx))
+        point_latitude = _f32(
+            _f32(_f32(latitude_lines - _f32(float(row))) - _f32(1.0)) * dy
+            + _f32(dy / _f32(2.0))
+        )
+        point_longitude = _f32(_f32(float(unwrapped)) * dx)
+        distance = _f32(
+            _f32(point_latitude - latitude_f32) ** 2
+            + _f32(point_longitude - longitude_f32) ** 2
+        )
+        return point_latitude, point_longitude, distance
+
+    lower = candidate(y)
+    upper_candidate = candidate(upper)
+    point_latitude, point_longitude, _ = (
+        lower if lower[2] < upper_candidate[2] else upper_candidate
+    )
+    if point_longitude >= _f32(180.0):
+        point_longitude = _f32(point_longitude - _f32(360.0))
+    return float(point_latitude), float(point_longitude)
+
+
+def sample_points(seed: int = 20260729, model: str | None = None) -> list[dict[str, Any]]:
     randomizer = random.Random(seed)
     common_grid = [
         (float(latitude), float(longitude))
@@ -702,7 +791,9 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
     ]
     randomizer.shuffle(common_grid)
     points: list[dict[str, Any]] = []
-    for latitude, longitude in common_grid[:100]:
+    for latitude, longitude in common_grid[:70]:
+        if model == "ec9":
+            latitude, longitude = _ec9_o1280_nearest_coordinate(latitude, longitude)
         points.append(
             {
                 "id": f"p{len(points):03d}",
@@ -712,7 +803,9 @@ def sample_points(seed: int = 20260729) -> list[dict[str, Any]]:
                 "kind": "random_exact_common_native_grid",
             }
         )
-    for latitude, longitude in common_grid[100:200]:
+    for latitude, longitude in common_grid[70:140]:
+        if model == "ec9":
+            latitude, longitude = _ec9_o1280_nearest_coordinate(latitude, longitude)
         latitude += randomizer.uniform(0.031, 0.179)
         longitude += randomizer.uniform(0.031, 0.179)
         points.append(
@@ -1253,7 +1346,7 @@ def capture_official(
                 )
         return metadata
 
-    points = sample_points()
+    points = sample_points(model=model)
     api_key = (api_key or "").strip()
     endpoint_key = "customer_endpoint" if api_key else "public_endpoint"
     endpoint = MODEL_SPECS[model][endpoint_key]
@@ -1892,7 +1985,7 @@ def validate_model(
     report_path = output / model / "report.json"
     report = {
         "schema_version": SCHEMA_VERSION,
-        "type": "official_300_point_comparison",
+        "type": "official_200_point_comparison",
         "model": model,
         "status": "running",
         "official_snapshot_sha256": metadata["response_sha256"],
@@ -1951,7 +2044,7 @@ def validate_model(
         request_units_total=request_units_total,
         timed_request_units_completed=timed_request_units_completed,
     )
-    points = sample_points()
+    points = sample_points(model=model)
     # Every repair attempt must prove the complete prefix again from point 0.
     # Keep prior receipts immutable for audit, but never use them to skip a
     # point in a later attempt.
@@ -2382,7 +2475,7 @@ def parse_args() -> argparse.Namespace:
         "--point-limit",
         type=int,
         default=POINT_COUNT,
-        help="validate only the first N points for a partial smoke run (maximum 300)",
+        help="validate only the first N points for a partial smoke run (maximum 200)",
     )
     return parser.parse_args()
 

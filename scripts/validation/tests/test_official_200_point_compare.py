@@ -127,11 +127,11 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("--data-binary", command)
         self.assertIn("127.0.0.1:8088", command)
 
-    def test_plan_has_exactly_three_hundred_stable_points(self) -> None:
+    def test_plan_has_exactly_two_hundred_stable_points(self) -> None:
         points = compare.sample_points()
-        self.assertEqual(len(points), 300)
+        self.assertEqual(len(points), 200)
         self.assertEqual(points, compare.sample_points())
-        self.assertEqual(len({point["id"] for point in points}), 300)
+        self.assertEqual(len({point["id"] for point in points}), 200)
         kinds = {point["kind"] for point in points}
         self.assertEqual(
             kinds,
@@ -143,12 +143,37 @@ class Official200PointCompareTests(unittest.TestCase):
         )
         self.assertEqual(
             sum(point["kind"] == "random_exact_common_native_grid" for point in points),
-            100,
+            70,
         )
         self.assertEqual(
-            sum(point["kind"] != "random_exact_common_native_grid" for point in points),
-            200,
+            sum(point["kind"] == "random_offgrid_near_native_grid" for point in points),
+            70,
         )
+        self.assertEqual(
+            sum(point["kind"] == "random_offgrid_uniform_crop" for point in points),
+            60,
+        )
+
+    def test_ec9_uses_official_ifs_and_local_nine_kilometre_endpoint(self) -> None:
+        spec = compare.MODEL_SPECS["ec9"]
+        self.assertEqual(spec["model_parameter"], ("models", ["ecmwf_ifs"]))
+        self.assertEqual(spec["local_path"], "/v1/ecmwf-ifs9km")
+        self.assertNotIn("precipitation_probability", spec["official_hourly"])
+        self.assertIn("wind_speed_200m", spec["official_hourly"])
+        self.assertIn("showers_sum", spec["daily"])
+
+    def test_ec9_exact_cohort_uses_o1280_grid_coordinates(self) -> None:
+        points = compare.sample_points(model="ec9")
+        exact = [point for point in points if point["kind"] == "random_exact_common_native_grid"]
+        self.assertEqual(len(exact), 70)
+        for point in exact:
+            self.assertEqual(
+                (point["latitude"], point["longitude"]),
+                compare._ec9_o1280_nearest_coordinate(
+                    point["latitude"], point["longitude"]
+                ),
+            )
+        self.assertNotEqual(points, compare.sample_points(model="ec"))
 
     def test_probability_daily_aggregations_are_in_both_weather_catalogs(self) -> None:
         expected = {
@@ -225,7 +250,7 @@ class Official200PointCompareTests(unittest.TestCase):
         )
 
     def test_default_plan_coalesces_each_model_period_without_parallelism(self) -> None:
-        for model in ("gfs", "ec"):
+        for model in ("gfs", "ec", "ec9"):
             plan = compare.request_plan(model, compare.DEFAULT_FIELD_CHUNK_SIZE)
             self.assertEqual(len(plan), 1)
             self.assertTrue(plan[0]["hourly"])
@@ -406,9 +431,9 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("commercial-secret", json.dumps(persisted_metadata))
         self.assertFalse(metadata["api_key_persisted"])
         self.assertEqual(metadata["api_access_tier"], "customer_commercial")
-        self.assertEqual(metadata["official_request_count"], 3)
+        self.assertEqual(metadata["official_request_count"], 2)
         self.assertEqual(metadata["official_batch_size"], 100)
-        self.assertEqual(len(metadata["batches"]), 3)
+        self.assertEqual(len(metadata["batches"]), 2)
 
     def test_capture_without_key_uses_public_noncommercial_endpoint(self) -> None:
         captured: dict[str, object] = {}
@@ -428,7 +453,7 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertNotIn("apikey", json.loads(captured["body"]))
         self.assertEqual(metadata["api_access_tier"], "public_noncommercial")
         self.assertEqual(metadata["api_key_transport"], "none")
-        self.assertEqual(metadata["official_request_count"], 3)
+        self.assertEqual(metadata["official_request_count"], 2)
 
     def test_capture_resumes_a_complete_partial_batch_without_requesting_it(self) -> None:
         response = json.dumps([{} for _ in range(100)]).encode()
@@ -449,11 +474,10 @@ class Official200PointCompareTests(unittest.TestCase):
                     "gfs", output, None, 10.0, 0
                 )
 
-        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_count, 1)
         self.assertTrue(metadata["batches"][0]["resumed_from_disk"])
         self.assertEqual(metadata["batches"][0]["request_exit"], "persisted")
         self.assertFalse(metadata["batches"][1]["resumed_from_disk"])
-        self.assertFalse(metadata["batches"][2]["resumed_from_disk"])
 
     def test_capture_routes_public_batches_through_distinct_ssh_hosts(self) -> None:
         response = json.dumps([{} for _ in range(100)]).encode()
@@ -475,11 +499,11 @@ class Official200PointCompareTests(unittest.TestCase):
                     ssh_hosts=("first-exit", "second-exit"),
                 )
 
-        self.assertEqual(ssh_request.call_count, 3)
+        self.assertEqual(ssh_request.call_count, 2)
         local_request.assert_not_called()
         self.assertEqual(
             [batch["request_exit"] for batch in metadata["batches"]],
-            ["ssh:first-exit", "ssh:second-exit", "ssh:first-exit"],
+            ["ssh:first-exit", "ssh:second-exit"],
         )
 
     def test_direct_comparison_stops_at_first_value(self) -> None:
