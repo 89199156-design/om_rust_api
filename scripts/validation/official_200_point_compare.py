@@ -249,6 +249,12 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": GFS_HOURLY,
         "local_hourly": GFS_HOURLY,
         "daily": GFS_DAILY,
+        "source_probe_domains": (
+            "ncep_gfs013",
+            "ncep_gfs025",
+            "ncep_gefs025",
+            "ncep_gefs05",
+        ),
     },
     "ec": {
         "public_endpoint": "https://api.open-meteo.com/v1/ecmwf",
@@ -259,6 +265,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": ECMWF_SURFACE_HOURLY,
         "local_hourly": ECMWF_SURFACE_HOURLY,
         "daily": tuple(ECMWF_DAILY),
+        "source_probe_domains": ("ecmwf_ifs025",),
     },
     "ec9": {
         "public_endpoint": "https://api.open-meteo.com/v1/ecmwf",
@@ -269,6 +276,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": EC9_HOURLY,
         "local_hourly": EC9_HOURLY,
         "daily": EC9_DAILY,
+        "source_probe_domains": ("ecmwf_ifs",),
     },
     "cams": {
         "public_endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
@@ -281,6 +289,7 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": CAMS_HOURLY_OFFICIAL,
         "local_hourly": CAMS_HOURLY_LOCAL,
         "daily": CAMS_DAILY,
+        "source_probe_domains": ("cams_global",),
     },
 }
 
@@ -961,6 +970,104 @@ def request_json_via_ssh(
     return raw, {}, elapsed
 
 
+def normalize_source_run(value: Any, *, label: str) -> str:
+    if isinstance(value, int):
+        return dt.datetime.fromtimestamp(value, dt.timezone.utc).strftime("%Y%m%d%H")
+    if isinstance(value, str):
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValidationError(f"{label} has invalid source run: {value!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc).strftime("%Y%m%d%H")
+    raise ValidationError(f"{label} has no source run")
+
+
+def capture_source_run_probe(
+    model: str,
+    model_dir: Path,
+    phase: str,
+    expected_run: str,
+    timeout: float,
+    retries: int,
+) -> dict[str, Any]:
+    if len(expected_run) != 10 or not expected_run.isdigit():
+        raise ValidationError(f"invalid expected source run: {expected_run!r}")
+    domains: tuple[str, ...] = MODEL_SPECS[model]["source_probe_domains"]
+    identities: list[dict[str, Any]] = []
+    for domain in domains:
+        temporal_url = (
+            f"https://openmeteo.s3.amazonaws.com/data/{domain}/static/meta.json"
+        )
+        spatial_url = (
+            f"https://openmeteo.s3.amazonaws.com/data_spatial/{domain}/latest.json"
+        )
+        temporal_raw, temporal_headers, _ = request_json(
+            "GET",
+            temporal_url,
+            body=None,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            timeout=timeout,
+            retries=retries,
+        )
+        spatial_raw, spatial_headers, _ = request_json(
+            "GET",
+            spatial_url,
+            body=None,
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            timeout=timeout,
+            retries=retries,
+        )
+        try:
+            temporal = json.loads(temporal_raw)
+            spatial = json.loads(spatial_raw)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"official source probe returned invalid JSON for {domain}"
+            ) from exc
+        temporal_run = normalize_source_run(
+            temporal.get("last_run_initialisation_time"),
+            label=f"{domain} temporal probe",
+        )
+        spatial_run = normalize_source_run(
+            spatial.get("reference_time"),
+            label=f"{domain} spatial probe",
+        )
+        if spatial.get("completed") is not True:
+            raise ValidationError(f"{domain} spatial source is not complete")
+        if temporal_run != expected_run or spatial_run != expected_run:
+            raise ValidationError(
+                f"official {model} source run mismatch during {phase}: "
+                f"domain={domain}, expected={expected_run}, "
+                f"temporal={temporal_run}, spatial={spatial_run}"
+            )
+        temporal_path = model_dir / "source-probes" / f"{phase}-{domain}-temporal.json"
+        spatial_path = model_dir / "source-probes" / f"{phase}-{domain}-spatial.json"
+        write_once(temporal_path, temporal_raw)
+        write_once(spatial_path, spatial_raw)
+        identities.append(
+            {
+                "domain": domain,
+                "temporal_run": temporal_run,
+                "spatial_run": spatial_run,
+                "spatial_completed": True,
+                "temporal_file": str(temporal_path.relative_to(model_dir)),
+                "temporal_sha256": sha256_bytes(temporal_raw),
+                "temporal_headers": temporal_headers,
+                "spatial_file": str(spatial_path.relative_to(model_dir)),
+                "spatial_sha256": sha256_bytes(spatial_raw),
+                "spatial_headers": spatial_headers,
+            }
+        )
+    return {
+        "phase": phase,
+        "expected_run": expected_run,
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "identities": identities,
+    }
+
+
 PRODUCTION_SSH_HELPER = r"""
 import base64
 import gzip
@@ -1296,6 +1403,7 @@ def capture_official(
     retries: int,
     request_delay_seconds: float = 0.0,
     ssh_hosts: tuple[str, ...] = (),
+    expected_run: str | None = None,
 ) -> dict[str, Any]:
     model_dir = output / model / "official"
     response_path = model_dir / "response.json"
@@ -1303,6 +1411,12 @@ def capture_official(
     request_path = model_dir / "request.json"
     if response_path.exists() and metadata_path.exists() and request_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if expected_run is not None:
+            proof = metadata.get("source_run_proof")
+            if not isinstance(proof, dict) or proof.get("expected_run") != expected_run:
+                raise ValidationError(
+                    f"official snapshot lacks source-run proof for {model}={expected_run}"
+                )
         raw = response_path.read_bytes()
         if metadata.get("response_sha256") != sha256_bytes(raw):
             raise ValidationError(f"official snapshot hash mismatch: {response_path}")
@@ -1346,6 +1460,13 @@ def capture_official(
                 )
         return metadata
 
+    source_probe_before = (
+        capture_source_run_probe(
+            model, model_dir, "before", expected_run, timeout, retries
+        )
+        if expected_run is not None
+        else None
+    )
     points = sample_points(model=model)
     api_key = (api_key or "").strip()
     endpoint_key = "customer_endpoint" if api_key else "public_endpoint"
@@ -1468,6 +1589,13 @@ def capture_official(
             f"official {model} merged response row count mismatch: "
             f"expected={POINT_COUNT}, actual={len(rows)}"
         )
+    source_probe_after = (
+        capture_source_run_probe(
+            model, model_dir, "after", expected_run, timeout, retries
+        )
+        if expected_run is not None
+        else None
+    )
     request_snapshot = {
         "batch_size": OFFICIAL_BATCH_SIZE,
         "batches": payloads,
@@ -1499,6 +1627,15 @@ def capture_official(
             else "none"
         ),
         "api_key_persisted": False,
+        "source_run_proof": (
+            {
+                "expected_run": expected_run,
+                "before": source_probe_before,
+                "after": source_probe_after,
+            }
+            if expected_run is not None
+            else None
+        ),
     }
     write_once(metadata_path, pretty_bytes(metadata))
     return metadata
@@ -2896,6 +3033,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expected-runs",
+        default="",
+        help=(
+            "comma-separated model=YYYYMMDDHH source runs; capture probes every "
+            "official temporal and spatial source before and after the API snapshot"
+        ),
+    )
+    parser.add_argument(
         "--point-delay-seconds",
         type=float,
         default=DEFAULT_POINT_DELAY_SECONDS,
@@ -2953,12 +3098,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_expected_runs(value: str) -> dict[str, str]:
+    expected: dict[str, str] = {}
+    for item in (part.strip() for part in value.split(",")):
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValidationError(f"invalid --expected-runs item: {item!r}")
+        model, run = (part.strip() for part in item.split("=", 1))
+        if model not in MODEL_SPECS:
+            raise ValidationError(f"unknown model in --expected-runs: {model!r}")
+        if len(run) != 10 or not run.isdigit():
+            raise ValidationError(f"invalid source run for {model}: {run!r}")
+        if model in expected:
+            raise ValidationError(f"duplicate source run for {model}")
+        expected[model] = run
+    return expected
+
+
 def main() -> int:
     args = parse_args()
     models = [value.strip() for value in args.models.split(",") if value.strip()]
     invalid = set(models) - set(MODEL_SPECS)
     if invalid:
         raise ValidationError(f"unknown models: {sorted(invalid)}")
+    expected_runs = parse_expected_runs(args.expected_runs)
+    if expected_runs and set(expected_runs) != set(models):
+        raise ValidationError(
+            "--expected-runs must name every and only selected model: "
+            f"models={sorted(models)}, expected={sorted(expected_runs)}"
+        )
     non_negative = {
         "--point-delay-seconds": args.point_delay_seconds,
         "--request-delay-seconds": args.request_delay_seconds,
@@ -3025,6 +3194,7 @@ def main() -> int:
                 args.retries,
                 args.official_request_delay_seconds,
                 model_ssh_hosts,
+                expected_runs.get(model),
             )
             print(
                 json.dumps(

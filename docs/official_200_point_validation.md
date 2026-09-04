@@ -26,8 +26,15 @@ CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQ
 
 ```bash
 python scripts/validation/official_200_point_compare.py capture \
+  --models gfs,ec,ec9,cams \
+  --expected-runs gfs=YYYYMMDDHH,ec=YYYYMMDDHH,ec9=YYYYMMDDHH,cams=YYYYMMDDHH \
   --output D:/Projects/weather_validation_artifacts/official-200/<批次标识>
 ```
+
+正式验收必须传入 `--expected-runs`。验证器会在抓取 API 响应前后分别读取该模型
+全部官方时序、空间数据源的批次元数据，并要求 `reference_time`、
+`last_run_initialisation_time` 和目标批次完全一致，且空间数据已标记完成。任一数据源
+批次不同或抓取过程中发生切换都会立即失败，不会保存成可用于验收的官方快照。
 
 每个模型按 100 个坐标一组，仅发出 2 次多点 POST；每次请求同时包含完整小时字段
 和完整日聚合字段。成功后每批原始响应、无密钥请求体、合并响应和对应 SHA-256
@@ -79,6 +86,8 @@ ECMWF 9 km 另有一项有证据约束的历史初始化例外：官方时间序
 数据批次与官方 API 对齐后，只通过 1Panel 面板停用当前生产探测任务
 `weather_gfs_probe_cycle`、`weather_ecmwf_probe_cycle`、
 `weather_ecmwf_ifs9km_probe_cycle` 和 `weather_cams_ecpds_probe_cycle`，并确认没有任务正在执行。
+随后读取生产 `current` 指针核对本地批次，并将同一批次传给 `--expected-runs`；四个模型
+独立冻结、独立抓取和独立验收，一个模型不必等待其他模型对齐。
 
 若差异来自 API 计算，部署修正后的同一 Git 修订后复验。若差异来自下载或数据处理，
 必须先校验并复用服务器已保留的目标批次；只有文件缺失、校验失败或覆盖范围不完整时

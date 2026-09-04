@@ -21,6 +21,61 @@ SPEC.loader.exec_module(compare)
 
 
 class Official200PointCompareTests(unittest.TestCase):
+    def test_parse_expected_runs_requires_unique_valid_pairs(self) -> None:
+        self.assertEqual(
+            compare.parse_expected_runs("gfs=2026090412,cams=2026090400"),
+            {"gfs": "2026090412", "cams": "2026090400"},
+        )
+        with self.assertRaises(compare.ValidationError):
+            compare.parse_expected_runs("gfs=bad")
+        with self.assertRaises(compare.ValidationError):
+            compare.parse_expected_runs("gfs=2026090412,gfs=2026090412")
+
+    def test_probe_persists_matching_temporal_and_spatial_identity(self) -> None:
+        temporal = json.dumps(
+            {"last_run_initialisation_time": 1788523200}
+        ).encode()
+        spatial = json.dumps(
+            {"reference_time": "2026-09-04T12:00:00Z", "completed": True}
+        ).encode()
+
+        def response(_method, url, **_kwargs):
+            return (spatial if "data_spatial" in url else temporal), {}, 0.01
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(compare, "request_json", side_effect=response):
+                proof = compare.capture_source_run_probe(
+                    "cams", Path(temporary), "before", "2026090412", 10, 0
+                )
+            self.assertEqual(proof["expected_run"], "2026090412")
+            self.assertEqual(proof["identities"][0]["temporal_run"], "2026090412")
+            self.assertTrue(
+                (
+                    Path(temporary)
+                    / "source-probes/before-cams_global-temporal.json"
+                ).is_file()
+            )
+
+    def test_probe_rejects_transition_before_snapshot_capture(self) -> None:
+        temporal = json.dumps(
+            {"last_run_initialisation_time": 1788523200}
+        ).encode()
+        spatial = json.dumps(
+            {"reference_time": "2026-09-04T12:00:00Z", "completed": True}
+        ).encode()
+
+        def response(_method, url, **_kwargs):
+            return (spatial if "data_spatial" in url else temporal), {}, 0.01
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(compare, "request_json", side_effect=response):
+                with self.assertRaisesRegex(
+                    compare.ValidationError, "source run mismatch"
+                ):
+                    compare.capture_source_run_probe(
+                        "cams", Path(temporary), "after", "2026090400", 10, 0
+                    )
+
     def test_persistent_ssh_transport_decompresses_responses(self) -> None:
         expected = b'{"hourly":{"time":["2026-08-02T00:00"]}}'
         response = compare.canonical_bytes(
