@@ -294,7 +294,7 @@ fn current_weather_model() -> WeatherModel {
 }
 
 fn derives_diffuse_radiation(model: WeatherModel) -> bool {
-    model.is_ecmwf()
+    model == WeatherModel::EcmwfIfs025
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2199,7 +2199,7 @@ fn daily_weather_value(
         speed, direction, ..
     } = aggregation
     {
-        let step_hours = if current_weather_model().is_ecmwf() {
+        let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025 {
             3
         } else {
             1
@@ -2220,7 +2220,7 @@ fn daily_weather_value(
     }
 
     let source = aggregation.seed_variable();
-    let step_hours = if current_weather_model().is_ecmwf()
+    let step_hours = if current_weather_model() == WeatherModel::EcmwfIfs025
         && matches!(
             aggregation,
             DailyWeatherAggregation::Mean(_)
@@ -2645,7 +2645,7 @@ pub fn read_variable_value(
             return read_weather_code(snapshot, decoder, time, latitude, longitude);
         }
         "apparent_temperature" => {
-            let temperature = read_direct(
+            let temperature = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "temperature_2m",
@@ -2653,7 +2653,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let relative_humidity = read_direct(
+            let relative_humidity = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "relative_humidity_2m",
@@ -2661,15 +2661,23 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let wind_speed = read_variable_value(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
-                "wind_speed_10m",
+                "wind_u_component_10m",
                 time,
                 latitude,
                 longitude,
             )?;
-            let shortwave_radiation = read_direct(
+            let v = read_direct_unrounded(
+                snapshot,
+                decoder,
+                "wind_v_component_10m",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let shortwave_radiation = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "shortwave_radiation",
@@ -2680,7 +2688,7 @@ pub fn read_variable_value(
             return Ok(apparent_temperature(
                 temperature,
                 relative_humidity,
-                wind_speed,
+                (u * u + v * v).sqrt(),
                 Some(shortwave_radiation),
             ));
         }
@@ -2730,7 +2738,7 @@ pub fn read_variable_value(
             return Ok(dew_point(temperature, relative_humidity));
         }
         "wet_bulb_temperature_2m" => {
-            let temperature = read_direct(
+            let temperature = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "temperature_2m",
@@ -2738,7 +2746,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let relative_humidity = read_direct(
+            let relative_humidity = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "relative_humidity_2m",
@@ -2760,7 +2768,7 @@ pub fn read_variable_value(
             return Ok(evapotranspiration(latent_heat_flux));
         }
         "vapour_pressure_deficit" | "vapor_pressure_deficit" => {
-            let temperature = read_direct(
+            let temperature = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "temperature_2m",
@@ -2768,7 +2776,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let relative_humidity = read_direct(
+            let relative_humidity = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "relative_humidity_2m",
@@ -2872,7 +2880,7 @@ pub fn read_variable_value(
             return Ok((precipitation - swe - showers).max(0.0));
         }
         "wind_speed_10m" | "windspeed_10m" => {
-            let u = read_direct(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_u_component_10m",
@@ -2880,7 +2888,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let v = read_direct(
+            let v = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_v_component_10m",
@@ -2891,7 +2899,7 @@ pub fn read_variable_value(
             return Ok((u * u + v * v).sqrt());
         }
         "wind_direction_10m" | "winddirection_10m" => {
-            let u = read_direct(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_u_component_10m",
@@ -2899,7 +2907,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let v = read_direct(
+            let v = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_v_component_10m",
@@ -2948,7 +2956,7 @@ pub fn read_variable_value(
             return Ok(wind_direction(u, v));
         }
         "wind_speed_100m" | "windspeed_100m" => {
-            let u = read_direct(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_u_component_100m",
@@ -2956,7 +2964,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let v = read_direct(
+            let v = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_v_component_100m",
@@ -2967,7 +2975,7 @@ pub fn read_variable_value(
             return Ok((u * u + v * v).sqrt());
         }
         "wind_speed_200m" | "windspeed_200m" => {
-            let u = read_direct(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_u_component_200m",
@@ -2975,7 +2983,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let v = read_direct(
+            let v = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_v_component_200m",
@@ -2986,7 +2994,7 @@ pub fn read_variable_value(
             return Ok((u * u + v * v).sqrt());
         }
         "wind_direction_200m" | "winddirection_200m" => {
-            let u = read_direct(
+            let u = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_u_component_200m",
@@ -2994,7 +3002,7 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let v = read_direct(
+            let v = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "wind_v_component_200m",
@@ -3064,6 +3072,25 @@ pub fn read_variable_value(
                 longitude,
             );
         }
+        "diffuse_radiation" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            let shortwave = read_direct_unrounded(
+                snapshot,
+                decoder,
+                "shortwave_radiation",
+                time,
+                latitude,
+                longitude,
+            )?;
+            let direct = read_direct_unrounded(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                time,
+                latitude,
+                longitude,
+            )?;
+            return Ok((shortwave - direct).max(0.0));
+        }
         "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
             let shortwave = read_direct(
                 snapshot,
@@ -3081,6 +3108,16 @@ pub fn read_variable_value(
                 sampling.latitude as f32,
                 sampling.longitude as f32,
             ));
+        }
+        "direct_radiation" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            return read_direct_unrounded(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                time,
+                latitude,
+                longitude,
+            );
         }
         "direct_radiation" => {
             let shortwave = read_direct(
@@ -3429,7 +3466,7 @@ pub fn read_variable_grid(
                 time,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let humidity = read_direct_grid(
                 snapshot,
@@ -3816,7 +3853,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_direct_grid_series(
                 snapshot,
@@ -3825,7 +3862,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             wet_bulb_temperature,
         )),
@@ -3837,7 +3874,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_direct_grid_series(
                 snapshot,
@@ -3846,7 +3883,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             |temperature, humidity| {
                 vapor_pressure_deficit(temperature, dew_point(temperature, humidity))
@@ -3874,7 +3911,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let middle = read_direct_grid_series(
                 snapshot,
@@ -3883,7 +3920,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let deep = read_direct_grid_series(
                 snapshot,
@@ -3892,7 +3929,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             Ok(shallow
                 .into_iter()
@@ -3917,7 +3954,7 @@ pub fn read_variable_grid_series(
             times,
             latitudes,
             longitudes,
-            true,
+            false,
         )?
         .into_iter()
         .map(|frame| {
@@ -3935,7 +3972,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let pressure = read_direct_grid_series(
                 snapshot,
@@ -3944,7 +3981,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let primary_product = current_weather_model().primary_product();
             let elevation = if let Some(sampling) = current_product_sampling(primary_product) {
@@ -3978,7 +4015,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let humidity = read_direct_grid_series(
                 snapshot,
@@ -3987,7 +4024,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let u = read_direct_grid_series(
                 snapshot,
@@ -3996,7 +4033,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let v = read_direct_grid_series(
                 snapshot,
@@ -4005,7 +4042,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let radiation = read_direct_grid_series(
                 snapshot,
@@ -4014,7 +4051,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             Ok(temperature
                 .into_iter()
@@ -4040,6 +4077,29 @@ pub fn read_variable_grid_series(
                         .collect()
                 })
                 .collect())
+        }
+        "diffuse_radiation" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            Ok(combine2(
+                read_direct_grid_series(
+                    snapshot,
+                    decoder,
+                    "shortwave_radiation",
+                    times,
+                    latitudes,
+                    longitudes,
+                    false,
+                )?,
+                read_direct_grid_series(
+                    snapshot,
+                    decoder,
+                    "direct_radiation",
+                    times,
+                    latitudes,
+                    longitudes,
+                    false,
+                )?,
+                |shortwave, direct| (shortwave - direct).max(0.0),
+            ))
         }
         "diffuse_radiation" if derives_diffuse_radiation(current_weather_model()) => {
             let shortwave = read_direct_grid_series(
@@ -4079,8 +4139,19 @@ pub fn read_variable_grid_series(
             times,
             latitudes,
             longitudes,
-            true,
+            false,
         ),
+        "direct_radiation" if current_weather_model() == WeatherModel::EcmwfIfs9km => {
+            read_direct_grid_series(
+                snapshot,
+                decoder,
+                "direct_radiation",
+                times,
+                latitudes,
+                longitudes,
+                false,
+            )
+        }
         "direct_radiation" => Ok(combine2(
             read_direct_grid_series(
                 snapshot,
@@ -4089,7 +4160,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_variable_grid_series(
                 snapshot,
@@ -4264,7 +4335,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let humidity = read_direct_grid_series(
                 snapshot,
@@ -4273,7 +4344,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let shortwave = read_direct_grid_series(
                 snapshot,
@@ -4282,7 +4353,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let wind = read_variable_grid_series(
                 snapshot,
@@ -4344,7 +4415,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let snowfall = read_direct_grid_series(
                 snapshot,
@@ -4353,13 +4424,13 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?;
             let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
                 vec![vec![0.0; latitudes.len() * longitudes.len()]; times.len()]
             } else {
                 read_direct_grid_series(
-                    snapshot, decoder, "showers", times, latitudes, longitudes, true,
+                    snapshot, decoder, "showers", times, latitudes, longitudes, false,
                 )?
             };
             Ok(precipitation
@@ -4397,7 +4468,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_direct_grid_series(
                 snapshot,
@@ -4406,7 +4477,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             |u, v| (u * u + v * v).sqrt(),
         )),
@@ -4418,7 +4489,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             &read_direct_grid_series(
                 snapshot,
@@ -4427,7 +4498,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
         )),
         "wind_speed_100m" | "windspeed_100m" => Ok(combine2(
@@ -4438,7 +4509,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_direct_grid_series(
                 snapshot,
@@ -4447,7 +4518,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             |u, v| (u * u + v * v).sqrt(),
         )),
@@ -4459,7 +4530,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             &read_direct_grid_series(
                 snapshot,
@@ -4468,7 +4539,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
         )),
         "wind_speed_200m" | "windspeed_200m" => Ok(combine2(
@@ -4479,7 +4550,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             read_direct_grid_series(
                 snapshot,
@@ -4488,7 +4559,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             |u, v| (u * u + v * v).sqrt(),
         )),
@@ -4500,7 +4571,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
             &read_direct_grid_series(
                 snapshot,
@@ -4509,7 +4580,7 @@ pub fn read_variable_grid_series(
                 times,
                 latitudes,
                 longitudes,
-                true,
+                false,
             )?,
         )),
         "snowfall" => Ok(read_direct_grid_series(
@@ -4519,7 +4590,7 @@ pub fn read_variable_grid_series(
             times,
             latitudes,
             longitudes,
-            true,
+            false,
         )?
         .into_iter()
         .map(|values| values.into_iter().map(|value| value * 0.7).collect())
@@ -13264,7 +13335,7 @@ fn entry_range_reader(product: &ProductSnapshot, entry: &BundleEntry) -> Result<
     })
 }
 
-fn read_optional_direct_grid_series_rounded(
+fn read_optional_direct_grid_series_unrounded(
     snapshot: &OmDataSnapshot,
     decoder: &OfficialDecoder,
     variable: &str,
@@ -13273,7 +13344,7 @@ fn read_optional_direct_grid_series_rounded(
     longitudes: &[f64],
 ) -> Result<Option<Vec<Vec<f32>>>> {
     match read_direct_grid_series(
-        snapshot, decoder, variable, times, latitudes, longitudes, true,
+        snapshot, decoder, variable, times, latitudes, longitudes, false,
     ) {
         Ok(values) => Ok(Some(values)),
         Err(_) => Ok(None),
@@ -13302,7 +13373,7 @@ fn read_weather_code_grid_series(
         times,
         latitudes,
         longitudes,
-        true,
+        false,
     )?;
     let precipitation = read_direct_grid_series(
         snapshot,
@@ -13311,7 +13382,7 @@ fn read_weather_code_grid_series(
         times,
         latitudes,
         longitudes,
-        true,
+        false,
     )?;
     let snowfall = read_direct_grid_series(
         snapshot,
@@ -13320,23 +13391,23 @@ fn read_weather_code_grid_series(
         times,
         latitudes,
         longitudes,
-        true,
+        false,
     )?;
     let showers = if current_weather_model() == WeatherModel::EcmwfIfs025 {
         None
     } else {
         Some(read_direct_grid_series(
-            snapshot, decoder, "showers", times, latitudes, longitudes, true,
+            snapshot, decoder, "showers", times, latitudes, longitudes, false,
         )?)
     };
-    let cape = read_optional_direct_grid_series_rounded(
+    let cape = read_optional_direct_grid_series_unrounded(
         snapshot, decoder, "cape", times, latitudes, longitudes,
     )?;
     let ecmwf = current_weather_model() == WeatherModel::EcmwfIfs025;
     let gusts = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "wind_gusts_10m",
@@ -13348,7 +13419,7 @@ fn read_weather_code_grid_series(
     let visibility = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "visibility",
@@ -13360,7 +13431,7 @@ fn read_weather_code_grid_series(
     let freezing_rain = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "categorical_freezing_rain",
@@ -13372,7 +13443,7 @@ fn read_weather_code_grid_series(
     let lifted_index = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "lifted_index",
@@ -13384,7 +13455,7 @@ fn read_weather_code_grid_series(
     let cin = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "convective_inhibition",
@@ -13396,7 +13467,7 @@ fn read_weather_code_grid_series(
     let pbl = if ecmwf {
         None
     } else {
-        read_optional_direct_grid_series_rounded(
+        read_optional_direct_grid_series_unrounded(
             snapshot,
             decoder,
             "boundary_layer_height",
@@ -14771,9 +14842,10 @@ mod output_tests {
     }
 
     #[test]
-    fn only_ecmwf_derives_diffuse_radiation_from_shortwave() {
+    fn only_ecmwf_ifs025_estimates_diffuse_radiation_from_shortwave() {
         assert!(!derives_diffuse_radiation(WeatherModel::Gfs));
         assert!(derives_diffuse_radiation(WeatherModel::EcmwfIfs025));
+        assert!(!derives_diffuse_radiation(WeatherModel::EcmwfIfs9km));
     }
 
     #[test]
