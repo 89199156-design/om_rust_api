@@ -2753,7 +2753,11 @@ pub fn read_variable_value(
             ));
         }
         "surface_pressure" => {
-            let temperature = read_direct(
+            // Open-Meteo derives surface pressure from the interpolated model
+            // values before applying public JSON precision. Rounding the two
+            // inputs first can move the derived result across a 0.1 hPa
+            // output boundary.
+            let temperature = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "temperature_2m",
@@ -2761,8 +2765,14 @@ pub fn read_variable_value(
                 latitude,
                 longitude,
             )?;
-            let pressure_msl =
-                read_direct(snapshot, decoder, "pressure_msl", time, latitude, longitude)?;
+            let pressure_msl = read_direct_unrounded(
+                snapshot,
+                decoder,
+                "pressure_msl",
+                time,
+                latitude,
+                longitude,
+            )?;
             let product = current_weather_model().primary_product();
             let elevation = current_product_sampling(product)
                 .map(surface_pressure_elevation)
@@ -13269,6 +13279,25 @@ mod tests {
         assert_eq!(
             seed_variable_for_times("surface_pressure"),
             "temperature_2m"
+        );
+    }
+
+    #[test]
+    fn surface_pressure_is_derived_before_public_input_rounding() {
+        let raw = surface_pressure(18.349, 1019.2, 181.0);
+        let rounded_inputs = surface_pressure(
+            round_variable_output_value("temperature_2m", 18.349),
+            round_variable_output_value("pressure_msl", 1019.2),
+            181.0,
+        );
+
+        assert_eq!(
+            json_value_for_variable("surface_pressure", raw),
+            serde_json::json!(997.9)
+        );
+        assert_eq!(
+            json_value_for_variable("surface_pressure", rounded_inputs),
+            serde_json::json!(997.8)
         );
     }
 
