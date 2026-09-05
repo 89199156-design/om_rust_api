@@ -7201,6 +7201,16 @@ fn ecmwf_first_stage_point(
     }
 }
 
+fn ecmwf_source_frame_in_support_window(
+    product: &str,
+    valid_time: DateTime<Utc>,
+    support_window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> bool {
+    support_window.is_none_or(|(start, end)| {
+        valid_time <= end && (product == "ecmwf_ifs9km" || valid_time >= start)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ecmwf_regularize_source_run(
     product: &ProductSnapshot,
@@ -7222,10 +7232,18 @@ fn ecmwf_regularize_source_run(
         .into_iter()
         .flatten()
         .filter(|entry| entry.variable == raw_variable)
+        // Open-Meteo interpolates the complete downloaded run before it
+        // updates the rolling time-series database.  Cutting the left side of
+        // an EC9 run first changes Hermite's remembered source spacing and can
+        // manufacture a finite value where the complete run stays NaN.  Keep
+        // every EC9 frame from the run origin; only the unneeded right tail is
+        // safe to bound for a request.
         .filter(|entry| {
-            support_window.is_none_or(|(start, end)| {
-                entry.valid_time_utc >= start && entry.valid_time_utc <= end
-            })
+            ecmwf_source_frame_in_support_window(
+                &product.product,
+                entry.valid_time_utc,
+                support_window,
+            )
         })
         .collect::<Vec<_>>();
     if entries.is_empty() {
@@ -8063,9 +8081,12 @@ fn build_ecmwf_ifs9km_regular_series(
                 let forecast_seconds = (*valid_time - run.reference_time).num_seconds();
                 (forecast_seconds >= 0
                     && forecast_seconds % 3600 == 0
-                    && *valid_time >= support_start
-                    && *valid_time <= support_end)
-                    .then_some((*valid_time, file))
+                    && ecmwf_source_frame_in_support_window(
+                        "ecmwf_ifs9km",
+                        *valid_time,
+                        Some((support_start, support_end)),
+                    ))
+                .then_some((*valid_time, file))
             })
             .collect::<Vec<_>>();
         let Some((first_time, _)) = selected.first() else {
@@ -15326,6 +15347,29 @@ mod output_tests {
         );
         assert_eq!(values, vec![vec![expected]]);
         assert_ne!(expected, older_run_only);
+    }
+
+    #[test]
+    fn ec9_support_window_keeps_the_complete_run_prefix() {
+        let run_start = Utc.with_ymd_and_hms(2026, 9, 3, 18, 0, 0).unwrap();
+        let requested_support_start = run_start + Duration::hours(6);
+        let support_end = run_start + Duration::hours(48);
+
+        assert!(ecmwf_source_frame_in_support_window(
+            "ecmwf_ifs9km",
+            run_start,
+            Some((requested_support_start, support_end)),
+        ));
+        assert!(!ecmwf_source_frame_in_support_window(
+            "ecmwf_ifs025",
+            run_start,
+            Some((requested_support_start, support_end)),
+        ));
+        assert!(!ecmwf_source_frame_in_support_window(
+            "ecmwf_ifs9km",
+            support_end + Duration::hours(1),
+            Some((requested_support_start, support_end)),
+        ));
     }
 
     #[test]
