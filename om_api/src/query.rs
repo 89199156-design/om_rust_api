@@ -10882,8 +10882,6 @@ fn is_elevation_correctable(variable: &str) -> bool {
             "temperature_2m"
                 | "temperature_2m_min"
                 | "temperature_2m_max"
-                | "surface_temperature"
-                | "skin_temperature"
                 | "soil_temperature_0_to_10cm"
                 | "soil_temperature_0_to_7cm"
                 | "soil_temperature_7_to_28cm"
@@ -12274,7 +12272,7 @@ mod tests {
     }
 
     #[test]
-    fn ec9_ecpds_corrects_dew_point_and_surface_temperature_for_elevation() {
+    fn ec9_and_ec25_match_official_elevation_correction_contracts() {
         with_weather_model(WeatherModel::EcmwfIfs9km, || {
             assert!(is_elevation_correctable("dew_point_2m"));
             assert!(is_elevation_correctable("surface_temperature"));
@@ -12283,7 +12281,9 @@ mod tests {
         .unwrap();
         with_weather_model(WeatherModel::EcmwfIfs025, || {
             assert!(!is_elevation_correctable("dew_point_2m"));
-            assert!(is_elevation_correctable("surface_temperature"));
+            assert!(!is_elevation_correctable("surface_temperature"));
+            assert!(!is_elevation_correctable("skin_temperature"));
+            assert!(is_elevation_correctable("soil_temperature_0_to_7cm"));
             Ok(())
         })
         .unwrap();
