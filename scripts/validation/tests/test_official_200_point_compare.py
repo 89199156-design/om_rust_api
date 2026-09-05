@@ -250,6 +250,12 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(compare.CAMS_DAILY, ())
         self.assertNotIn("chinese_aqi", compare.CAMS_HOURLY_LOCAL)
 
+    def test_cams_source_proof_includes_greenhouse_gas_domain(self) -> None:
+        self.assertEqual(
+            compare.MODEL_SPECS["cams"]["source_probe_domains"],
+            ("cams_global", "cams_global_greenhouse_gases"),
+        )
+
     def test_weather_scope_excludes_all_pressure_level_fields(self) -> None:
         self.assertFalse(any("hPa" in variable for variable in compare.GFS_HOURLY))
         self.assertFalse(

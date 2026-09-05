@@ -289,7 +289,14 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "official_hourly": CAMS_HOURLY_OFFICIAL,
         "local_hourly": CAMS_HOURLY_LOCAL,
         "daily": CAMS_DAILY,
-        "source_probe_domains": ("cams_global",),
+        # The public cams_global endpoint mixes the higher-resolution
+        # greenhouse-gas domain into variables such as carbon_monoxide. Both
+        # internal products must be on the requested run before an official
+        # snapshot can be treated as an exact-run comparison.
+        "source_probe_domains": (
+            "cams_global",
+            "cams_global_greenhouse_gases",
+        ),
     },
 }
 
