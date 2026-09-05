@@ -882,6 +882,57 @@ class Official200PointCompareTests(unittest.TestCase):
             accepted[1]["reason"], "official_rolling_value_over_local_nan"
         )
 
+    def test_weather_code_rolling_evidence_uses_prior_field_chunk(self) -> None:
+        first_chunk = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                "time": ["2026-09-16T07:00"],
+                "cloud_cover": [75],
+                "precipitation": [0.8],
+                "snowfall": [0.0],
+                "cape": [760],
+            },
+        }
+        second_chunk = {
+            "latitude": 32.021087646484375,
+            "hourly": {
+                "time": ["2026-09-16T07:00"],
+                "showers": [0.7],
+                "convective_inhibition": [None],
+                "boundary_layer_height": [1180],
+                "weather_code": [53],
+            },
+        }
+        local = compare.merge_local_response_periods([first_chunk, second_chunk])
+        official = {
+            **local,
+            "hourly": {
+                **local["hourly"],
+                "convective_inhibition": [8],
+                "weather_code": [95],
+            },
+        }
+        accepted: list[dict[str, object]] = []
+
+        difference, hourly_count, _ = compare.first_period_difference(
+            "hourly",
+            ("weather_code", "convective_inhibition"),
+            official,
+            local,
+            allow_official_finite_local_nan=True,
+            accepted_differences=accepted,
+        )
+
+        self.assertIsNone(difference)
+        self.assertEqual(hourly_count, 2)
+        self.assertEqual(
+            [item["reason"] for item in accepted],
+            [
+                "official_weather_code_derived_from_rolling_value_over_local_nan",
+                "official_rolling_value_over_local_nan",
+            ],
+        )
+
     def test_hourly_weather_code_rolling_nan_policy_requires_causal_match(self) -> None:
         official = {
             "latitude": 32.021087646484375,

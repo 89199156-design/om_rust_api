@@ -1701,6 +1701,49 @@ def _finite_number(value: Any) -> bool:
     )
 
 
+def merge_local_response_periods(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine field-chunk responses without weakening identity or time axes.
+
+    EC9 rolling-NaN evidence for weather_code needs inputs that may belong to
+    an earlier request chunk.  Keep the current response's top-level identity,
+    but make every hourly/daily field already fetched for this point available
+    to the causal proof.
+    """
+
+    if not rows:
+        raise ValidationError("cannot merge an empty local response set")
+    merged = dict(rows[-1])
+    for period in ("hourly", "daily"):
+        time_axis: list[Any] | None = None
+        values_by_name: dict[str, Any] = {}
+        for row in rows:
+            values = row.get(period)
+            if values is None:
+                continue
+            if not isinstance(values, dict):
+                raise ValidationError(f"local {period} payload is not an object")
+            times = values.get("time")
+            if not isinstance(times, list):
+                raise ValidationError(f"local {period} payload has no time axis")
+            if time_axis is None:
+                time_axis = times
+            elif times != time_axis:
+                raise ValidationError(
+                    f"local {period} time axes differ between field chunks"
+                )
+            for name, field_values in values.items():
+                if name == "time":
+                    continue
+                if name in values_by_name and values_by_name[name] != field_values:
+                    raise ValidationError(
+                        f"local {period} field differs between chunks: {name}"
+                    )
+                values_by_name[name] = field_values
+        if time_axis is not None:
+            merged[period] = {"time": time_axis, **values_by_name}
+    return merged
+
+
 def _ec9_public_weather_code(
     period: dict[str, Any], index: int, latitude: Any
 ) -> int | None:
@@ -2684,6 +2727,7 @@ def validate_model(
         accepted_rolling_nan: list[dict[str, Any]] = []
         local_elapsed_seconds = 0.0
         response_parts: list[dict[str, Any]] = []
+        local_response_rows: list[dict[str, Any]] = []
         for request_index, request_part in enumerate(plan):
             hourly_variables = request_part["hourly"]
             daily_variables = request_part["daily"]
@@ -2797,6 +2841,8 @@ def validate_model(
             )
             write_once(local_path, raw)
             local = normalize_rows(json.loads(raw), 1)[0]
+            local_response_rows.append(local)
+            comparison_local = merge_local_response_periods(local_response_rows)
             difference = None
             part_comparison: dict[str, Any] = {}
             request_accepted: list[dict[str, Any]] = []
@@ -2806,7 +2852,7 @@ def validate_model(
                     period,
                     variables,
                     official,
-                    local,
+                    comparison_local,
                     allow_official_finite_local_nan=model == "ec9",
                     accepted_differences=period_accepted,
                 )
