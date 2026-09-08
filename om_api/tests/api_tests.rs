@@ -3316,6 +3316,72 @@ fn weather_code_reference_returns_thunderstorm_for_high_probability_showers() {
 }
 
 #[test]
+fn weather_code_retries_only_when_nonfinite_cin_blocks_a_thunderstorm_result() {
+    assert_eq!(
+        weather_code(
+            100.0,
+            10.0,
+            Some(10.0),
+            0.0,
+            Some(18.0),
+            Some(4000.0),
+            Some(-8.0),
+            Some(f32::NAN),
+            Some(1500.0),
+            Some(10000.0),
+            Some(0.0),
+            3600,
+            45.0,
+        ),
+        Some(96.0)
+    );
+}
+
+#[test]
+fn weather_code_keeps_the_non_thunderstorm_result_when_cin_fallback_is_insufficient() {
+    assert_eq!(
+        weather_code(
+            82.0,
+            0.9,
+            Some(0.8),
+            0.0,
+            None,
+            Some(670.0),
+            None,
+            Some(f32::NAN),
+            Some(1500.0),
+            Some(18220.0),
+            Some(0.0),
+            3600,
+            32.021088,
+        ),
+        Some(53.0)
+    );
+}
+
+#[test]
+fn weather_code_does_not_retry_when_an_early_guard_produces_a_valid_score() {
+    assert_eq!(
+        weather_code(
+            10.0,
+            0.0,
+            Some(0.0),
+            0.0,
+            None,
+            Some(4000.0),
+            Some(-8.0),
+            Some(f32::NAN),
+            Some(1500.0),
+            Some(10000.0),
+            Some(0.0),
+            3600,
+            45.0,
+        ),
+        Some(0.0)
+    );
+}
+
+#[test]
 fn weather_code_reference_returns_moderate_drizzle_for_strong_showers() {
     assert_eq!(
         weather_code(

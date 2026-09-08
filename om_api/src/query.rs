@@ -14278,6 +14278,28 @@ pub fn weather_code(
             model_dt_seconds,
             latitude,
         );
+        // Keep the primary calculation unchanged. Only retry without CIN when
+        // a non-finite CIN has actually contaminated the thunderstorm score.
+        // This avoids treating every missing CIN value as a reason to alter
+        // weather_code; the fallback matters only if it crosses a threshold.
+        let thunderstorms = if !thunderstorms.is_finite()
+            && convective_inhibition.is_some_and(|value| !value.is_finite())
+        {
+            thunderstorm_probability(
+                convective_precipitation,
+                precipitation,
+                cloudcover,
+                gusts,
+                cape_value,
+                lifted_index,
+                None,
+                pbl_height,
+                model_dt_seconds,
+                latitude,
+            )
+        } else {
+            thunderstorms
+        };
         if thunderstorms > 85.0 {
             return Some(96.0);
         }
