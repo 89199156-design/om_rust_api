@@ -1,6 +1,7 @@
 pub mod api;
 pub mod dem;
 pub mod ec9_materialize;
+mod ecmwf_route;
 pub mod manifest;
 pub mod materialize;
 pub mod native;

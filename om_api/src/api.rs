@@ -1,3 +1,4 @@
+use crate::ecmwf_route::{model_name, EcmwfRouteSelector};
 use crate::official::OfficialDecoder;
 use crate::query::{
     ecmwf_ifs9km_public_daily_variables, ecmwf_ifs9km_public_hourly_variables,
@@ -38,6 +39,7 @@ pub struct AppState {
     data_root: PathBuf,
     decoder: Option<OfficialDecoder>,
     cache: Arc<RwLock<SnapshotCache>>,
+    ecmwf_route: EcmwfRouteSelector,
 }
 
 struct SnapshotCache {
@@ -110,13 +112,68 @@ impl SnapshotIdentity {
 
 impl AppState {
     pub fn new(data_root: PathBuf, decoder: Option<OfficialDecoder>) -> Result<Self> {
+        Self::new_with_ecmwf_route(data_root, decoder, None)
+    }
+
+    pub fn new_with_ecmwf_route(
+        data_root: PathBuf,
+        decoder: Option<OfficialDecoder>,
+        ecmwf_route_state: Option<PathBuf>,
+    ) -> Result<Self> {
         let identity = SnapshotIdentity::read(&data_root)?;
         let snapshot = Arc::new(OmDataSnapshot::load(&data_root)?);
         Ok(Self {
             data_root,
             decoder,
             cache: Arc::new(RwLock::new(SnapshotCache { identity, snapshot })),
+            ecmwf_route: EcmwfRouteSelector::new(ecmwf_route_state),
         })
+    }
+
+    fn selected_ecmwf_model(&self) -> Result<WeatherModel> {
+        let (model, selected_run) = self.ecmwf_route.selection();
+        let Some(selected_run) = selected_run else {
+            return Ok(model);
+        };
+        let loaded_run = {
+            let guard = self
+                .cache
+                .read()
+                .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
+            match model {
+                WeatherModel::EcmwfIfs025 => guard.identity.ecmwf_ready.as_ref(),
+                WeatherModel::EcmwfIfs9km => guard.identity.ecmwf_ifs9km_ready.as_ref(),
+                WeatherModel::Gfs => unreachable!("ECMWF route selector cannot select GFS"),
+            }
+            .map(|identity| identity.latest_complete_run.as_str())
+            .unwrap_or("")
+            .to_string()
+        };
+        if loaded_run != selected_run {
+            self.refresh_if_changed()?;
+        }
+        let refreshed_run = {
+            let guard = self
+                .cache
+                .read()
+                .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
+            match model {
+                WeatherModel::EcmwfIfs025 => guard.identity.ecmwf_ready.as_ref(),
+                WeatherModel::EcmwfIfs9km => guard.identity.ecmwf_ifs9km_ready.as_ref(),
+                WeatherModel::Gfs => unreachable!("ECMWF route selector cannot select GFS"),
+            }
+            .map(|identity| identity.latest_complete_run.as_str())
+            .unwrap_or("")
+            .to_string()
+        };
+        if refreshed_run != selected_run {
+            anyhow::bail!(
+                "selected ECMWF route run is not loaded: selected={} loaded={}",
+                selected_run,
+                refreshed_run
+            );
+        }
+        Ok(model)
     }
 
     fn snapshot(&self) -> Result<Arc<OmDataSnapshot>> {
@@ -153,6 +210,7 @@ impl AppState {
             "cams_greenhouse": group(guard.identity.cams_greenhouse_ready.as_ref()),
             "ecmwf": group(guard.identity.ecmwf_ready.as_ref()),
             "ecmwf_ifs9km": group(guard.identity.ecmwf_ifs9km_ready.as_ref()),
+            "ecmwf_route": self.ecmwf_route.identity(),
         }))
     }
 
@@ -259,6 +317,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/gfs", get(gfs_forecast))
         .route("/v1/ecmwf", get(ecmwf_forecast).post(ecmwf_forecast_post))
         .route("/v1/ecmwf/catalog", get(ecmwf_catalog))
+        .route("/v1/ecmwf/route-state", get(ecmwf_route_state))
         .route(
             "/v1/ecmwf-ifs9km",
             get(ecmwf_ifs9km_forecast).post(ecmwf_ifs9km_forecast_post),
@@ -290,6 +349,10 @@ async fn source_offer() -> Json<serde_json::Value> {
 
 async fn data_identity(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(state.data_identity()?))
+}
+
+async fn ecmwf_route_state(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(state.ecmwf_route.identity())
 }
 
 fn weather_attribution_payload() -> serde_json::Value {
@@ -441,8 +504,9 @@ async fn ecmwf_forecast(
     Query(mut query): Query<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_explicit_variables(&query)?;
-    query.models = Some("ecmwf_ifs025".to_string());
-    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
+    let model = state.selected_ecmwf_model()?;
+    query.models = Some(model_name(model).to_string());
+    let (snapshot, model_run) = state.weather_snapshot(model)?;
     let decoder = state.decoder.clone();
     let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
@@ -458,8 +522,9 @@ async fn ecmwf_forecast_post(
     Json(mut query): Json<PointQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_explicit_variables(&query)?;
-    query.models = Some("ecmwf_ifs025".to_string());
-    let (snapshot, model_run) = state.weather_snapshot(WeatherModel::EcmwfIfs025)?;
+    let model = state.selected_ecmwf_model()?;
+    query.models = Some(model_name(model).to_string());
+    let (snapshot, model_run) = state.weather_snapshot(model)?;
     let decoder = state.decoder.clone();
     let mut payload = tokio::task::spawn_blocking(move || {
         forecast_for_query(&snapshot, decoder.as_ref(), &query)
@@ -528,6 +593,14 @@ fn attach_model_run(payload: &mut serde_json::Value, model_run: &str) -> Result<
 }
 
 async fn ecmwf_catalog(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    match state.selected_ecmwf_model()? {
+        WeatherModel::EcmwfIfs9km => ecmwf_ifs9km_catalog(State(state)).await,
+        WeatherModel::EcmwfIfs025 => ecmwf_ifs025_catalog(&state),
+        WeatherModel::Gfs => unreachable!("ECMWF route selector cannot select GFS"),
+    }
+}
+
+fn ecmwf_ifs025_catalog(state: &AppState) -> Result<Json<serde_json::Value>, ApiError> {
     let snapshot = state.snapshot()?;
     let product = snapshot.require_product("ecmwf_ifs025")?;
     let probability_product = snapshot.require_product("ecmwf_ifs025_ensemble")?;
@@ -705,7 +778,8 @@ async fn ecmwf_route(
     State(state): State<AppState>,
     Json(mut query): Json<RouteQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    query.models = Some("ecmwf_ifs025".to_string());
+    let model = state.selected_ecmwf_model()?;
+    query.models = Some(model_name(model).to_string());
     let snapshot = state.snapshot()?;
     let decoder = state.decoder.clone();
     let payload =

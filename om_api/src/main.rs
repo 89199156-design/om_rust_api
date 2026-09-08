@@ -20,6 +20,9 @@ struct Args {
 
     #[arg(long, env = "OM_SNAPSHOT_REFRESH_SECONDS", default_value_t = 30)]
     snapshot_refresh_seconds: u64,
+
+    #[arg(long, env = "OM_ECMWF_ROUTE_STATE")]
+    ecmwf_route_state: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -34,7 +37,7 @@ async fn main() -> Result<()> {
         Some(path) => Some(OfficialDecoder::load(path)?),
         None => None,
     };
-    let state = AppState::new(args.data_root, decoder)?;
+    let state = AppState::new_with_ecmwf_route(args.data_root, decoder, args.ecmwf_route_state)?;
     serve(
         state,
         args.bind,

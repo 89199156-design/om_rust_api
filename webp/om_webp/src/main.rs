@@ -400,6 +400,16 @@ impl Scope {
         }
     }
 
+    fn public_link_dir(self) -> &'static str {
+        match self {
+            // The stable ecmwf_ifs025 client path is owned by the runtime
+            // EC9/EC25 router. The renderer publishes the physical EC25
+            // source separately so rebuilding EC25 cannot bypass that router.
+            Self::EcmwfIfs025 => "ecmwf_ifs025_source",
+            _ => self.product_dir(),
+        }
+    }
+
     fn manifest_name(self) -> &'static str {
         match self {
             Self::Gfs => "gfs013_surface_data.json",
@@ -1736,13 +1746,13 @@ fn publish_current(
             public_root.join(format!(".weather_layer_catalog.{}.tmp", std::process::id()));
         fs::write(&catalog_tmp, serde_json::to_vec_pretty(&catalog_payload())?)?;
         fs::rename(catalog_tmp, catalog_path)?;
-        let link = public_root.join(scope.product_dir());
+        let link = public_root.join(scope.public_link_dir());
         if link.exists() && !link.is_symlink() {
             bail!("refusing to replace non-symlink {}", link.display());
         }
         let tmp = public_root.join(format!(
             ".{}.{}.tmp",
-            scope.product_dir(),
+            scope.public_link_dir(),
             std::process::id()
         ));
         if tmp.exists() {
@@ -2227,6 +2237,7 @@ mod tests {
         assert_eq!(args.scope.name(), "ecmwf_ifs025");
         assert_eq!(args.scope.group(), "ecmwf");
         assert_eq!(args.scope.product_dir(), "ecmwf_ifs025");
+        assert_eq!(args.scope.public_link_dir(), "ecmwf_ifs025_source");
         assert_eq!(args.scope.manifest_name(), "ecmwf_ifs025_data.json");
         assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs025);
     }
@@ -2245,6 +2256,7 @@ mod tests {
         assert_eq!(args.scope.name(), "ecmwf_ifs9km");
         assert_eq!(args.scope.group(), "ecmwf_ifs9km");
         assert_eq!(args.scope.product_dir(), "ecmwf_ifs9km");
+        assert_eq!(args.scope.public_link_dir(), "ecmwf_ifs9km");
         assert_eq!(args.scope.manifest_name(), "ecmwf_ifs9km_data.json");
         assert_eq!(args.scope.weather_model(), WeatherModel::EcmwfIfs9km);
     }

@@ -10656,6 +10656,19 @@ fn product_for_variable(
     snapshot: &OmDataSnapshot,
     variable: &str,
 ) -> Result<(&'static str, String)> {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km
+        && variable == "precipitation_probability"
+        && snapshot.product("ecmwf_ifs025_ensemble").is_some()
+    {
+        // IFS 9 km is deterministic and has no probability field. The stable
+        // generic ECMWF client contract nevertheless requests this one
+        // ensemble product, so keep it sourced from the independently
+        // published EC25 ensemble while every deterministic field remains EC9.
+        return Ok((
+            "ecmwf_ifs025_ensemble",
+            "precipitation_probability".to_string(),
+        ));
+    }
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
         let raw_variable = match variable {
             "soil_temperature_0_to_10cm" => "soil_temperature_0_to_7cm",
