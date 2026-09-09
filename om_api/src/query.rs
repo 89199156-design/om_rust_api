@@ -2923,14 +2923,7 @@ pub fn read_variable_value(
                 longitude,
             )?;
             let dewpoint = if current_weather_model() == WeatherModel::EcmwfIfs9km {
-                read_direct_unrounded(
-                    snapshot,
-                    decoder,
-                    "dew_point_2m",
-                    time,
-                    latitude,
-                    longitude,
-                )?
+                read_direct_unrounded(snapshot, decoder, "dew_point_2m", time, latitude, longitude)?
             } else {
                 let relative_humidity = read_direct_unrounded(
                     snapshot,
@@ -12838,6 +12831,17 @@ mod tests {
     }
 
     #[test]
+    fn et0_uses_current_official_nighttime_humidity_approximation() {
+        let value = et0_evapotranspiration(27.5, 2.75, 24.3, 0.0, 0.0, 0.0, 3600);
+        assert_eq!(
+            json_value_for_variable("et0_fao_evapotranspiration", value),
+            serde_json::json!(0.03)
+        );
+        assert_eq!(relative_shortwave_radiation_approximation(0.0), 0.8);
+        assert_eq!(relative_shortwave_radiation_approximation(100.0), 0.4);
+    }
+
+    #[test]
     fn wind_direction_matches_pinned_official_fast_approximation() {
         let inputs = [
             (-1.0, -3.0),
@@ -15051,6 +15055,11 @@ fn weighted_soil_layer_0_to_100cm(shallow: f32, middle: f32, deep: f32) -> f32 {
     shallow * 0.07 + middle * (0.28 - 0.07) + deep * (1.0 - 0.28)
 }
 
+fn relative_shortwave_radiation_approximation(relative_humidity: f32) -> f32 {
+    let relative_humidity_fraction = relative_humidity.clamp(0.0, 100.0) / 100.0;
+    0.8 - relative_humidity_fraction * 0.4
+}
+
 #[allow(clippy::too_many_arguments)]
 fn et0_evapotranspiration(
     temperature: f32,
@@ -15085,7 +15094,7 @@ fn et0_evapotranspiration(
     let relative_humidity = (100.0 * ((17.625 * dewpoint) / (243.04 + dewpoint)).exp()
         / ((17.625 * temperature) / (243.04 + temperature)).exp())
     .clamp(0.0, 100.0);
-    let relative_approximation = 0.4 + relative_humidity / 100.0 * 0.4;
+    let relative_approximation = relative_shortwave_radiation_approximation(relative_humidity);
     let relative_radiation = if extraterrestrial_radiation <= 0.0 {
         relative_approximation
     } else {
