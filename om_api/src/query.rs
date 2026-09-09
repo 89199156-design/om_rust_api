@@ -803,17 +803,21 @@ pub fn ecmwf_public_hourly_variables() -> Vec<String> {
 }
 
 pub fn ecmwf_ifs9km_public_hourly_variables() -> Vec<String> {
-    ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES
+    let mut variables = ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES
         .iter()
         .map(|variable| (*variable).to_string())
-        .collect()
+        .collect::<Vec<_>>();
+    // The generic ECMWF endpoint has a stable client contract that includes
+    // probability. EC9 is deterministic, so this one field is read from the
+    // independently published EC25 ensemble product.
+    variables.push("precipitation_probability".to_string());
+    variables
 }
 
 pub fn ecmwf_ifs9km_public_daily_variables() -> Vec<String> {
     let mut variables = ECMWF_PUBLIC_DAILY_VARIABLES
         .iter()
         .copied()
-        .filter(|variable| !variable.starts_with("precipitation_probability_"))
         .map(str::to_string)
         .collect::<Vec<_>>();
     variables.extend(
@@ -12146,6 +12150,16 @@ mod tests {
         assert!(daily.contains(&"snow_depth_max".to_string()));
         assert!(daily.contains(&"snow_depth_mean".to_string()));
         assert!(daily.contains(&"snow_depth_min".to_string()));
+    }
+
+    #[test]
+    fn ec9_catalog_keeps_generic_ecmwf_probability_contract() {
+        assert!(ecmwf_ifs9km_public_hourly_variables()
+            .contains(&"precipitation_probability".to_string()));
+        let daily = ecmwf_ifs9km_public_daily_variables();
+        assert!(daily.contains(&"precipitation_probability_max".to_string()));
+        assert!(daily.contains(&"precipitation_probability_mean".to_string()));
+        assert!(daily.contains(&"precipitation_probability_min".to_string()));
     }
 
     #[test]
