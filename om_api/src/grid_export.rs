@@ -1,7 +1,7 @@
 use crate::official::OfficialDecoder;
 use crate::query::{
-    read_variable_grid_series, round_variable_output_value, unit_for_variable, with_weather_model,
-    WeatherModel,
+    is_supported_hourly_grid_variable, read_variable_grid_series, round_variable_output_value,
+    unit_for_variable, with_weather_model, WeatherModel,
 };
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{bail, Context, Result};
@@ -430,7 +430,20 @@ pub fn catalog(
     }))
 }
 
-fn validate_request(model: GridModel, variable: &str, valid_time: DateTime<Utc>) -> Result<()> {
+fn model_has_source_variable(snapshot: &OmDataSnapshot, model: GridModel, variable: &str) -> bool {
+    model.products().iter().any(|product_name| {
+        snapshot
+            .product(product_name)
+            .is_some_and(|product| product.entries.keys().any(|key| key.variable == variable))
+    })
+}
+
+fn validate_request(
+    snapshot: &OmDataSnapshot,
+    model: GridModel,
+    variable: &str,
+    valid_time: DateTime<Utc>,
+) -> Result<()> {
     if variable.is_empty()
         || variable.len() > 128
         || !variable
@@ -457,6 +470,12 @@ fn validate_request(model: GridModel, variable: &str, valid_time: DateTime<Utc>)
     {
         bail!("CAMS grid export only accepts source concentration and aerosol variables");
     }
+    let source_variable = model_has_source_variable(snapshot, model, variable);
+    let supported_derived = model != GridModel::Cams
+        && is_supported_hourly_grid_variable(model.weather_model(), variable);
+    if !source_variable && !supported_derived {
+        bail!("variable is not available for {}: {variable}", model.name());
+    }
     Ok(())
 }
 
@@ -469,7 +488,7 @@ pub fn encode_grid_file(
     valid_time: DateTime<Utc>,
     requested_bounds: Option<RequestedBounds>,
 ) -> Result<EncodedGridFile> {
-    validate_request(model, variable, valid_time)?;
+    validate_request(snapshot, model, variable, valid_time)?;
     let grid = output_grid(snapshot, model, requested_bounds)?;
     let point_count = grid.point_count()?;
     let latitude_block_rows = if model == GridModel::EcmwfIfs9km {

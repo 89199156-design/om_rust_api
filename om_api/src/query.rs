@@ -992,6 +992,14 @@ fn is_ecmwf_ifs9km_public_hourly_variable(variable: &str) -> bool {
         || variable == "precipitation_probability"
 }
 
+pub fn is_supported_hourly_grid_variable(model: WeatherModel, variable: &str) -> bool {
+    match model {
+        WeatherModel::Gfs => is_public_hourly_variable(variable),
+        WeatherModel::EcmwfIfs025 => is_ecmwf_public_hourly_variable(variable),
+        WeatherModel::EcmwfIfs9km => is_ecmwf_ifs9km_public_hourly_variable(variable),
+    }
+}
+
 fn is_gfs_public_daily_variable(variable: &str) -> bool {
     matches!(
         variable,
@@ -3761,6 +3769,23 @@ pub fn read_variable_grid_series(
 ) -> Result<Vec<Vec<f32>>> {
     if times.is_empty() || requested_latitudes.is_empty() || requested_longitudes.is_empty() {
         bail!("regional grid series dimensions must not be empty");
+    }
+    if variable == "carbon_monoxide"
+        && current_weather_model() == WeatherModel::Gfs
+        && snapshot.product("cams_global").is_some()
+    {
+        return times
+            .iter()
+            .map(|time| {
+                read_cams_mixed_carbon_monoxide_grid(
+                    snapshot,
+                    decoder,
+                    *time,
+                    requested_latitudes,
+                    requested_longitudes,
+                )
+            })
+            .collect();
     }
     let selected_sampling = if requested_latitudes.len() == 1 && requested_longitudes.len() == 1 {
         current_product_sampling(current_weather_model().primary_product())
@@ -9120,6 +9145,316 @@ fn read_cams_mixed_carbon_monoxide(
     Ok(high[0])
 }
 
+fn read_cams_mixed_carbon_monoxide_grid(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<f32>> {
+    let point_count = latitudes
+        .len()
+        .checked_mul(longitudes.len())
+        .context("CAMS carbon monoxide grid size overflow")?;
+    let mut high = Vec::with_capacity(4);
+    let mut low = Vec::with_capacity(4);
+    for offset in 0..=3 {
+        let sample_time = time + Duration::hours(offset);
+        high.push(read_cams_greenhouse_carbon_monoxide_grid_for_mixer(
+            snapshot,
+            decoder,
+            sample_time,
+            latitudes,
+            longitudes,
+        )?);
+        low.push(read_cams_product_history_grid_with_rounding(
+            snapshot,
+            decoder,
+            "cams_global",
+            "carbon_monoxide",
+            "carbon_monoxide",
+            sample_time,
+            latitudes,
+            longitudes,
+            true,
+        )?);
+    }
+    if high.iter().any(|frame| frame.len() != point_count)
+        || low.iter().any(|frame| frame.len() != point_count)
+    {
+        bail!("CAMS carbon monoxide mixer returned an incomplete grid");
+    }
+    integrate_cams_carbon_monoxide_if_nan_smooth(&mut high, &low, point_count);
+    Ok(high.remove(0))
+}
+
+fn integrate_cams_carbon_monoxide_if_nan_smooth(
+    high: &mut [Vec<f32>],
+    low: &[Vec<f32>],
+    point_count: usize,
+) {
+    debug_assert_eq!(high.len(), low.len());
+    for point in 0..point_count {
+        let mut steps_since_nan = 3_i32;
+        for index in (0..high.len()).rev() {
+            steps_since_nan += 1;
+            let low_value = low[index][point];
+            if low_value.is_nan() {
+                continue;
+            }
+            let high_value = &mut high[index][point];
+            if high_value.is_nan() {
+                steps_since_nan = 0;
+                *high_value = low_value;
+                continue;
+            }
+            if steps_since_nan <= 3 {
+                *high_value = (low_value * (4 - steps_since_nan) as f32
+                    + *high_value * steps_since_nan as f32)
+                    / 4.0;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_cams_product_history_grid_with_rounding(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    product_name: &str,
+    variable: &str,
+    raw_variable: &str,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Vec<f32>> {
+    let point_count = latitudes
+        .len()
+        .checked_mul(longitudes.len())
+        .context("CAMS grid size overflow")?;
+    let products = snapshot.product_snapshots(product_name);
+    let mut output = vec![f32::NAN; point_count];
+    let mut found_coverage = false;
+    for product in newest_and_previous_products(&products) {
+        if !product_covers_time(product, raw_variable, time) {
+            continue;
+        }
+        found_coverage = true;
+        let values = read_product_grid_with_rounding(
+            product,
+            decoder,
+            variable,
+            raw_variable,
+            time,
+            latitudes,
+            longitudes,
+            round_values,
+        )?;
+        fill_nan_from_fallback(&mut output, &values);
+        if output.iter().all(|value| value.is_finite()) {
+            break;
+        }
+    }
+    if found_coverage
+        || products.iter().any(|product| {
+            product
+                .entries
+                .keys()
+                .any(|key| key.variable == raw_variable)
+        })
+    {
+        return Ok(output);
+    }
+    bail!("variable is not available in CAMS product {product_name}: {raw_variable}")
+}
+
+fn read_cams_greenhouse_carbon_monoxide_grid_for_mixer(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<f32>> {
+    let point_count = latitudes
+        .len()
+        .checked_mul(longitudes.len())
+        .context("CAMS greenhouse grid size overflow")?;
+    let products = snapshot.product_snapshots("cams_global_greenhouse_gases");
+    let Some(product) = products.first().cloned() else {
+        return Ok(vec![f32::NAN; point_count]);
+    };
+    if let Some(covering) = newest_and_previous_products(&products)
+        .find(|candidate| product_covers_time(candidate, "carbon_monoxide", time))
+    {
+        return read_cams_greenhouse_carbon_monoxide_grid_with_history(
+            snapshot, covering, decoder, time, latitudes, longitudes,
+        );
+    }
+    let native_times = native_times_for_variable(&product, "carbon_monoxide");
+    let (Some(first), Some(last)) = (native_times.first().copied(), native_times.last().copied())
+    else {
+        return Ok(vec![f32::NAN; point_count]);
+    };
+    if time < first {
+        return Ok(vec![f32::NAN; point_count]);
+    }
+    let cadence = native_times
+        .windows(2)
+        .next()
+        .map(|pair| pair[1] - pair[0])
+        .unwrap_or_else(|| Duration::hours(3));
+    if time <= last || time >= last + cadence {
+        return Ok(vec![f32::NAN; point_count]);
+    }
+    let b = read_native_grid(
+        &product,
+        decoder,
+        "carbon_monoxide",
+        last,
+        latitudes,
+        longitudes,
+    )?;
+    let a_time = last - cadence;
+    let a = read_cams_greenhouse_retained_native_grid(
+        snapshot, decoder, a_time, latitudes, longitudes,
+    )?
+    .unwrap_or_else(|| b.clone());
+    let fraction = (time - last).num_seconds() as f32 / cadence.num_seconds() as f32;
+    Ok(cams_carbon_monoxide_hermite_grid(
+        a,
+        b.clone(),
+        b.clone(),
+        b,
+        fraction,
+    ))
+}
+
+fn read_cams_greenhouse_carbon_monoxide_grid_with_history(
+    snapshot: &OmDataSnapshot,
+    product: &ProductSnapshot,
+    decoder: &OfficialDecoder,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Vec<f32>> {
+    let native_times = native_times_for_variable(product, "carbon_monoxide");
+    let point_count = latitudes
+        .len()
+        .checked_mul(longitudes.len())
+        .context("CAMS greenhouse grid size overflow")?;
+    let Some((index, fraction)) = interpolation_index(&native_times, time) else {
+        return Ok(vec![f32::NAN; point_count]);
+    };
+    let b = read_native_grid(
+        product,
+        decoder,
+        "carbon_monoxide",
+        native_times[index],
+        latitudes,
+        longitudes,
+    )?;
+    if index + 1 >= native_times.len() {
+        return Ok(b
+            .into_iter()
+            .map(|value| round_to_scalefactor(value, 1.0).clamp(0.0, f32::INFINITY))
+            .collect());
+    }
+    let stride = Duration::seconds(interpolation_stride_seconds(&native_times, index));
+    let a_time = native_times[index] - stride;
+    let a = if native_times.binary_search(&a_time).is_ok() {
+        read_native_grid(
+            product,
+            decoder,
+            "carbon_monoxide",
+            a_time,
+            latitudes,
+            longitudes,
+        )?
+    } else {
+        read_cams_greenhouse_retained_native_grid(snapshot, decoder, a_time, latitudes, longitudes)?
+            .unwrap_or_else(|| b.clone())
+    };
+    let c = read_native_grid(
+        product,
+        decoder,
+        "carbon_monoxide",
+        native_times[index + 1],
+        latitudes,
+        longitudes,
+    )?;
+    let d_time = native_times[index + 1] + stride;
+    let d = if native_times.binary_search(&d_time).is_ok() {
+        read_native_grid(
+            product,
+            decoder,
+            "carbon_monoxide",
+            d_time,
+            latitudes,
+            longitudes,
+        )?
+    } else {
+        b.clone()
+    };
+    Ok(cams_carbon_monoxide_hermite_grid(a, b, c, d, fraction))
+}
+
+fn read_cams_greenhouse_retained_native_grid(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    time: DateTime<Utc>,
+    latitudes: &[f64],
+    longitudes: &[f64],
+) -> Result<Option<Vec<f32>>> {
+    for product in snapshot.product_snapshots("cams_global_greenhouse_gases") {
+        if product.entries.contains_key(&EntryKey {
+            variable: "carbon_monoxide".to_string(),
+            valid_time_utc: time,
+        }) {
+            return read_native_grid(
+                &product,
+                decoder,
+                "carbon_monoxide",
+                time,
+                latitudes,
+                longitudes,
+            )
+            .map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn cams_carbon_monoxide_hermite_grid(
+    a: Vec<f32>,
+    b: Vec<f32>,
+    c: Vec<f32>,
+    d: Vec<f32>,
+    fraction: f32,
+) -> Vec<f32> {
+    a.into_iter()
+        .zip(b)
+        .zip(c)
+        .zip(d)
+        .map(|(((a, b), c), d)| {
+            let a = if a.is_finite() { a } else { b };
+            let c = if c.is_finite() { c } else { b };
+            let d = if d.is_finite() { d } else { b };
+            let coefficient_a = -a / 2.0 + (3.0 * b) / 2.0 - (3.0 * c) / 2.0 + d / 2.0;
+            let coefficient_b = a - (5.0 * b) / 2.0 + 2.0 * c - d / 2.0;
+            let coefficient_c = -a / 2.0 + c / 2.0;
+            round_to_scalefactor(
+                coefficient_a * fraction * fraction * fraction
+                    + coefficient_b * fraction * fraction
+                    + coefficient_c * fraction
+                    + b,
+                1.0,
+            )
+            .clamp(0.0, f32::INFINITY)
+        })
+        .collect()
+}
+
 fn read_cams_greenhouse_carbon_monoxide_for_mixer(
     snapshot: &OmDataSnapshot,
     decoder: Option<&OfficialDecoder>,
@@ -12381,6 +12716,37 @@ mod tests {
             ]
         );
         assert!(high[7][0].is_nan());
+    }
+
+    #[test]
+    fn cams_carbon_monoxide_grid_mixer_blends_each_point_independently() {
+        let mut high = vec![
+            vec![10.0, 100.0],
+            vec![20.0, 110.0],
+            vec![30.0, 120.0],
+            vec![f32::NAN, 130.0],
+        ];
+        let low = vec![
+            vec![50.0, 500.0],
+            vec![60.0, 510.0],
+            vec![70.0, 520.0],
+            vec![80.0, 530.0],
+        ];
+
+        integrate_cams_carbon_monoxide_if_nan_smooth(&mut high, &low, 2);
+
+        assert_eq!(high[0], vec![20.0, 100.0]);
+        assert_eq!(high[1], vec![40.0, 110.0]);
+        assert_eq!(high[2], vec![60.0, 120.0]);
+        assert_eq!(high[3], vec![80.0, 130.0]);
+    }
+
+    #[test]
+    fn cams_carbon_monoxide_grid_hermite_matches_linear_control_points() {
+        let values =
+            cams_carbon_monoxide_hermite_grid(vec![10.0], vec![20.0], vec![30.0], vec![40.0], 0.5);
+
+        assert_eq!(values, vec![25.0]);
     }
 
     #[test]
