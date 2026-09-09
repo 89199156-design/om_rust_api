@@ -994,7 +994,9 @@ fn is_ecmwf_ifs9km_public_hourly_variable(variable: &str) -> bool {
 
 pub fn is_supported_hourly_grid_variable(model: WeatherModel, variable: &str) -> bool {
     match model {
-        WeatherModel::Gfs => is_public_hourly_variable(variable),
+        WeatherModel::Gfs => {
+            is_public_hourly_variable(variable) && !is_air_quality_variable(variable)
+        }
         WeatherModel::EcmwfIfs025 => is_ecmwf_public_hourly_variable(variable),
         WeatherModel::EcmwfIfs9km => is_ecmwf_ifs9km_public_hourly_variable(variable),
     }
@@ -12747,6 +12749,22 @@ mod tests {
             cams_carbon_monoxide_hermite_grid(vec![10.0], vec![20.0], vec![30.0], vec![40.0], 0.5);
 
         assert_eq!(values, vec![25.0]);
+    }
+
+    #[test]
+    fn internal_gfs_grid_variables_do_not_admit_cams_fields() {
+        assert!(is_supported_hourly_grid_variable(
+            WeatherModel::Gfs,
+            "temperature_2m"
+        ));
+        assert!(!is_supported_hourly_grid_variable(
+            WeatherModel::Gfs,
+            "carbon_monoxide"
+        ));
+        assert!(!is_supported_hourly_grid_variable(
+            WeatherModel::Gfs,
+            "pm2_5"
+        ));
     }
 
     #[test]
