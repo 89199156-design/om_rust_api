@@ -102,18 +102,20 @@ pub enum SunTransit {
     Transit { rise_seconds: i64, set_seconds: i64 },
 }
 
+fn sun_transit_hour_angle_cosine(latitude: f32, declination: f32) -> f32 {
+    let alpha = radians(0.83333);
+    let latitude = radians(latitude);
+    let declination = radians(declination);
+    -(alpha.sin() + latitude.sin() * declination.sin()) / (latitude.cos() * declination.cos())
+}
+
 /// Exact Float-port of Open-Meteo's `Zensun.calculateSunTransit` at the pinned
 /// source revision. Offsets are seconds from the supplied UTC-midnight axis.
 pub fn sun_transit(utc_midnight: DateTime<Utc>, latitude: f32, longitude: f32) -> SunTransit {
-    let local_midday =
-        utc_midnight + chrono::Duration::seconds(((12.0 - longitude / 15.0) * 3600.0) as i64);
-    let position = sun_position(local_midday);
-    let declination = radians(position.declination_degrees);
-    let alpha = radians(0.83333);
-    let latitude = radians(latitude);
     let noon = 12.0 - longitude / 15.0;
-    let arg =
-        -(alpha.sin() + latitude.sin() * declination.sin()) / (latitude.cos() * declination.cos());
+    let local_midday = utc_midnight + chrono::Duration::seconds((noon * 3600.0) as i64);
+    let position = sun_position(local_midday);
+    let arg = sun_transit_hour_angle_cosine(latitude, position.declination_degrees);
     if arg > 1.0 {
         return SunTransit::PolarNight;
     }
@@ -121,9 +123,21 @@ pub fn sun_transit(utc_midnight: DateTime<Utc>, latitude: f32, longitude: f32) -
         return SunTransit::PolarDay;
     }
     let hours = arg.acos() / radians(15.0);
+    let refine = |approximation: f32, hour_angle_sign: f32| {
+        let time = utc_midnight + chrono::Duration::seconds((approximation * 3600.0) as i64);
+        let event_position = sun_position(time);
+        let event_arg = sun_transit_hour_angle_cosine(latitude, event_position.declination_degrees);
+        if !(-1.0..=1.0).contains(&event_arg) {
+            return approximation;
+        }
+        noon + hour_angle_sign * event_arg.acos() / radians(15.0)
+            - event_position.equation_of_time_hours
+    };
+    let sunrise = refine(noon - hours - position.equation_of_time_hours, -1.0);
+    let sunset = refine(noon + hours - position.equation_of_time_hours, 1.0);
     SunTransit::Transit {
-        rise_seconds: ((noon - hours - position.equation_of_time_hours) * 3600.0) as i64,
-        set_seconds: ((noon + hours - position.equation_of_time_hours) * 3600.0) as i64,
+        rise_seconds: (sunrise * 3600.0) as i64,
+        set_seconds: (sunset * 3600.0) as i64,
     }
 }
 
@@ -578,6 +592,16 @@ mod tests {
         let after_sunrise = Utc.with_ymd_and_hms(2026, 7, 14, 23, 0, 0).unwrap();
         assert_eq!(is_day(before_sunrise, 29.580215, 106.52344), 0.0);
         assert_eq!(is_day(after_sunrise, 29.580215, 106.52344), 1.0);
+    }
+
+    #[test]
+    fn sun_transit_refines_the_current_official_ec9_sunset() {
+        let midnight = Utc.with_ymd_and_hms(2026, 9, 12, 0, 0, 0).unwrap();
+        let SunTransit::Transit { set_seconds, .. } = sun_transit(midnight, 19.999998, 134.01001)
+        else {
+            panic!("expected a normal sunset")
+        };
+        assert_eq!(set_seconds / 60, 9 * 60 + 9);
     }
 
     #[test]
