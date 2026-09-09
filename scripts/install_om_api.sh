@@ -10,6 +10,9 @@ INSTALL_OWNER="${OM_API_USER:-ubuntu}"
 API_DEM_ROOT="${OM_API_DEM_ROOT:-$INSTALL_DIR/static}"
 MODEL_STATIC_ROOT="${OM_API_MODEL_STATIC_ROOT:-$INSTALL_DIR}"
 ECMWF_ROUTE_STATE="${OM_ECMWF_ROUTE_STATE:-/opt/1panel/apps/weather/data/ecmwf_ifs025/route_state.json}"
+INTERNAL_GRID_TOKEN_FILE="${OM_INTERNAL_GRID_TOKEN_FILE:-$INSTALL_DIR/secrets/internal-grid-token}"
+INTERNAL_GRID_MAX_CONCURRENT="${OM_INTERNAL_GRID_MAX_CONCURRENT:-1}"
+INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS="${OM_INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS:-30}"
 STRICT_DATA_ROOT="${OM_STRICT_DATA_ROOT:-}"
 CONFIGURE_HOST_NGINX="${OM_API_CONFIGURE_HOST_NGINX:-auto}"
 HOST_NGINX_ROOT="${OM_API_HOST_NGINX_ROOT:-/etc/nginx}"
@@ -53,6 +56,18 @@ if [[ "$API_DEM_ROOT" != /* ]]; then
 fi
 if [[ "$MODEL_STATIC_ROOT" != /* ]]; then
   echo "OM_API_MODEL_STATIC_ROOT must be an absolute path: $MODEL_STATIC_ROOT" >&2
+  exit 2
+fi
+if [[ "$INTERNAL_GRID_TOKEN_FILE" != /* ]]; then
+  echo "OM_INTERNAL_GRID_TOKEN_FILE must be an absolute path: $INTERNAL_GRID_TOKEN_FILE" >&2
+  exit 2
+fi
+if [[ ! "$INTERNAL_GRID_MAX_CONCURRENT" =~ ^[1-9][0-9]*$ ]]; then
+  echo "OM_INTERNAL_GRID_MAX_CONCURRENT must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "OM_INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS must be a non-negative integer" >&2
   exit 2
 fi
 if [[ "$HOST_NGINX_ROOT" != /* ]]; then
@@ -218,6 +233,31 @@ run_privileged() {
     "$@"
   fi
 }
+
+install_internal_grid_token() (
+  set -euo pipefail
+
+  local token_dir
+  local token_tmp
+  token_dir="$(dirname -- "$INTERNAL_GRID_TOKEN_FILE")"
+  run_privileged install -d -o root -g "$INSTALL_OWNER" -m 0750 -- "$token_dir"
+  if run_privileged test -s "$INTERNAL_GRID_TOKEN_FILE"; then
+    run_privileged chown root:"$INSTALL_OWNER" -- "$INTERNAL_GRID_TOKEN_FILE"
+    run_privileged chmod 0640 -- "$INTERNAL_GRID_TOKEN_FILE"
+    echo "internal_grid_token=reused"
+    exit 0
+  fi
+  token_tmp="$(mktemp)"
+  trap 'rm -f -- "$token_tmp"' EXIT
+  LC_ALL=C od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$token_tmp"
+  if ! grep -Eq '^[0-9a-f]{64}$' "$token_tmp"; then
+    echo "failed to generate internal grid token" >&2
+    exit 1
+  fi
+  run_privileged install -o root -g "$INSTALL_OWNER" -m 0640 -- \
+    "$token_tmp" "$INTERNAL_GRID_TOKEN_FILE"
+  echo "internal_grid_token=created"
+)
 
 run_privileged install -d -m 0755 "$MODEL_STATIC_ROOT"
 system_device="$(stat -c %d /)"
@@ -405,6 +445,7 @@ install_verified_static_asset \
   "ECMWF IFS 9 km" "$ECMWF_IFS9KM_STATIC_URL" \
   "$ECMWF_IFS9KM_STATIC_SHA256" "$ECMWF_IFS9KM_STATIC_PATH"
 
+install_internal_grid_token
 install_corresponding_source_archive
 
 OM_FILE_FORMAT_REF="${OM_FILE_FORMAT_REF:-$PINNED_OM_FILE_FORMAT_REF}"
@@ -485,6 +526,9 @@ OM_API_BIND=$BIND_ADDR
 OM_OMFILE_LIB=$NATIVE_DIR/libomfileformat.so
 OM_SNAPSHOT_REFRESH_SECONDS=0
 OM_ECMWF_ROUTE_STATE=$ECMWF_ROUTE_STATE
+OM_INTERNAL_GRID_TOKEN_FILE=$INTERNAL_GRID_TOKEN_FILE
+OM_INTERNAL_GRID_MAX_CONCURRENT=$INTERNAL_GRID_MAX_CONCURRENT
+OM_INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS=$INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS
 RAYON_NUM_THREADS=$RAYON_THREADS
 RUST_LOG=info,tower_http=warn
 EOF

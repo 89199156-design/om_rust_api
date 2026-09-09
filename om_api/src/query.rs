@@ -14728,7 +14728,7 @@ fn apparent_temperature(
         - 4.25
 }
 
-fn unit_for_variable(variable: &str) -> &'static str {
+pub fn unit_for_variable(variable: &str) -> &'static str {
     if variable.ends_with("hPa") {
         if variable.starts_with("temperature_") {
             return "°C";

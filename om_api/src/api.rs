@@ -1,4 +1,8 @@
 use crate::ecmwf_route::{model_name, EcmwfRouteSelector};
+use crate::grid_export::{
+    catalog as grid_catalog_payload, encode_grid_file, GridModel, GridReleaseIdentity,
+    RequestedBounds,
+};
 use crate::official::OfficialDecoder;
 use crate::query::{
     ecmwf_ifs9km_public_daily_variables, ecmwf_ifs9km_public_hourly_variables,
@@ -9,13 +13,14 @@ use crate::query::{
 use crate::snapshot::OmDataSnapshot;
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -23,6 +28,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 
 const SOURCE_REPOSITORY: &str = "https://github.com/89199156-design/om_rust_api";
@@ -40,11 +46,44 @@ pub struct AppState {
     decoder: Option<OfficialDecoder>,
     cache: Arc<RwLock<SnapshotCache>>,
     ecmwf_route: EcmwfRouteSelector,
+    internal_grid_token_file: Option<PathBuf>,
+    internal_grid_permits: Arc<Semaphore>,
+    internal_grid_queue_timeout: Duration,
 }
 
 struct SnapshotCache {
     identity: SnapshotIdentity,
     snapshot: Arc<OmDataSnapshot>,
+}
+
+fn authorize_internal_grid_token_file(path: Option<&Path>, headers: &HeaderMap) -> Result<()> {
+    let path = path.context("internal grid API is disabled")?;
+    if !path.is_absolute() {
+        anyhow::bail!("internal grid token path must be absolute");
+    }
+    let expected = fs::read_to_string(path)
+        .with_context(|| format!("read internal grid token file {}", path.display()))?;
+    let expected = expected.trim();
+    if expected.len() < 32 || expected.chars().any(char::is_whitespace) {
+        anyhow::bail!("internal grid token file is invalid");
+    }
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let expected_digest = sha2::Sha256::digest(expected.as_bytes());
+    let supplied_digest = sha2::Sha256::digest(supplied.as_bytes());
+    let mismatch = expected_digest
+        .iter()
+        .zip(supplied_digest.iter())
+        .fold(0_u8, |difference, (expected, supplied)| {
+            difference | (expected ^ supplied)
+        });
+    if mismatch != 0 {
+        anyhow::bail!("internal grid authorization failed");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +159,24 @@ impl AppState {
         decoder: Option<OfficialDecoder>,
         ecmwf_route_state: Option<PathBuf>,
     ) -> Result<Self> {
+        let internal_grid_max_concurrent = std::env::var("OM_INTERNAL_GRID_MAX_CONCURRENT")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .context("OM_INTERNAL_GRID_MAX_CONCURRENT must be a positive integer")?
+            .unwrap_or(1);
+        if internal_grid_max_concurrent == 0 {
+            anyhow::bail!("OM_INTERNAL_GRID_MAX_CONCURRENT must be a positive integer");
+        }
+        let internal_grid_queue_timeout_seconds =
+            std::env::var("OM_INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS")
+                .ok()
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .context("OM_INTERNAL_GRID_QUEUE_TIMEOUT_SECONDS must be an integer")?
+                .unwrap_or(30);
+        let internal_grid_token_file =
+            std::env::var_os("OM_INTERNAL_GRID_TOKEN_FILE").map(PathBuf::from);
         let identity = SnapshotIdentity::read(&data_root)?;
         let snapshot = Arc::new(OmDataSnapshot::load(&data_root)?);
         Ok(Self {
@@ -127,6 +184,9 @@ impl AppState {
             decoder,
             cache: Arc::new(RwLock::new(SnapshotCache { identity, snapshot })),
             ecmwf_route: EcmwfRouteSelector::new(ecmwf_route_state),
+            internal_grid_token_file,
+            internal_grid_permits: Arc::new(Semaphore::new(internal_grid_max_concurrent)),
+            internal_grid_queue_timeout: Duration::from_secs(internal_grid_queue_timeout_seconds),
         })
     }
 
@@ -231,6 +291,41 @@ impl AppState {
         Ok((guard.snapshot.clone(), identity.latest_complete_run.clone()))
     }
 
+    fn grid_snapshot(
+        &self,
+        model: GridModel,
+    ) -> Result<(Arc<OmDataSnapshot>, GridReleaseIdentity)> {
+        let guard = self
+            .cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("snapshot cache poisoned"))?;
+        let identity = match model {
+            GridModel::Gfs => guard.identity.gfs_ready.as_ref(),
+            GridModel::EcmwfIfs025 => guard.identity.ecmwf_ready.as_ref(),
+            GridModel::EcmwfIfs9km => guard.identity.ecmwf_ifs9km_ready.as_ref(),
+            GridModel::Cams => guard.identity.cams_ready.as_ref(),
+        }
+        .context("requested grid group marker is unavailable")?;
+        if identity.status != "complete"
+            || identity.runtime_format != "openmeteo-native-v1"
+            || identity.latest_complete_run.is_empty()
+            || identity.coverage_id.is_empty()
+        {
+            anyhow::bail!("requested grid group is not a complete native release");
+        }
+        Ok((
+            guard.snapshot.clone(),
+            GridReleaseIdentity {
+                model_run: identity.latest_complete_run.clone(),
+                coverage_id: identity.coverage_id.clone(),
+            },
+        ))
+    }
+
+    fn authorize_internal_grid(&self, headers: &HeaderMap) -> Result<()> {
+        authorize_internal_grid_token_file(self.internal_grid_token_file.as_deref(), headers)
+    }
+
     fn refresh_if_changed(&self) -> Result<bool> {
         let identity_before = SnapshotIdentity::read(&self.data_root)?;
         {
@@ -324,6 +419,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/ecmwf-ifs9km/catalog", get(ecmwf_ifs9km_catalog))
         .route("/v1/cams", get(cams_forecast))
+        .route("/v1/internal/grid", get(internal_grid))
+        .route("/v1/internal/grid/catalog", get(internal_grid_catalog))
         .route("/v1/route", post(route))
         .route("/v1/ecmwf/route", post(ecmwf_route))
         .route("/v1/ecmwf-ifs9km/route", post(ecmwf_ifs9km_route))
@@ -761,6 +858,232 @@ async fn cams_forecast(
     Ok(Json(payload))
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalGridCatalogQuery {
+    model: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalGridQuery {
+    model: String,
+    variable: String,
+    valid_time: String,
+    #[serde(default)]
+    expected_run: Option<String>,
+    #[serde(default)]
+    west: Option<f64>,
+    #[serde(default)]
+    east: Option<f64>,
+    #[serde(default)]
+    south: Option<f64>,
+    #[serde(default)]
+    north: Option<f64>,
+}
+
+impl InternalGridQuery {
+    fn requested_bounds(&self) -> Result<Option<RequestedBounds>> {
+        match (self.west, self.east, self.south, self.north) {
+            (None, None, None, None) => Ok(None),
+            (Some(west), Some(east), Some(south), Some(north)) => Ok(Some(
+                RequestedBounds {
+                    west,
+                    east,
+                    south,
+                    north,
+                }
+                .validate()?,
+            )),
+            _ => anyhow::bail!("west, east, south and north must be supplied together"),
+        }
+    }
+
+    fn valid_time(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(&self.valid_time)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .with_context(|| "valid_time must be RFC3339, for example 2026-09-10T03:00:00Z")
+    }
+}
+
+fn internal_grid_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": message.into(),
+        })),
+    )
+        .into_response()
+}
+
+async fn internal_grid_catalog(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InternalGridCatalogQuery>,
+) -> Response {
+    if let Err(error) = state.authorize_internal_grid(&headers) {
+        let status = if error.to_string() == "internal grid authorization failed" {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return internal_grid_error(status, error.to_string());
+    }
+    let model = match GridModel::parse(&query.model) {
+        Ok(model) => model,
+        Err(error) => return internal_grid_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let (snapshot, release) = match state.grid_snapshot(model) {
+        Ok(context) => context,
+        Err(error) => {
+            return internal_grid_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+        }
+    };
+    match grid_catalog_payload(&snapshot, model, &release) {
+        Ok(payload) => Json(payload).into_response(),
+        Err(error) => internal_grid_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+    }
+}
+
+async fn internal_grid(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InternalGridQuery>,
+) -> Response {
+    if let Err(error) = state.authorize_internal_grid(&headers) {
+        let status = if error.to_string() == "internal grid authorization failed" {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return internal_grid_error(status, error.to_string());
+    }
+    let model = match GridModel::parse(&query.model) {
+        Ok(model) => model,
+        Err(error) => return internal_grid_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let valid_time = match query.valid_time() {
+        Ok(value) => value,
+        Err(error) => return internal_grid_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let requested_bounds = match query.requested_bounds() {
+        Ok(bounds) => bounds,
+        Err(error) => return internal_grid_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let (snapshot, release) = match state.grid_snapshot(model) {
+        Ok(context) => context,
+        Err(error) => {
+            return internal_grid_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+        }
+    };
+    if query
+        .expected_run
+        .as_deref()
+        .is_some_and(|expected| expected != release.model_run)
+    {
+        return internal_grid_error(
+            StatusCode::CONFLICT,
+            format!(
+                "model run changed: expected {}, current {}",
+                query.expected_run.as_deref().unwrap_or_default(),
+                release.model_run
+            ),
+        );
+    }
+    let Some(decoder) = state.decoder.clone() else {
+        return internal_grid_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "official OM decoder is unavailable",
+        );
+    };
+    let permit = match tokio::time::timeout(
+        state.internal_grid_queue_timeout,
+        state.internal_grid_permits.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return internal_grid_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "internal grid worker is shutting down",
+            )
+        }
+        Err(_) => {
+            return internal_grid_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "internal grid worker is busy; retry later",
+            )
+        }
+    };
+    let variable = query.variable.clone();
+    let release_for_worker = release.clone();
+    let generated = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        encode_grid_file(
+            &snapshot,
+            &decoder,
+            model,
+            release_for_worker,
+            &variable,
+            valid_time,
+            requested_bounds,
+        )
+    })
+    .await;
+    let encoded = match generated {
+        Ok(Ok(encoded)) => encoded,
+        Ok(Err(error)) => {
+            return internal_grid_error(StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+        }
+        Err(error) => {
+            return internal_grid_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("internal grid worker failed: {error}"),
+            )
+        }
+    };
+    let filename = format!(
+        "{}_{}_{}_{}.wgrid",
+        model.name(),
+        query.variable,
+        valid_time.format("%Y%m%d%H"),
+        release.model_run
+    );
+    let mut response = Response::new(encoded.bytes.into());
+    *response.status_mut() = StatusCode::OK;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.weather-grid-v1"),
+    );
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            .expect("validated model and variable produce a valid filename"),
+    );
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-weather-model-run"),
+        HeaderValue::from_str(&release.model_run).expect("validated run is a header value"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-weather-coverage-id"),
+        HeaderValue::from_str(&release.coverage_id).expect("validated coverage is a header value"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-weather-grid-payload-sha256"),
+        HeaderValue::from_str(&encoded.payload_sha256).expect("SHA-256 is a header value"),
+    );
+    response_headers.insert(
+        HeaderName::from_static("x-weather-grid-points"),
+        HeaderValue::from_str(&encoded.point_count.to_string())
+            .expect("point count is a header value"),
+    );
+    response
+}
+
 async fn route(
     State(state): State<AppState>,
     Json(query): Json<RouteQuery>,
@@ -831,6 +1154,47 @@ mod tests {
     use axum::http::Request;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    #[test]
+    fn internal_grid_token_is_required_and_can_rotate_without_restart() {
+        let root = TempDir::new().unwrap();
+        let token_path = root.path().join("internal-grid-token");
+        let first = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let second = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        fs::write(&token_path, format!("{first}\n")).unwrap();
+
+        let mut headers = HeaderMap::new();
+        assert!(authorize_internal_grid_token_file(Some(&token_path), &headers).is_err());
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {first}")).unwrap(),
+        );
+        authorize_internal_grid_token_file(Some(&token_path), &headers).unwrap();
+
+        fs::write(&token_path, format!("{second}\n")).unwrap();
+        assert!(authorize_internal_grid_token_file(Some(&token_path), &headers).is_err());
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {second}")).unwrap(),
+        );
+        authorize_internal_grid_token_file(Some(&token_path), &headers).unwrap();
+    }
+
+    #[test]
+    fn internal_grid_query_requires_a_complete_exact_window() {
+        let query = InternalGridQuery {
+            model: "ec9".to_string(),
+            variable: "temperature_2m".to_string(),
+            valid_time: "2026-09-10T03:00:00Z".to_string(),
+            expected_run: None,
+            west: Some(100.0),
+            east: None,
+            south: None,
+            north: None,
+        };
+        assert!(query.requested_bounds().is_err());
+        assert_eq!(query.valid_time().unwrap().timestamp(), 1_789_009_200);
+    }
 
     #[tokio::test]
     async fn source_offer_is_present_on_root_and_api_errors() {
