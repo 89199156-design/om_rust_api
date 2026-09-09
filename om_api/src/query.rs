@@ -2910,7 +2910,11 @@ pub fn read_variable_value(
             return Ok(vapor_pressure_deficit(temperature, dewpoint));
         }
         "et0_fao_evapotranspiration" => {
-            let temperature = read_direct(
+            // Official Open-Meteo derives ET0 from the stored OM values before
+            // applying public JSON precision.  Rounding temperature/dew point
+            // to one decimal first can move small nighttime ET0 values across
+            // a 0.01 mm output boundary.
+            let temperature = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "temperature_2m",
@@ -2919,9 +2923,16 @@ pub fn read_variable_value(
                 longitude,
             )?;
             let dewpoint = if current_weather_model() == WeatherModel::EcmwfIfs9km {
-                read_direct(snapshot, decoder, "dew_point_2m", time, latitude, longitude)?
+                read_direct_unrounded(
+                    snapshot,
+                    decoder,
+                    "dew_point_2m",
+                    time,
+                    latitude,
+                    longitude,
+                )?
             } else {
-                let relative_humidity = read_direct(
+                let relative_humidity = read_direct_unrounded(
                     snapshot,
                     decoder,
                     "relative_humidity_2m",
@@ -2931,7 +2942,7 @@ pub fn read_variable_value(
                 )?;
                 dew_point(temperature, relative_humidity)
             };
-            let shortwave_radiation = read_direct(
+            let shortwave_radiation = read_direct_unrounded(
                 snapshot,
                 decoder,
                 "shortwave_radiation",
