@@ -26,6 +26,13 @@ the token in `OM_INTERNAL_GRID_TOKEN_FILE`; the token is generated once with
 mode `0640`, is never committed, and is reread on every request so rotation
 does not require an API restart.
 
+On a 1Panel site that applies user `auth_request` at server scope, install
+`nginx/om_internal_grid_1panel.conf` in that site's proxy include directory.
+Its exact locations bypass only the outer user-session check and forward the
+Bearer header to this API; every request still has to pass the token check.
+Proxy buffering is disabled so an on-demand grid is not spooled to a proxy
+temporary file.
+
 - `GET /v1/internal/grid/catalog?model=ec9`
 - `GET /v1/internal/grid?model=ec9&variable=temperature_2m&valid_time=2026-09-10T03:00:00Z`
 

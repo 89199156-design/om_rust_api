@@ -30,3 +30,15 @@ def test_public_nginx_surface_does_not_expose_raw_om_bundles():
     assert "/data/webp/" in nginx
     assert "/data/om/" not in nginx
     assert "om_rust_api-" in nginx
+
+
+def test_internal_grid_1panel_proxy_bypasses_only_outer_auth_and_does_not_buffer():
+    nginx = (ROOT / "nginx" / "om_internal_grid_1panel.conf").read_text(
+        encoding="utf-8"
+    )
+    assert "location = /v1/internal/grid {" in nginx
+    assert "location = /v1/internal/grid/catalog {" in nginx
+    assert nginx.count("auth_request off;") == 2
+    assert nginx.count("proxy_set_header Authorization $http_authorization;") == 2
+    assert nginx.count("proxy_buffering off;") == 2
+    assert "location /" not in nginx
