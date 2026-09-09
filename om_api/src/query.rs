@@ -6359,7 +6359,9 @@ fn read_direct_grid_series_uncached(
     longitudes: &[f64],
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
-    if current_weather_model() == WeatherModel::EcmwfIfs9km {
+    if current_weather_model() == WeatherModel::EcmwfIfs9km
+        && variable != "precipitation_probability"
+    {
         if matches!(variable, "relative_humidity_2m" | "relativehumidity_2m") {
             let temperature = read_direct_grid_series_uncached(
                 snapshot,
