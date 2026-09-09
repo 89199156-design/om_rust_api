@@ -989,6 +989,7 @@ fn is_ecmwf_public_hourly_variable(variable: &str) -> bool {
 
 fn is_ecmwf_ifs9km_public_hourly_variable(variable: &str) -> bool {
     ECMWF_IFS9KM_PUBLIC_SURFACE_VARIABLES.contains(&variable)
+        || variable == "precipitation_probability"
 }
 
 fn is_gfs_public_daily_variable(variable: &str) -> bool {
@@ -12154,6 +12155,9 @@ mod tests {
 
     #[test]
     fn ec9_catalog_keeps_generic_ecmwf_probability_contract() {
+        assert!(is_ecmwf_ifs9km_public_hourly_variable(
+            "precipitation_probability"
+        ));
         assert!(ecmwf_ifs9km_public_hourly_variables()
             .contains(&"precipitation_probability".to_string()));
         let daily = ecmwf_ifs9km_public_daily_variables();
