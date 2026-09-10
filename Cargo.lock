@@ -819,6 +819,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "image",
  "libc",
  "libloading",
  "rayon",

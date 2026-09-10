@@ -31,7 +31,10 @@ except ImportError:  # pragma: no cover - Windows only
 
 
 SCHEMA_VERSION = 1
-SCORER_VERSION = "stargazing-score-v3"
+SCORER_VERSION = "stargazing-score-v4"
+DETAIL_MAG_MIN = 5.0
+DETAIL_MAG_STEP = 0.02
+DETAIL_MAG_MAX_CODE = 1023
 MAX_CAMS_TIME_DELTA_SECONDS = 90 * 60
 NATURAL_BACKGROUND_MICROCD_M2 = 174.0
 MICROCD_M2_PER_NANOLAMBERT = 3.18309886184
@@ -357,7 +360,7 @@ def _linear_factor(value: np.ndarray, start: float, end: float, at_start: float,
 def round_score_half_up(value: np.ndarray) -> np.ndarray:
     """Round a non-negative 0-100 suitability score to the nearest integer."""
     finite = np.nan_to_num(value, nan=0.0, posinf=100.0, neginf=0.0)
-    return np.floor(np.clip(finite, 0.0, 100.0) + 0.5).astype(np.uint8)
+    return np.floor(np.clip(finite, 0.0, 100.0) + 0.50001).astype(np.uint8)
 
 
 def moonlight_microcd_m2(moon_elevation: np.ndarray, phase_degrees: float) -> np.ndarray:
@@ -381,7 +384,7 @@ def score_frame(
     moon_phase: float, cloud: np.ndarray, visibility_m: np.ndarray, humidity: np.ndarray,
     temperature: np.ndarray, dew_point: np.ndarray, wind: np.ndarray, gust: np.ndarray,
     precipitation: np.ndarray, thunder: np.ndarray, aod: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     required = (artificial, cloud, visibility_m, humidity, temperature, dew_point, wind, gust, precipitation, thunder, aod)
     valid = np.logical_and.reduce([np.isfinite(value) for value in required])
     moonlight = moonlight_microcd_m2(moon_elevation, moon_phase)
@@ -421,9 +424,10 @@ def score_frame(
     ) * np.sqrt(wind_factor) * aerosol_factor ** 0.35
     hard_gate = (precipitation >= 0.05) | (thunder >= 95.0) | (visibility_m < 1000.0)
     valid &= np.isfinite(sun_elevation) & np.isfinite(moon_elevation)
-    score = round_score_half_up(100.0 * light_score * weather_score)
-    score = np.where(valid & ~hard_gate, score, 0).astype(np.uint8)
-    return score, valid
+    effective_weather_score = np.where(hard_gate, 0.0, weather_score)
+    score = round_score_half_up(100.0 * light_score * effective_weather_score)
+    score = np.where(valid, score, 0).astype(np.uint8)
+    return score, valid, magnitude, effective_weather_score
 
 
 def encode_score(path: Path, score: np.ndarray, valid: np.ndarray) -> None:
@@ -431,6 +435,42 @@ def encode_score(path: Path, score: np.ndarray, valid: np.ndarray) -> None:
     rgba[..., 1] = score
     rgba[..., 3] = np.where(valid, 255, 0).astype(np.uint8)
     Image.fromarray(rgba, "RGBA").save(path, format="WEBP", lossless=True, method=4)
+
+
+def encode_details(
+    path: Path,
+    magnitude: np.ndarray,
+    weather_score: np.ndarray,
+    score: np.ndarray,
+    valid: np.ndarray,
+) -> None:
+    """Pack map-matched point details into one lossless RGB WebP.
+
+    Bits 23..14 store total sky magnitude in 0.02 mag/arcsec² steps with code
+    zero reserved for invalid cells. Bits 13..7 store weather retention percent,
+    and bits 6..0 store the already published integer suitability score.
+    """
+    finite_magnitude = np.nan_to_num(
+        magnitude,
+        nan=DETAIL_MAG_MIN,
+        posinf=DETAIL_MAG_MIN + (DETAIL_MAG_MAX_CODE - 1) * DETAIL_MAG_STEP,
+        neginf=DETAIL_MAG_MIN,
+    )
+    magnitude_code = np.floor(
+        np.clip((finite_magnitude - DETAIL_MAG_MIN) / DETAIL_MAG_STEP, 0.0, DETAIL_MAG_MAX_CODE - 1) + 0.5
+    ).astype(np.uint32) + 1
+    weather_percent = round_score_half_up(100.0 * weather_score).astype(np.uint32)
+    packed = (
+        (magnitude_code << 14)
+        | (weather_percent << 7)
+        | score.astype(np.uint32)
+    )
+    packed = np.where(valid, packed, 0).astype(np.uint32)
+    rgb = np.empty((*score.shape, 3), dtype=np.uint8)
+    rgb[..., 0] = ((packed >> 16) & 0xFF).astype(np.uint8)
+    rgb[..., 1] = ((packed >> 8) & 0xFF).astype(np.uint8)
+    rgb[..., 2] = (packed & 0xFF).astype(np.uint8)
+    Image.fromarray(rgb, "RGB").save(path, format="WEBP", lossless=True, method=4)
 
 
 def nearest_timestamp(timestamp: int, candidates: list[int]) -> int | None:
@@ -504,7 +544,9 @@ def build_model(webp_root: Path, public_root: Path, light_cache_manifest: Path, 
     staging = Path(tempfile.mkdtemp(prefix=f".{release_id}.", dir=releases))
     output_product = staging / str(spec["output"])
     score_root = output_product / "score"
+    details_root = output_product / "details"
     score_root.mkdir(parents=True)
+    details_root.mkdir(parents=True)
     weather_root = inputs["weatherRoot"]
     cams_root = inputs["camsRoot"]
     assert isinstance(weather_root, Path) and isinstance(cams_root, Path)
@@ -524,7 +566,7 @@ def build_model(webp_root: Path, public_root: Path, light_cache_manifest: Path, 
             aod = resample_bilinear(aod_source, cams_grid, weather_grid)
             month = dt.datetime.fromtimestamp(timestamp, tz=dt.timezone(dt.timedelta(hours=8))).month
             sun_alt, moon_alt, moon_phase = celestial_geometry(timestamp, target_lat, target_lon)
-            score, valid = score_frame(
+            score, valid, magnitude, weather_score = score_frame(
                 artificial=light_by_month[month - 1], sun_elevation=sun_alt, moon_elevation=moon_alt,
                 moon_phase=moon_phase, cloud=values["cloud_total_1"], visibility_m=values["vis"],
                 humidity=values["r2"], temperature=values["t2m"], dew_point=values["d2m"],
@@ -532,6 +574,13 @@ def build_model(webp_root: Path, public_root: Path, light_cache_manifest: Path, 
                 thunder=values["thunderstorm_code"], aod=aod,
             )
             encode_score(score_root / f"{timestamp}_{batch}.webp", score, valid)
+            encode_details(
+                details_root / f"{timestamp}_{batch}.webp",
+                magnitude,
+                weather_score,
+                score,
+                valid,
+            )
             if index == 1 or index % 12 == 0 or index == len(aligned):
                 print(f"STARGAZING_PROGRESS model={model} frame={index}/{len(aligned)} timestamp={timestamp}", flush=True)
 
@@ -552,7 +601,18 @@ def build_model(webp_root: Path, public_root: Path, light_cache_manifest: Path, 
             "file_pattern": "{timestamp}_{batch}.webp",
             "files": [timestamp for timestamp, _ in aligned],
             "grid": weather_grid,
-            "layers": {"score": {"subdir": "score", "unit": "score", "encoding": "scalar", "scale": 1.0, "vmin": 0.0, "range": [0.0, 100.0]}},
+            "layers": {
+                "score": {"subdir": "score", "unit": "score", "encoding": "scalar", "scale": 1.0, "vmin": 0.0, "range": [0.0, 100.0]},
+                "details": {
+                    "subdir": "details",
+                    "unit": "packed",
+                    "encoding": "stargazing-details-rgb24-v1",
+                    "magnitudeMin": DETAIL_MAG_MIN,
+                    "magnitudeStep": DETAIL_MAG_STEP,
+                    "weatherRetentionRange": [0, 100],
+                    "scoreRange": [0, 100],
+                },
+            },
             "coverage_policy": "weather grid intersected with CAMS and monthly light-pollution valid cells",
             "score_components": ["monthly artificial skyglow", "natural sky background", "moonlight", "twilight", "cloud", "visibility", "humidity", "dew-point spread", "wind", "precipitation", "thunderstorm", "CAMS AOD"],
             "data_attribution": [

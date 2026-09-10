@@ -12,3 +12,4 @@ pub mod regionpack;
 pub mod snapshot;
 pub mod solar;
 mod solar_lookup;
+pub mod stargazing;

@@ -11,6 +11,7 @@ use crate::query::{
     ECMWF_PUBLIC_DAILY_VARIABLES,
 };
 use crate::snapshot::OmDataSnapshot;
+use crate::stargazing::{load_details, StargazingDetailsQuery};
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -43,6 +44,7 @@ const ECMWF_LICENSE_URL: &str = "https://creativecommons.org/licenses/by/4.0/";
 #[derive(Clone)]
 pub struct AppState {
     data_root: PathBuf,
+    stargazing_root: PathBuf,
     decoder: Option<OfficialDecoder>,
     cache: Arc<RwLock<SnapshotCache>>,
     ecmwf_route: EcmwfRouteSelector,
@@ -181,6 +183,9 @@ impl AppState {
         let snapshot = Arc::new(OmDataSnapshot::load(&data_root)?);
         Ok(Self {
             data_root,
+            stargazing_root: std::env::var_os("OM_STARGAZING_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/opt/1panel/apps/weather_om_webp/data")),
             decoder,
             cache: Arc::new(RwLock::new(SnapshotCache { identity, snapshot })),
             ecmwf_route: EcmwfRouteSelector::new(ecmwf_route_state),
@@ -419,6 +424,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/ecmwf-ifs9km/catalog", get(ecmwf_ifs9km_catalog))
         .route("/v1/cams", get(cams_forecast))
+        .route("/v1/stargazing/details", get(stargazing_details))
         .route("/v1/internal/grid", get(internal_grid))
         .route("/v1/internal/grid/catalog", get(internal_grid_catalog))
         .route("/v1/route", post(route))
@@ -446,6 +452,17 @@ async fn source_offer() -> Json<serde_json::Value> {
 
 async fn data_identity(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(state.data_identity()?))
+}
+
+async fn stargazing_details(
+    State(state): State<AppState>,
+    Query(query): Query<StargazingDetailsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = state.stargazing_root.clone();
+    let details = tokio::task::spawn_blocking(move || load_details(&root, &query))
+        .await
+        .context("stargazing details worker failed")??;
+    Ok(Json(serde_json::to_value(details)?))
 }
 
 async fn ecmwf_route_state(State(state): State<AppState>) -> Json<serde_json::Value> {
