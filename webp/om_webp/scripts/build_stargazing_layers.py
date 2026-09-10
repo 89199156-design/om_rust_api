@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - Windows only
 
 
 SCHEMA_VERSION = 1
-SCORER_VERSION = "stargazing-score-v2"
+SCORER_VERSION = "stargazing-score-v3"
 MAX_CAMS_TIME_DELTA_SECONDS = 90 * 60
 NATURAL_BACKGROUND_MICROCD_M2 = 174.0
 MICROCD_M2_PER_NANOLAMBERT = 3.18309886184
@@ -356,7 +356,8 @@ def _linear_factor(value: np.ndarray, start: float, end: float, at_start: float,
 
 def round_score_half_up(value: np.ndarray) -> np.ndarray:
     """Round a non-negative 0-100 suitability score to the nearest integer."""
-    return np.floor(np.clip(value, 0.0, 100.0) + 0.5).astype(np.uint8)
+    finite = np.nan_to_num(value, nan=0.0, posinf=100.0, neginf=0.0)
+    return np.floor(np.clip(finite, 0.0, 100.0) + 0.5).astype(np.uint8)
 
 
 def moonlight_microcd_m2(moon_elevation: np.ndarray, phase_degrees: float) -> np.ndarray:
@@ -593,7 +594,10 @@ def build_model(webp_root: Path, public_root: Path, light_cache_manifest: Path, 
             reverse=True,
         )
         for path in old[max(0, keep - 1):]:
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                print(f"STARGAZING_RETENTION_WARNING path={path} error={error}", flush=True)
         return {"model": model, "status": "published", "releaseId": release_id, "frames": len(aligned)}
     finally:
         if staging is not None:
