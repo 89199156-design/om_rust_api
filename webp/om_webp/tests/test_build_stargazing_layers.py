@@ -15,6 +15,14 @@ SPEC.loader.exec_module(module)
 
 
 class StargazingLayerBuilderTest(unittest.TestCase):
+    def test_score_rounding_uses_half_up(self):
+        values = np.array(
+            [0.0, 0.49, 0.5, 1.49, 1.5, 99.49, 99.5, 100.0, 100.4],
+            dtype=np.float32,
+        )
+        rounded = module.round_score_half_up(values)
+        self.assertEqual(rounded.tolist(), [0, 0, 1, 1, 2, 99, 100, 100, 100])
+
     def test_clear_dark_conditions_score_higher_than_cloud_or_daylight(self):
         shape = (2, 3)
         zeros = np.zeros(shape, dtype=np.float32)

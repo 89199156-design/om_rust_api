@@ -354,6 +354,11 @@ def _linear_factor(value: np.ndarray, start: float, end: float, at_start: float,
     return at_start + (at_end - at_start) * ratio
 
 
+def round_score_half_up(value: np.ndarray) -> np.ndarray:
+    """Round a non-negative 0-100 suitability score to the nearest integer."""
+    return np.floor(np.clip(value, 0.0, 100.0) + 0.5).astype(np.uint8)
+
+
 def moonlight_microcd_m2(moon_elevation: np.ndarray, phase_degrees: float) -> np.ndarray:
     phase_angle = abs(180.0 - phase_degrees)
     zenith_distance = np.clip(90.0 - moon_elevation, 0.0, 89.9)
@@ -415,8 +420,8 @@ def score_frame(
     ) * np.sqrt(wind_factor) * aerosol_factor ** 0.35
     hard_gate = (precipitation >= 0.05) | (thunder >= 95.0) | (visibility_m < 1000.0)
     valid &= np.isfinite(sun_elevation) & np.isfinite(moon_elevation)
-    score = np.floor(100.0 * light_score * weather_score)
-    score = np.where(valid & ~hard_gate, np.clip(score, 0.0, 100.0), 0.0).astype(np.uint8)
+    score = round_score_half_up(100.0 * light_score * weather_score)
+    score = np.where(valid & ~hard_gate, score, 0).astype(np.uint8)
     return score, valid
 
 
