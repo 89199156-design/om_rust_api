@@ -9,6 +9,27 @@ The source path is selected by `OM_DATA_ROOT`:
 
 The renderer contains no downloader or raw-model conversion logic.
 
+## Hourly stargazing maps
+
+`scripts/build_stargazing_layers.py` composes the `stargazing_gfs` and
+`stargazing_ec9` products from already-published weather WebPs, CAMS AOD, and
+the immutable 12-month artificial-skyglow cache. It adds the standard natural
+zenith background, geometric twilight, and the modified
+Krisciunas-Schaefer scattered-moonlight calculation, then applies weather as a
+suitability score. Missing pixels in any required input remain transparent, so
+each frame's coverage is the intersection of weather, CAMS, and light
+pollution.
+
+The derived product never runs the light-propagation solver. An input identity
+ties each release to the exact weather pointer, CAMS pointer, light-pollution
+publication revision, cache digest, and scorer version. Unchanged inputs are a
+no-op. Install the five-minute change detector on Shanghai after the cache has
+been provisioned:
+
+```bash
+bash webp/om_webp/scripts/install_stargazing_layer_timer.sh
+```
+
 ## Publication contract
 
 Each source `release_id` is built under the configured WebP staging directory. A complete immutable release is moved to `releases/`, then the public/current marker is switched atomically. Existing images remain available while a new release builds. If the OM source identity changes during rendering, the staging release is discarded.

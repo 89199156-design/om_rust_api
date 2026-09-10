@@ -1,0 +1,23 @@
+[Unit]
+Description=Compose hourly stargazing map layers from published weather, CAMS, and light pollution
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+Environment=PYTHONUNBUFFERED=1
+RuntimeDirectory=weather-stargazing
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/python3 /opt/1panel/apps/weather_om_webp/scripts/build_stargazing_layers.py --model all --lock-path /run/weather-stargazing/layer.lock
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/1panel/apps/weather_om_webp/data /opt/1panel/apps/weather/data
+MemoryMax=768M
+TimeoutStartSec=15min

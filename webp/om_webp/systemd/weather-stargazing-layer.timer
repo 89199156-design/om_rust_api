@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh hourly stargazing map layers after source products change
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=weather-stargazing-layer.service
+
+[Install]
+WantedBy=timers.target
+
