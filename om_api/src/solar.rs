@@ -517,35 +517,28 @@ pub fn clear_sky_radiation_factor_backwards(
 
 pub fn is_day(timestamp: DateTime<Utc>, latitude: f32, longitude: f32) -> f32 {
     let universal_offset = (longitude / 15.0 * 3600.0) as i64;
-    let local_midnight = (timestamp.timestamp() + universal_offset).div_euclid(SECONDS_PER_DAY)
-        * SECONDS_PER_DAY
-        - universal_offset;
-    let local_midday = local_midnight + ((12.0 - longitude / 15.0) * 3600.0) as i64;
-    let midday = DateTime::from_timestamp(local_midday, 0).expect("valid solar timestamp");
-    let position = sun_position(midday);
-    let declination = radians(position.declination_degrees);
-    let latitude = radians(latitude);
-    let alpha = radians(0.83333);
-    let arg =
-        -(alpha.sin() + latitude.sin() * declination.sin()) / (latitude.cos() * declination.cos());
-    if arg > 1.0 {
-        return 0.0;
-    }
-    if arg < -1.0 {
-        return 1.0;
-    }
-    let noon = 12.0 - longitude / 15.0;
-    let hours = arg.acos() / radians(15.0);
-    let rise = ((noon - hours - position.equation_of_time_hours) * 3600.0) as i64;
-    let set = ((noon + hours - position.equation_of_time_hours) * 3600.0) as i64;
+    let local_midnight_seconds =
+        (timestamp.timestamp() + universal_offset).div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY
+            - universal_offset;
+    let local_midnight =
+        DateTime::from_timestamp(local_midnight_seconds, 0).expect("valid solar timestamp");
     let seconds_since_midnight =
         (timestamp.timestamp() + universal_offset).rem_euclid(SECONDS_PER_DAY);
-    if seconds_since_midnight > rise + universal_offset
-        && seconds_since_midnight < set + universal_offset
-    {
-        1.0
-    } else {
-        0.0
+    match sun_transit(local_midnight, latitude, longitude) {
+        SunTransit::PolarNight => 0.0,
+        SunTransit::PolarDay => 1.0,
+        SunTransit::Transit {
+            rise_seconds,
+            set_seconds,
+        } => {
+            if seconds_since_midnight > rise_seconds + universal_offset
+                && seconds_since_midnight < set_seconds + universal_offset
+            {
+                1.0
+            } else {
+                0.0
+            }
+        }
     }
 }
 
@@ -592,6 +585,12 @@ mod tests {
         let after_sunrise = Utc.with_ymd_and_hms(2026, 7, 14, 23, 0, 0).unwrap();
         assert_eq!(is_day(before_sunrise, 29.580215, 106.52344), 0.0);
         assert_eq!(is_day(after_sunrise, 29.580215, 106.52344), 1.0);
+    }
+
+    #[test]
+    fn is_day_uses_the_refined_current_official_sunrise() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 9, 17, 23, 0, 0).unwrap();
+        assert_eq!(is_day(timestamp, 20.0, 101.970001), 1.0);
     }
 
     #[test]
