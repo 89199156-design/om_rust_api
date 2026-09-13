@@ -815,6 +815,15 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(numeric_difference["reason"], "json_value")
         self.assertEqual(reverse_difference["reason"], "json_value")
 
+        other_variable_difference, _, _ = compare.first_period_difference(
+            "hourly",
+            ("cape",),
+            {"hourly": {"time": ["2026-09-04T03:00"], "cape": [800]}},
+            {"hourly": {"time": ["2026-09-04T03:00"], "cape": [None]}},
+            allow_official_finite_local_nan=True,
+        )
+        self.assertEqual(other_variable_difference["reason"], "json_value")
+
     def test_hourly_weather_code_can_record_proven_rolling_cin_effect(self) -> None:
         official = {
             "latitude": 32.021087646484375,
@@ -971,6 +980,24 @@ class Official200PointCompareTests(unittest.TestCase):
             allow_official_finite_local_nan=True,
         )
 
+        self.assertEqual(difference["reason"], "json_value")
+
+        local_with_other_missing_input = {
+            "latitude": official["latitude"],
+            "hourly": {
+                **official["hourly"],
+                "cape": [None],
+                "convective_inhibition": [None],
+                "weather_code": [51],
+            },
+        }
+        difference, _, _ = compare.first_period_difference(
+            "hourly",
+            ("weather_code",),
+            {**official, "hourly": {**official["hourly"], "weather_code": [95]}},
+            local_with_other_missing_input,
+            allow_official_finite_local_nan=True,
+        )
         self.assertEqual(difference["reason"], "json_value")
 
     def test_daily_weather_code_can_record_proven_hourly_rolling_cin_effect(self) -> None:

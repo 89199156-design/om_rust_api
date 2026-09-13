@@ -1909,16 +1909,18 @@ def _ec9_weather_code_rolling_nan_evidence(
     local_period = local.get("hourly")
     if not isinstance(official_period, dict) or not isinstance(local_period, dict):
         return None
-    dependency_names = (
-        "cape",
-        "showers",
-        "convective_inhibition",
-        "boundary_layer_height",
-    )
+    # The accepted EC9 history gap is deliberately limited to CIN. Every
+    # other public weather-code input must already match, otherwise the code
+    # difference is not proven to originate from the shorter local CIN
+    # history and remains a hard validation failure.
+    dependency_names = ("convective_inhibition",)
     required_equal_names = (
         "cloud_cover",
         "precipitation",
         "snowfall",
+        "cape",
+        "showers",
+        "boundary_layer_height",
     )
     for name in required_equal_names:
         official_values = official_period.get(name)
@@ -2230,6 +2232,7 @@ def first_period_difference(
             if (
                 allow_official_finite_local_nan
                 and period == "hourly"
+                and variable == "convective_inhibition"
                 and official_is_finite_number
                 and local_value is None
             ):
@@ -2610,10 +2613,10 @@ def validate_model(
         "accepted_official_rolling_values_over_local_nan": 0,
         "accepted_difference_policy": {
             "models": ["ec9"],
-            "period": "hourly plus causally derived hourly/daily weather_code",
+            "period": "hourly CIN plus causally derived hourly/daily weather_code",
             "conditions": [
-                "official finite JSON number and local null",
-                "weather_code recomputes to both observed values using otherwise equal public inputs",
+                "official convective_inhibition is finite and local value is null",
+                "weather_code recomputes to both observed values with every non-CIN public input equal",
                 "daily weather_code is the proven maximum of those hourly codes",
             ],
             "reason": "official rolling OM retains an older finite forecast value when newer runs are NaN",
