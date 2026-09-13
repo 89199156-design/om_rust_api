@@ -146,6 +146,7 @@ GFS_PRESSURE_HOURLY = tuple(
     for level in GFS_PRESSURE_LEVELS_HPA
 )
 GFS_HOURLY = (*GFS_SURFACE, *GFS_PRESSURE_HOURLY)
+GFS_LOCAL_HOURLY = (*GFS_HOURLY, "friction_velocity")
 ECMWF_SURFACE_HOURLY = tuple(variable for variable in ECMWF_HOURLY if "hPa" not in variable)
 EC9_HOURLY = tuple(
     variable
@@ -270,7 +271,11 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "model_parameter": ("models", ["gfs_global"]),
         "forecast_days": 16,
         "official_hourly": GFS_HOURLY,
-        "local_hourly": GFS_HOURLY,
+        # The public reference does not expose friction_velocity.
+        # Keeping it in every local request still proves that the production
+        # field exists; its values are validated against the pinned Swift
+        # engine by friction_velocity_200_compare.py.
+        "local_hourly": GFS_LOCAL_HOURLY,
         "daily": GFS_DAILY,
         "source_probe_domains": (
             "ncep_gfs013",

@@ -274,6 +274,8 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertIn("shortwave_radiation_instant", compare.GFS_HOURLY)
         self.assertIn("shortwave_radiation_sum", compare.GFS_DAILY)
         self.assertIn("sunshine_duration", compare.GFS_DAILY)
+        self.assertNotIn("friction_velocity", compare.GFS_HOURLY)
+        self.assertIn("friction_velocity", compare.GFS_LOCAL_HOURLY)
 
     def test_cams_direct_comparison_does_not_require_daily_period(self) -> None:
         original = compare.MODEL_SPECS["cams"]
