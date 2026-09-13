@@ -269,6 +269,12 @@ class Official200PointCompareTests(unittest.TestCase):
             any("hPa" in variable for variable in compare.EC9_HOURLY)
         )
 
+    def test_gfs_scope_includes_every_public_radiation_output(self) -> None:
+        self.assertIn("shortwave_radiation", compare.GFS_HOURLY)
+        self.assertIn("shortwave_radiation_instant", compare.GFS_HOURLY)
+        self.assertIn("shortwave_radiation_sum", compare.GFS_DAILY)
+        self.assertIn("sunshine_duration", compare.GFS_DAILY)
+
     def test_cams_direct_comparison_does_not_require_daily_period(self) -> None:
         original = compare.MODEL_SPECS["cams"]
         compare.MODEL_SPECS["cams"] = {

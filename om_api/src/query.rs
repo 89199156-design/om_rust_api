@@ -937,6 +937,7 @@ fn is_public_hourly_variable(variable: &str) -> bool {
             | "windspeed_120m"
             | "wind_direction_120m"
             | "winddirection_120m"
+            | "friction_velocity"
             | "cape"
             | "uv_index"
             | "uv_index_clear_sky"
@@ -15499,6 +15500,7 @@ mod output_tests {
             "is_day",
             "wind_speed_850hPa",
             "vertical_velocity_500hPa",
+            "friction_velocity",
             "chinese_aqi_pm2_5",
             "soil_moisture_0_to_10cm",
             "soil_temperature_0_to_10cm",

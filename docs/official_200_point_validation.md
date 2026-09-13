@@ -11,10 +11,29 @@
 所有请求使用 `cell_selection=nearest`，以明确覆盖精确网格读取与非网格点选择。GFS
 和 ECMWF 0.25° 会直接比较双方共同支持的全部地面小时变量、全部压力层小时变量与全部
 官方日聚合变量，其中包括 `precipitation_probability_max`、
-`precipitation_probability_min` 和 `precipitation_probability_mean`。ECMWF 9 km 的本地
+`precipitation_probability_min`、`precipitation_probability_mean`、全部公开短波辐射
+小时字段及其日聚合。ECMWF 9 km 的本地
 区域源不发布压力层，因此比较其完整地面小时与日字段目录。CAMS 官方 API 不提供日字段
 和中国 AQI 字段，因此 CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQI、
 CAMS 日统计及其他独有派生输出不参与官方一致性判定。
+
+Open-Meteo 公网 API 当前不接受 GFS `friction_velocity`，因此该字段不能混入公网官方
+快照并伪装为已通过官方 API 比较。它必须在同批次 GFS 生产完成后，另外启动由固定源码
+修订构建的 Open-Meteo 引擎只读实例，以相同数据、相同 200 点和相同请求选项与生产 API
+逐值比较；该独立报告和公网官方全字段报告均通过，GFS 才算验收完成。
+
+固定源码的只读引擎必须挂载目标批次目录而不是可变的 `current` 链接。启动后先冻结参考
+响应，再比较生产 API；参考镜像标签和预期批次都会进入不可变元数据：
+
+```bash
+python scripts/validation/friction_velocity_200_compare.py capture \
+  --ssh-host shanghai1 --reference-base http://127.0.0.1:18080 \
+  --expected-run YYYYMMDDHH --reference-image weather-forecast-openmeteo:native-<源码ID> \
+  --output D:/Projects/weather_validation_artifacts/friction-200/<批次标识>
+python scripts/validation/friction_velocity_200_compare.py validate \
+  --ssh-host shanghai1 --local-base http://127.0.0.1:8088 \
+  --output D:/Projects/weather_validation_artifacts/friction-200/<批次标识>
+```
 
 ## 访问与快照
 

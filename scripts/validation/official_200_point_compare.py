@@ -120,6 +120,8 @@ GFS_SURFACE = (
     "cape",
     "uv_index",
     "uv_index_clear_sky",
+    "shortwave_radiation",
+    "shortwave_radiation_instant",
     "sunshine_duration",
     "et0_fao_evapotranspiration",
     "vapour_pressure_deficit",
@@ -224,6 +226,8 @@ GFS_DAILY = (
     "snow_depth_mean",
     "uv_index_max",
     "uv_index_clear_sky_max",
+    "shortwave_radiation_sum",
+    "sunshine_duration",
 )
 CAMS_RAW = (
     "aerosol_optical_depth",
