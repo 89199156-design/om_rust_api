@@ -377,6 +377,8 @@ const GFS025_REQUIRED_SURFACE_VARIABLES: &[&str] = &[
     "categorical_freezing_rain",
     "temperature_80m",
     "temperature_100m",
+    "temperature_sigma_0_995",
+    "temperature_30hpa_agl",
     "wind_v_component_80m",
     "wind_u_component_80m",
     "wind_v_component_100m",
@@ -3255,10 +3257,11 @@ mod tests {
             ]
         );
         assert_eq!(required_variables("ncep_gfs013").unwrap().len(), 29);
-        assert_eq!(required_variables("ncep_gfs025").unwrap().len(), 168);
-        assert!(required_variables("ncep_gfs025")
-            .unwrap()
-            .contains("vertical_velocity_50hPa"));
+        let gfs025 = required_variables("ncep_gfs025").unwrap();
+        assert_eq!(gfs025.len(), 170);
+        assert!(gfs025.contains("vertical_velocity_50hPa"));
+        assert!(gfs025.contains("temperature_sigma_0_995"));
+        assert!(gfs025.contains("temperature_30hpa_agl"));
     }
 
     #[test]

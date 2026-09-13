@@ -103,6 +103,12 @@ GET /v1/cams?latitude=31.23&longitude=121.47&hourly=chinese_aqi&daily=chinese_aq
 POST /v1/route
 ```
 
+The authenticated full-grid endpoint also exports the native GFS
+`temperature_sigma_0_995` and `temperature_30hpa_agl` result fields used by
+the independently implemented GFS/AXP optical-turbulence service. They remain
+ordinary decoded weather results; no OM storage structure or decoder is
+exposed to that downstream service.
+
 Daily weather:
 
 ```text

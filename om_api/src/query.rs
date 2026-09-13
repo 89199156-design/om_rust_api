@@ -10637,6 +10637,8 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
         "temperature_2m"
         | "temperature_80m"
         | "temperature_100m"
+        | "temperature_sigma_0_995"
+        | "temperature_30hpa_agl"
         | "surface_temperature"
         | "soil_temperature_0_to_10cm"
         | "soil_temperature_10_to_40cm"
@@ -15166,6 +15168,8 @@ pub fn unit_for_variable(variable: &str) -> &'static str {
         | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
+        | "temperature_sigma_0_995"
+        | "temperature_30hpa_agl"
         | "temperature_120m"
         | "dew_point_2m"
         | "dewpoint_2m"
@@ -15408,6 +15412,20 @@ enum OutputDecimals {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn axp_native_temperature_fields_keep_temperature_contracts() {
+        for variable in ["temperature_sigma_0_995", "temperature_30hpa_agl"] {
+            assert_eq!(unit_for_variable(variable), "°C");
+            assert!(matches!(
+                interpolation_kind_for_variable(variable),
+                InterpolationKind::Hermite {
+                    scalefactor: 20.0,
+                    bounds: None
+                }
+            ));
+        }
+    }
 
     #[test]
     fn growing_degree_days_uses_official_api_unit_token() {
@@ -16122,6 +16140,8 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "apparent_temperature"
         | "temperature_80m"
         | "temperature_100m"
+        | "temperature_sigma_0_995"
+        | "temperature_30hpa_agl"
         | "temperature_120m"
         | "dew_point_2m"
         | "dewpoint_2m"
