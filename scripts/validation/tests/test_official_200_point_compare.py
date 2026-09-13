@@ -256,10 +256,17 @@ class Official200PointCompareTests(unittest.TestCase):
             ("cams_global", "cams_global_greenhouse_gases"),
         )
 
-    def test_weather_scope_excludes_all_pressure_level_fields(self) -> None:
-        self.assertFalse(any("hPa" in variable for variable in compare.GFS_HOURLY))
+    def test_weather_scope_includes_all_supported_pressure_level_fields(self) -> None:
+        self.assertEqual(len(compare.GFS_PRESSURE_HOURLY), 22 * 8)
+        self.assertTrue(
+            set(compare.GFS_PRESSURE_HOURLY).issubset(compare.GFS_HOURLY)
+        )
+        self.assertEqual(
+            compare.MODEL_SPECS["ec"]["official_hourly"],
+            tuple(compare.ECMWF_HOURLY),
+        )
         self.assertFalse(
-            any("hPa" in variable for variable in compare.ECMWF_SURFACE_HOURLY)
+            any("hPa" in variable for variable in compare.EC9_HOURLY)
         )
 
     def test_cams_direct_comparison_does_not_require_daily_period(self) -> None:
@@ -310,12 +317,26 @@ class Official200PointCompareTests(unittest.TestCase):
             ],
         )
 
-    def test_default_plan_coalesces_each_model_period_without_parallelism(self) -> None:
+    def test_default_plan_chunks_complete_catalogs_without_parallelism(self) -> None:
         for model in ("gfs", "ec", "ec9"):
             plan = compare.request_plan(model, compare.DEFAULT_FIELD_CHUNK_SIZE)
-            self.assertEqual(len(plan), 1)
+            spec = compare.MODEL_SPECS[model]
+            expected_groups = max(
+                (len(spec["local_hourly"]) + compare.DEFAULT_FIELD_CHUNK_SIZE - 1)
+                // compare.DEFAULT_FIELD_CHUNK_SIZE,
+                (len(spec["daily"]) + compare.DEFAULT_FIELD_CHUNK_SIZE - 1)
+                // compare.DEFAULT_FIELD_CHUNK_SIZE,
+            )
+            self.assertEqual(len(plan), expected_groups)
             self.assertTrue(plan[0]["hourly"])
             self.assertTrue(plan[0]["daily"])
+            self.assertTrue(
+                all(
+                    len(group[period]) <= compare.DEFAULT_FIELD_CHUNK_SIZE
+                    for group in plan
+                    for period in ("hourly", "daily")
+                )
+            )
         cams_plan = compare.request_plan("cams", compare.DEFAULT_FIELD_CHUNK_SIZE)
         self.assertEqual(len(cams_plan), 1)
         self.assertTrue(cams_plan[0]["hourly"])

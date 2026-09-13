@@ -9,12 +9,12 @@
 - 60 个区域内均匀随机非网格点。
 
 所有请求使用 `cell_selection=nearest`，以明确覆盖精确网格读取与非网格点选择。GFS
-和 ECMWF 会直接比较双方共同支持的全部地面小时变量与全部官方日聚合变量，其中包括
-`precipitation_probability_max`、`precipitation_probability_min` 和
-`precipitation_probability_mean`。压力层字段全部排除，因为本验证针对公共点位预报
-契约，而不是比较双方压力层库存。CAMS 官方 API 不提供日字段和中国 AQI 字段，因此
-CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQI、CAMS 日统计及其他独有
-派生输出不参与官方一致性判定。
+和 ECMWF 0.25° 会直接比较双方共同支持的全部地面小时变量、全部压力层小时变量与全部
+官方日聚合变量，其中包括 `precipitation_probability_max`、
+`precipitation_probability_min` 和 `precipitation_probability_mean`。ECMWF 9 km 的本地
+区域源不发布压力层，因此比较其完整地面小时与日字段目录。CAMS 官方 API 不提供日字段
+和中国 AQI 字段，因此 CAMS 只比较官方提供的全部共同小时字段；本服独有的中国 AQI、
+CAMS 日统计及其他独有派生输出不参与官方一致性判定。
 
 ## 访问与快照
 

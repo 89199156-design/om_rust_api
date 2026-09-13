@@ -6,12 +6,12 @@ Validation then requests the local API one point at a time and stops at the
 first difference.  Successful point receipts are immutable and resumable, so
 diagnosis and fixes never consume the official API quota again.
 
-Only the requested official/local surface-field intersection is compared. GFS
-and ECMWF surface hourly and daily fields are compared directly. Pressure-level
-fields are excluded because this validation targets the public point forecast
-contract rather than each server's pressure-level inventory. Open-Meteo does
-not expose CAMS daily fields or Chinese AQI fields, so local-only derived
-outputs are intentionally outside this official parity run.
+The complete requested official/local public-field intersection is compared.
+GFS and ECMWF 0.25-degree include every supported surface, pressure-level and
+daily field. ECMWF 9 km includes its complete surface/daily catalog because the
+local regional source does not publish pressure levels. Open-Meteo does not
+expose CAMS daily fields or Chinese AQI fields, so local-only derived outputs
+are intentionally outside this official parity run.
 """
 
 from __future__ import annotations
@@ -124,7 +124,26 @@ GFS_SURFACE = (
     "et0_fao_evapotranspiration",
     "vapour_pressure_deficit",
 )
-GFS_HOURLY = GFS_SURFACE
+GFS_PRESSURE_LEVELS_HPA = (
+    1000, 975, 950, 925, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450,
+    400, 350, 300, 250, 200, 150, 100, 50,
+)
+GFS_PRESSURE_FAMILIES = (
+    "temperature",
+    "relative_humidity",
+    "dew_point",
+    "cloud_cover",
+    "wind_speed",
+    "wind_direction",
+    "geopotential_height",
+    "vertical_velocity",
+)
+GFS_PRESSURE_HOURLY = tuple(
+    f"{family}_{level}hPa"
+    for family in GFS_PRESSURE_FAMILIES
+    for level in GFS_PRESSURE_LEVELS_HPA
+)
+GFS_HOURLY = (*GFS_SURFACE, *GFS_PRESSURE_HOURLY)
 ECMWF_SURFACE_HOURLY = tuple(variable for variable in ECMWF_HOURLY if "hPa" not in variable)
 EC9_HOURLY = tuple(
     variable
@@ -262,8 +281,8 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
         "local_path": "/v1/ecmwf",
         "model_parameter": ("models", ["ecmwf_ifs025"]),
         "forecast_days": 15,
-        "official_hourly": ECMWF_SURFACE_HOURLY,
-        "local_hourly": ECMWF_SURFACE_HOURLY,
+        "official_hourly": tuple(ECMWF_HOURLY),
+        "local_hourly": tuple(ECMWF_HOURLY),
         "daily": tuple(ECMWF_DAILY),
         "source_probe_domains": ("ecmwf_ifs025",),
     },
