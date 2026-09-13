@@ -10700,6 +10700,10 @@ pub(crate) fn interpolation_kind_for_variable(variable: &str) -> InterpolationKi
             scalefactor: 0.144,
             bounds: None,
         },
+        "friction_velocity" => InterpolationKind::Hermite {
+            scalefactor: 1000.0,
+            bounds: Some((0.0, 10e9)),
+        },
         "soil_moisture_0_to_10cm"
         | "soil_moisture_10_to_40cm"
         | "soil_moisture_40_to_100cm"
@@ -13006,6 +13010,14 @@ mod tests {
                 bounds: None
             }
         ));
+        assert!(matches!(
+            interpolation_kind_for_variable("friction_velocity"),
+            InterpolationKind::Hermite {
+                scalefactor: 1000.0,
+                bounds: Some((0.0, 10e9))
+            }
+        ));
+        assert_eq!(unit_for_variable("friction_velocity"), "m/s");
     }
 
     #[test]
@@ -15305,6 +15317,7 @@ pub fn unit_for_variable(variable: &str) -> &'static str {
         | "global_tilted_irradiance_instant"
         | "latent_heat_flux"
         | "sensible_heat_flux" => "W/m\u{00B2}",
+        "friction_velocity" => "m/s",
         "sunshine_duration" => "s",
         "evapotranspiration" | "et0_fao_evapotranspiration" => "mm",
         "vapour_pressure_deficit" | "vapor_pressure_deficit" => "kPa",
@@ -16106,6 +16119,7 @@ fn output_decimals_for_variable(variable: &str) -> OutputDecimals {
         | "wind_v_component_200m"
         | "vertical_velocity"
         | "aerosol_optical_depth" => OutputDecimals::Fixed(2),
+        "friction_velocity" => OutputDecimals::Fixed(3),
         "soil_moisture_0_to_10cm"
         | "soil_moisture_0_to_7cm"
         | "soil_moisture_7_to_28cm"
