@@ -5945,6 +5945,32 @@ fn read_direct_with_rounding(
     longitude: f64,
     round_values: bool,
 ) -> Result<f32> {
+    if variable == "snowfall_water_equivalent" && gfs_uses_temperature_snow_partition() {
+        let precipitation = read_direct_with_rounding(
+            snapshot,
+            decoder,
+            "precipitation",
+            time,
+            latitude,
+            longitude,
+            false,
+        )?;
+        let temperature = read_direct_with_rounding(
+            snapshot,
+            decoder,
+            "temperature_2m",
+            time,
+            latitude,
+            longitude,
+            false,
+        )?;
+        let value = snowfall_water_equivalent_for_elevation(precipitation, temperature);
+        return Ok(if round_values {
+            round_variable_output_value(variable, value)
+        } else {
+            value
+        });
+    }
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
         if matches!(variable, "relative_humidity_2m" | "relativehumidity_2m") {
             let temperature = read_direct_with_rounding(
@@ -6391,6 +6417,47 @@ fn read_direct_grid_series_uncached(
     longitudes: &[f64],
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
+    if variable == "snowfall_water_equivalent" && gfs_uses_temperature_snow_partition() {
+        let precipitation = read_direct_grid_series_uncached(
+            snapshot,
+            decoder,
+            "precipitation",
+            times,
+            latitudes,
+            longitudes,
+            false,
+        )?;
+        let temperature = read_direct_grid_series_uncached(
+            snapshot,
+            decoder,
+            "temperature_2m",
+            times,
+            latitudes,
+            longitudes,
+            false,
+        )?;
+        let mut values = precipitation
+            .into_iter()
+            .zip(temperature)
+            .map(|(precipitation, temperature)| {
+                precipitation
+                    .into_iter()
+                    .zip(temperature)
+                    .map(|(precipitation, temperature)| {
+                        snowfall_water_equivalent_for_elevation(precipitation, temperature)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if round_values {
+            for frame in &mut values {
+                for value in frame {
+                    *value = round_variable_output_value(variable, *value);
+                }
+            }
+        }
+        return Ok(values);
+    }
     if current_weather_model() == WeatherModel::EcmwfIfs9km
         && variable != "precipitation_probability"
     {
@@ -11304,6 +11371,26 @@ fn apply_elevation_correction(product: &str, variable: &str, value: f32) -> f32 
     value + (sampling.model_elevation - sampling.target_elevation) * 0.0065
 }
 
+/// Open-Meteo repartitions GFS precipitation into rain/snow from the
+/// elevation-corrected 2 m temperature when the requested terrain differs by
+/// more than 100 m from the model cell.  Below that threshold the native GFS
+/// frozen-precipitation fraction remains authoritative.
+fn gfs_uses_temperature_snow_partition() -> bool {
+    if current_weather_model() != WeatherModel::Gfs {
+        return false;
+    }
+    let Some(sampling) = current_product_sampling("gfs013_surface") else {
+        return false;
+    };
+    sampling.model_elevation.is_finite()
+        && sampling.target_elevation.is_finite()
+        && (sampling.model_elevation - sampling.target_elevation).abs() > 100.0
+}
+
+fn snowfall_water_equivalent_for_elevation(precipitation: f32, temperature_2m: f32) -> f32 {
+    precipitation * if temperature_2m >= 0.0 { 0.0 } else { 1.0 }
+}
+
 fn read_entry_grid(
     product: &ProductSnapshot,
     entry: &BundleEntry,
@@ -15426,6 +15513,17 @@ enum OutputDecimals {
 #[cfg(test)]
 mod output_tests {
     use super::*;
+
+    #[test]
+    fn gfs_elevation_snow_partition_uses_corrected_temperature() {
+        assert_eq!(snowfall_water_equivalent_for_elevation(0.1, 0.0), 0.0);
+        assert_eq!(snowfall_water_equivalent_for_elevation(0.1, 5.6), 0.0);
+        assert_eq!(snowfall_water_equivalent_for_elevation(0.1, -0.1), 0.1);
+        assert!(snowfall_water_equivalent_for_elevation(f32::NAN, -1.0).is_nan());
+        // Swift comparisons with NaN are false, so the official fallback keeps
+        // precipitation as snow when the corrected temperature is unavailable.
+        assert_eq!(snowfall_water_equivalent_for_elevation(0.1, f32::NAN), 0.1);
+    }
 
     #[test]
     fn axp_native_temperature_fields_keep_temperature_contracts() {
