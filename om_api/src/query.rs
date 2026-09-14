@@ -11337,6 +11337,8 @@ fn is_gfs025_variable(variable: &str) -> bool {
             | "convective_inhibition"
             | "temperature_80m"
             | "temperature_100m"
+            | "temperature_sigma_0_995"
+            | "temperature_30hpa_agl"
             | "wind_u_component_80m"
             | "wind_v_component_80m"
             | "wind_u_component_100m"
@@ -13375,6 +13377,12 @@ mod tests {
     #[test]
     fn wind_gusts_are_routed_to_gfs025() {
         assert!(is_gfs025_variable("wind_gusts_10m"));
+    }
+
+    #[test]
+    fn axp_native_temperatures_are_routed_to_gfs025() {
+        assert!(is_gfs025_variable("temperature_sigma_0_995"));
+        assert!(is_gfs025_variable("temperature_30hpa_agl"));
     }
 
     #[test]
