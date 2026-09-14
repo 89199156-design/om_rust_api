@@ -657,6 +657,31 @@ class Official200PointCompareTests(unittest.TestCase):
             ["ssh:first-exit", "ssh:second-exit"],
         )
 
+    def test_capture_can_split_large_official_responses_into_smaller_batches(self) -> None:
+        response = json.dumps([{} for _ in range(50)]).encode()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with mock.patch.object(
+                compare,
+                "request_json",
+                return_value=(response, {}, 0.01),
+            ) as request:
+                metadata = compare.capture_official(
+                    "gfs",
+                    Path(temporary_directory),
+                    None,
+                    10.0,
+                    0,
+                    official_batch_size=50,
+                )
+
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual(metadata["official_request_count"], 4)
+        self.assertEqual(metadata["official_batch_size"], 50)
+        self.assertEqual(
+            [batch["point_count"] for batch in metadata["batches"]],
+            [50, 50, 50, 50],
+        )
+
     def test_direct_comparison_stops_at_first_value(self) -> None:
         original = compare.MODEL_SPECS["gfs"]
         compare.MODEL_SPECS["gfs"] = {

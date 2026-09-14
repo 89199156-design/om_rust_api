@@ -1504,6 +1504,7 @@ def capture_official(
     request_delay_seconds: float = 0.0,
     ssh_hosts: tuple[str, ...] = (),
     expected_run: str | None = None,
+    official_batch_size: int = OFFICIAL_BATCH_SIZE,
 ) -> dict[str, Any]:
     model_dir = output / model / "official"
     response_path = model_dir / "response.json"
@@ -1582,8 +1583,8 @@ def capture_official(
     batch_time_axis: dict[str, Any] | None = None
     total_elapsed = 0.0
     last_network_request_at: float | None = None
-    for batch_index, start in enumerate(range(0, len(points), OFFICIAL_BATCH_SIZE)):
-        batch_points = points[start : start + OFFICIAL_BATCH_SIZE]
+    for batch_index, start in enumerate(range(0, len(points), official_batch_size)):
+        batch_points = points[start : start + official_batch_size]
         payload = official_payload(model, batch_points)
         payloads.append(payload)
         payload_raw = canonical_bytes(payload)
@@ -1697,7 +1698,7 @@ def capture_official(
         else None
     )
     request_snapshot = {
-        "batch_size": OFFICIAL_BATCH_SIZE,
+        "batch_size": official_batch_size,
         "batches": payloads,
     }
     request_snapshot_raw = canonical_bytes(request_snapshot)
@@ -1712,7 +1713,7 @@ def capture_official(
         "endpoint": endpoint,
         "method": "POST",
         "official_request_count": len(batch_artifacts),
-        "official_batch_size": OFFICIAL_BATCH_SIZE,
+        "official_batch_size": official_batch_size,
         "point_count": len(rows),
         "request_sha256": sha256_bytes(request_snapshot_raw),
         "response_sha256": sha256_bytes(response_snapshot_raw),
@@ -3186,6 +3187,15 @@ def parse_args() -> argparse.Namespace:
         help="pause between new official snapshot batches from the same process",
     )
     parser.add_argument(
+        "--official-batch-size",
+        type=int,
+        default=OFFICIAL_BATCH_SIZE,
+        help=(
+            "number of points per official POST; lower this when a large "
+            "all-field response exceeds the upstream request timeout"
+        ),
+    )
+    parser.add_argument(
         "--official-ssh-hosts",
         default="",
         help=(
@@ -3305,6 +3315,7 @@ def main() -> int:
             f"{', '.join(invalid_non_negative)} must be non-negative"
         )
     positive = {
+        "--official-batch-size": args.official_batch_size,
         "--field-chunk-size": args.field_chunk_size,
         "--resource-poll-seconds": args.resource_poll_seconds,
         "--max-local-om-api-processes": args.max_local_om_api_processes,
@@ -3316,6 +3327,10 @@ def main() -> int:
     if args.point_limit > POINT_COUNT:
         raise ValidationError(
             f"--point-limit must not exceed the {POINT_COUNT}-point immutable plan"
+        )
+    if args.official_batch_size > POINT_COUNT:
+        raise ValidationError(
+            f"--official-batch-size must not exceed the {POINT_COUNT}-point plan"
         )
     local_ssh_host = args.local_ssh_host.strip() or None
     if local_ssh_host and not is_loopback_url(args.local_base):
@@ -3356,6 +3371,7 @@ def main() -> int:
                 args.official_request_delay_seconds,
                 model_ssh_hosts,
                 expected_runs.get(model),
+                args.official_batch_size,
             )
             print(
                 json.dumps(
