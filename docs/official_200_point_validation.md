@@ -22,13 +22,18 @@ Open-Meteo 公网 API 当前不接受 GFS `friction_velocity`，因此该字段�
 修订构建的 Open-Meteo 引擎只读实例，以相同数据、相同 200 点和相同请求选项与生产 API
 逐值比较；该独立报告和公网官方全字段报告均通过，GFS 才算验收完成。
 
-固定源码的只读引擎必须挂载目标批次目录而不是可变的 `current` 链接。启动后先冻结参考
-响应，再比较生产 API；参考镜像标签和预期批次都会进入不可变元数据：
+固定源码的只读引擎必须挂载目标批次目录而不是可变的 `current` 链接。由于公网字段枚举
+不接受 `friction_velocity`，只读视图把该 OM 目录映射为具有相同单位和有界 Hermite
+插值的 `wind_gusts_10m`；参考请求使用 FlatBuffers 保留 JSON 舍入前的浮点值，再按生产
+接口的 3 位小数契约比较。源目录保持只读且不改名。启动后先冻结参考响应，再比较生产
+API；参考镜像标签、别名字段、SDK 版本和预期批次都会进入不可变元数据：
 
 ```bash
 python scripts/validation/friction_velocity_200_compare.py capture \
   --ssh-host shanghai1 --reference-base http://127.0.0.1:18080 \
   --expected-run YYYYMMDDHH --reference-image weather-forecast-openmeteo:native-<源码ID> \
+  --reference-query-field wind_gusts_10m \
+  --flatbuffers-sdk-path D:/path/to/pinned/openmeteo-sdk \
   --output D:/Projects/weather_validation_artifacts/friction-200/<批次标识>
 python scripts/validation/friction_velocity_200_compare.py validate \
   --ssh-host shanghai1 --local-base http://127.0.0.1:8088 \
