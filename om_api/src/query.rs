@@ -5946,14 +5946,8 @@ fn read_direct_with_rounding(
     round_values: bool,
 ) -> Result<f32> {
     if variable == "snowfall_water_equivalent" && gfs_uses_temperature_snow_partition() {
-        let precipitation = read_direct_with_rounding(
-            snapshot,
-            decoder,
-            "precipitation",
-            time,
-            latitude,
-            longitude,
-            false,
+        let native_snowfall_water_equivalent = read_direct_native_with_rounding(
+            snapshot, decoder, variable, time, latitude, longitude, false,
         )?;
         let temperature = read_direct_with_rounding(
             snapshot,
@@ -5964,13 +5958,34 @@ fn read_direct_with_rounding(
             longitude,
             false,
         )?;
-        let value = snowfall_water_equivalent_for_elevation(precipitation, temperature);
+        let value =
+            snowfall_water_equivalent_for_elevation(native_snowfall_water_equivalent, temperature);
         return Ok(if round_values {
             round_variable_output_value(variable, value)
         } else {
             value
         });
     }
+    read_direct_native_with_rounding(
+        snapshot,
+        decoder,
+        variable,
+        time,
+        latitude,
+        longitude,
+        round_values,
+    )
+}
+
+fn read_direct_native_with_rounding(
+    snapshot: &OmDataSnapshot,
+    decoder: Option<&OfficialDecoder>,
+    variable: &str,
+    time: DateTime<Utc>,
+    latitude: f64,
+    longitude: f64,
+    round_values: bool,
+) -> Result<f32> {
     if current_weather_model() == WeatherModel::EcmwfIfs9km {
         if matches!(variable, "relative_humidity_2m" | "relativehumidity_2m") {
             let temperature = read_direct_with_rounding(
@@ -6418,14 +6433,8 @@ fn read_direct_grid_series_uncached(
     round_values: bool,
 ) -> Result<Vec<Vec<f32>>> {
     if variable == "snowfall_water_equivalent" && gfs_uses_temperature_snow_partition() {
-        let precipitation = read_direct_grid_series_uncached(
-            snapshot,
-            decoder,
-            "precipitation",
-            times,
-            latitudes,
-            longitudes,
-            false,
+        let native_snowfall_water_equivalent = read_direct_grid_series_native_uncached(
+            snapshot, decoder, variable, times, latitudes, longitudes, false,
         )?;
         let temperature = read_direct_grid_series_uncached(
             snapshot,
@@ -6436,15 +6445,18 @@ fn read_direct_grid_series_uncached(
             longitudes,
             false,
         )?;
-        let mut values = precipitation
+        let mut values = native_snowfall_water_equivalent
             .into_iter()
             .zip(temperature)
-            .map(|(precipitation, temperature)| {
-                precipitation
+            .map(|(native_snowfall_water_equivalent, temperature)| {
+                native_snowfall_water_equivalent
                     .into_iter()
                     .zip(temperature)
-                    .map(|(precipitation, temperature)| {
-                        snowfall_water_equivalent_for_elevation(precipitation, temperature)
+                    .map(|(native_snowfall_water_equivalent, temperature)| {
+                        snowfall_water_equivalent_for_elevation(
+                            native_snowfall_water_equivalent,
+                            temperature,
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -6458,6 +6470,26 @@ fn read_direct_grid_series_uncached(
         }
         return Ok(values);
     }
+    read_direct_grid_series_native_uncached(
+        snapshot,
+        decoder,
+        variable,
+        times,
+        latitudes,
+        longitudes,
+        round_values,
+    )
+}
+
+fn read_direct_grid_series_native_uncached(
+    snapshot: &OmDataSnapshot,
+    decoder: &OfficialDecoder,
+    variable: &str,
+    times: &[DateTime<Utc>],
+    latitudes: &[f64],
+    longitudes: &[f64],
+    round_values: bool,
+) -> Result<Vec<Vec<f32>>> {
     if current_weather_model() == WeatherModel::EcmwfIfs9km
         && variable != "precipitation_probability"
     {
@@ -11371,10 +11403,11 @@ fn apply_elevation_correction(product: &str, variable: &str, value: f32) -> f32 
     value + (sampling.model_elevation - sampling.target_elevation) * 0.0065
 }
 
-/// Open-Meteo repartitions GFS precipitation into rain/snow from the
-/// elevation-corrected 2 m temperature when the requested terrain differs by
-/// more than 100 m from the model cell.  Below that threshold the native GFS
-/// frozen-precipitation fraction remains authoritative.
+/// Open-Meteo suppresses native GFS snowfall when the elevation-corrected 2 m
+/// temperature is non-freezing and the requested terrain differs by more than
+/// 100 m from the model cell. It does not promote native rain to snow when the
+/// corrected temperature is below freezing. Below the elevation threshold the
+/// native GFS frozen-precipitation fraction remains authoritative.
 fn gfs_uses_temperature_snow_partition() -> bool {
     if current_weather_model() != WeatherModel::Gfs {
         return false;
@@ -11387,8 +11420,11 @@ fn gfs_uses_temperature_snow_partition() -> bool {
         && (sampling.model_elevation - sampling.target_elevation).abs() > 100.0
 }
 
-fn snowfall_water_equivalent_for_elevation(precipitation: f32, temperature_2m: f32) -> f32 {
-    precipitation * if temperature_2m >= 0.0 { 0.0 } else { 1.0 }
+fn snowfall_water_equivalent_for_elevation(
+    native_snowfall_water_equivalent: f32,
+    temperature_2m: f32,
+) -> f32 {
+    native_snowfall_water_equivalent * if temperature_2m >= 0.0 { 0.0 } else { 1.0 }
 }
 
 fn read_entry_grid(
@@ -15519,6 +15555,7 @@ mod output_tests {
         assert_eq!(snowfall_water_equivalent_for_elevation(0.1, 0.0), 0.0);
         assert_eq!(snowfall_water_equivalent_for_elevation(0.1, 5.6), 0.0);
         assert_eq!(snowfall_water_equivalent_for_elevation(0.1, -0.1), 0.1);
+        assert_eq!(snowfall_water_equivalent_for_elevation(0.0, -5.0), 0.0);
         assert!(snowfall_water_equivalent_for_elevation(f32::NAN, -1.0).is_nan());
         // Swift comparisons with NaN are false, so the official fallback keeps
         // precipitation as snow when the corrected temperature is unavailable.

@@ -325,6 +325,49 @@ class Official200PointCompareTests(unittest.TestCase):
             ],
         )
 
+    def test_gfs_local_only_friction_velocity_is_not_compared_to_public_api(
+        self,
+    ) -> None:
+        comparable, local_only = compare.split_comparison_variables(
+            "gfs", "hourly", ("temperature_2m", "friction_velocity")
+        )
+        self.assertEqual(comparable, ("temperature_2m",))
+        self.assertEqual(local_only, ("friction_velocity",))
+
+        difference, checked = compare.first_local_only_axis_difference(
+            "hourly",
+            local_only,
+            {
+                "hourly": {
+                    "time": ["2026-09-13T00:00", "2026-09-13T01:00"],
+                    "friction_velocity": [0.123, 0.456],
+                }
+            },
+        )
+        self.assertIsNone(difference)
+        self.assertEqual(checked, 2)
+
+    def test_local_only_field_rejects_missing_or_empty_value_axis(self) -> None:
+        missing, missing_checked = compare.first_local_only_axis_difference(
+            "hourly",
+            ("friction_velocity",),
+            {"hourly": {"time": ["2026-09-13T00:00"]}},
+        )
+        empty, empty_checked = compare.first_local_only_axis_difference(
+            "hourly",
+            ("friction_velocity",),
+            {
+                "hourly": {
+                    "time": ["2026-09-13T00:00"],
+                    "friction_velocity": [None],
+                }
+            },
+        )
+        self.assertEqual(missing["reason"], "invalid_local_only_value_axis")
+        self.assertEqual(missing_checked, 0)
+        self.assertEqual(empty["reason"], "empty_local_only_value_axis")
+        self.assertEqual(empty_checked, 0)
+
     def test_default_plan_chunks_complete_catalogs_without_parallelism(self) -> None:
         for model in ("gfs", "ec", "ec9"):
             plan = compare.request_plan(model, compare.DEFAULT_FIELD_CHUNK_SIZE)

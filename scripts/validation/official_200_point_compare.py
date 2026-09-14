@@ -410,6 +410,71 @@ def request_plan(model: str, field_chunk_size: int) -> list[dict[str, Any]]:
     return plan
 
 
+def split_comparison_variables(
+    model: str, period: str, variables: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    spec = MODEL_SPECS[model]
+    official_variables = set(
+        spec["official_hourly"] if period == "hourly" else spec["daily"]
+    )
+    comparable = tuple(variable for variable in variables if variable in official_variables)
+    local_only = tuple(variable for variable in variables if variable not in official_variables)
+    return comparable, local_only
+
+
+def first_local_only_axis_difference(
+    period: str, variables: tuple[str, ...], local: dict[str, Any]
+) -> tuple[dict[str, Any] | None, int]:
+    if not variables:
+        return None, 0
+    local_period = local.get(period)
+    if not isinstance(local_period, dict):
+        return (
+            {
+                "period": period,
+                "variable": variables[0],
+                "reason": "missing_local_only_period",
+            },
+            0,
+        )
+    local_times = local_period.get("time")
+    if not isinstance(local_times, list) or len(set(local_times)) != len(local_times):
+        return (
+            {
+                "period": period,
+                "variable": "time",
+                "reason": "invalid_local_only_time_axis",
+            },
+            0,
+        )
+    values_checked = 0
+    for variable in variables:
+        values = local_period.get(variable)
+        if not isinstance(values, list) or len(values) != len(local_times):
+            return (
+                {
+                    "period": period,
+                    "variable": variable,
+                    "reason": "invalid_local_only_value_axis",
+                    "local_values": len(values) if isinstance(values, list) else None,
+                    "local_times": len(local_times),
+                },
+                values_checked,
+            )
+        if values and not any(value is not None for value in values):
+            return (
+                {
+                    "period": period,
+                    "variable": variable,
+                    "reason": "empty_local_only_value_axis",
+                    "local_values": len(values),
+                },
+                values_checked,
+            )
+        values_checked += len(values)
+    return None, values_checked
+
+
 def attempt_id_now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
@@ -2886,9 +2951,17 @@ def validate_model(
             request_accepted: list[dict[str, Any]] = []
             for period, variables in periods:
                 period_accepted: list[dict[str, Any]] = []
+                comparison_variables, local_only_variables = split_comparison_variables(
+                    model, period, variables
+                )
+                difference, local_only_values_checked = first_local_only_axis_difference(
+                    period, local_only_variables, comparison_local
+                )
+                if difference is not None:
+                    break
                 difference, hourly_part, daily_part = first_period_difference(
                     period,
-                    variables,
+                    comparison_variables,
                     official,
                     comparison_local,
                     allow_official_finite_local_nan=model == "ec9",
@@ -2909,10 +2982,14 @@ def validate_model(
                     official_period = official.get(period, {})
                     official_times = official_period.get("time", [])
                     compared = hourly_part if period == "hourly" else daily_part
-                    exempted = len(variables) * len(official_times) - compared
+                    exempted = (
+                        len(comparison_variables) * len(official_times) - compared
+                    )
                     part_comparison[period] = {
                         "values_compared": compared,
                         "values_exempted": exempted,
+                        "local_only_values_checked": local_only_values_checked,
+                        "local_only_variables": list(local_only_variables),
                         "accepted_official_rolling_values_over_local_nan": len(
                             period_accepted
                         ),
