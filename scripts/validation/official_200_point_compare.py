@@ -1023,14 +1023,16 @@ def request_json_via_ssh(
     retry_delay = min(30, max(1, int(timeout // 30)))
     body_argument = "--data-binary @- " if body is not None else ""
     curl_command = (
-        "curl --silent --show-error --fail-with-body "
+        "curl --silent --show-error --fail-with-body --compressed "
         f"--max-time {max(1, int(timeout))} --retry {max(0, retries)} "
         f"--retry-delay {retry_delay} --retry-all-errors -X {method} "
         f"{curl_headers} {body_argument}{shlex.quote(url)}"
     )
-    # Compress before crossing the SSH link. Forecast JSON compresses very
-    # well, while sending it uncompressed can make a low-bandwidth server hit
-    # curl's transfer timeout even after the official endpoint has answered.
+    # Ask the official endpoint to compress its response, then compress again
+    # after curl decodes it so both network legs stay bounded. Forecast JSON
+    # compresses very well; leaving either leg uncompressed can make a
+    # low-bandwidth server hit curl's transfer timeout after the endpoint has
+    # already started returning a valid response.
     remote_command = "bash -o pipefail -c " + shlex.quote(
         f"{curl_command} | gzip -1 -c"
     )

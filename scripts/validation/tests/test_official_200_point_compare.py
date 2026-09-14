@@ -156,6 +156,7 @@ class Official200PointCompareTests(unittest.TestCase):
         self.assertEqual(raw, expected)
         self.assertEqual(headers, {})
         self.assertGreaterEqual(elapsed, 0)
+        self.assertIn("--compressed", run.call_args.args[0][-1])
         self.assertIn("gzip -1 -c", run.call_args.args[0][-1])
 
     def test_ssh_get_targets_the_real_loopback_api_without_a_body(self) -> None:
